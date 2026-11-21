@@ -13,6 +13,7 @@ const MUTED: Color = Color::from_rgb(0.60, 0.64, 0.70);
 mod attention;
 mod launch;
 mod newpane;
+mod palette;
 mod recents;
 mod term;
 mod usage;
@@ -175,6 +176,9 @@ struct App {
     recents_path: Option<std::path::PathBuf>,
     /// Lanzador de agentes abierto.
     launcher: bool,
+    /// Paleta de comandos abierta: texto de búsqueda y resultado resaltado.
+    palette: Option<String>,
+    palette_cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +229,55 @@ enum Message {
     Launch(launch::Agent),
     /// Un panel creado desde un atajo o el lanzador: queda seleccionado.
     PaneLaunched(Result<serde_json::Value, String>),
+    /// Paleta de comandos (C): abrir/cerrar, buscar, mover el resaltado, ejecutar (por índice de resultado).
+    OpenPalette,
+    ClosePalette,
+    PaletteQuery(String),
+    PaletteMove(isize),
+    PaletteRun(usize),
+}
+
+/// Un resultado de la paleta: lo que muestra, lo que busca y lo que hace al elegirlo.
+struct PaletteItem {
+    label: String,
+    detail: String,
+    message: Message,
+}
+
+/// Todos los resultados posibles: workspaces, paneles y comandos. Se filtran con la búsqueda.
+fn palette_items(app: &App) -> Vec<PaletteItem> {
+    let mut items = Vec::new();
+    for (i, (ws, group)) in galgo_proto::group_by_workspace(&app.panes).into_iter().enumerate() {
+        let label = ws.clone().unwrap_or_else(|| "sin workspace".into());
+        items.push(PaletteItem { label: format!("Workspace · {label}"), detail: format!("{} panel(es)", group.len()), message: Message::SelectWorkspaceAt(i) });
+    }
+    for p in &app.panes {
+        let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
+        items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
+    }
+    let commands: [(&str, &str, Message); 9] = [
+        ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
+        ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
+        ("Lanzar agente…", "Cmd+Shift+L", Message::OpenLauncher),
+        ("Cerrar panel", "Cmd+W", Message::CloseFocused),
+        ("Siguiente que necesita atención", "Cmd+Shift+U", Message::NextAttention),
+        ("Lanzar Claude aquí", "", Message::Launch(launch::Agent::Claude)),
+        ("Lanzar Codex aquí", "", Message::Launch(launch::Agent::Codex)),
+        ("Lanzar PI aquí", "", Message::Launch(launch::Agent::Pi)),
+        ("Nuevo panel con formulario", "", Message::OpenForm),
+    ];
+    for (label, keys, message) in commands {
+        items.push(PaletteItem { label: label.into(), detail: keys.into(), message });
+    }
+    items
+}
+
+/// Resultados que casan con la búsqueda actual, del mejor al peor.
+fn palette_results(app: &App) -> Vec<PaletteItem> {
+    let query = app.palette.as_deref().unwrap_or("");
+    let items = palette_items(app);
+    let texts: Vec<String> = items.iter().map(|i| format!("{} {}", i.label, i.detail)).collect();
+    palette::rank(&texts, query).into_iter().map(|i| PaletteItem { label: items[i].label.clone(), detail: items[i].detail.clone(), message: items[i].message.clone() }).collect()
 }
 
 /// Atajos de la ventana con Cmd. Lo que no es atajo llega al panel seleccionado.
@@ -232,6 +285,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     let Key::Character(c) = key else { return None };
     let lower = c.as_str().to_lowercase();
     match (lower.as_str(), modifiers.shift()) {
+        ("k", false) | ("p", true) => Some(Message::OpenPalette),
         ("n", false) => Some(Message::OpenNewWorkspace),
         ("t", false) => Some(Message::NewTab),
         ("w", false) => Some(Message::CloseFocused),
@@ -292,12 +346,15 @@ enum Body {
     Welcome,
     NewWorkspace,
     Launcher,
+    Palette,
     Form,
     Screen,
 }
 
 fn body_mode(app: &App) -> Body {
-    if app.new_ws.is_some() {
+    if app.palette.is_some() {
+        Body::Palette
+    } else if app.new_ws.is_some() {
         Body::NewWorkspace
     } else if app.launcher {
         Body::Launcher
@@ -354,6 +411,38 @@ fn welcome_view(app: &App) -> Element<'_, Message> {
         col = col.push(button(text(p.as_str()).size(12).color(MUTED)).width(Length::Fill).padding(8).on_press(Message::OpenFolder(p.clone())));
     }
     container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
+}
+
+/// Identificador del campo de búsqueda de la paleta: para darle el foco al abrirla.
+fn palette_input_id() -> iced::widget::text_input::Id {
+    iced::widget::text_input::Id::new("paleta")
+}
+
+/// Paleta: búsqueda arriba y resultados debajo; el resaltado se mueve con las flechas y se ejecuta con Enter.
+fn palette_view(app: &App) -> Element<'_, Message> {
+    let query = app.palette.as_deref().unwrap_or("");
+    let results = palette_results(app);
+    let mut list = column![].spacing(4);
+    for (i, item) in results.iter().enumerate().take(12) {
+        let marca = if i == app.palette_cursor { "▸ " } else { "   " };
+        let line = row![text(format!("{marca}{}", item.label)).size(14), Space::with_width(Length::Fill), text(item.detail.clone()).size(11).color(MUTED)];
+        list = list.push(button(line).width(Length::Fill).padding(8).on_press(Message::PaletteRun(i)));
+    }
+    if results.is_empty() {
+        list = list.push(text("Sin resultados.").size(12).color(MUTED));
+    }
+    column![
+        text_input("Buscar workspace, panel o acción…", query)
+            .id(palette_input_id())
+            .on_input(Message::PaletteQuery)
+            .on_submit(Message::PaletteRun(app.palette_cursor))
+            .padding(10),
+        scrollable(list).height(Length::Fill),
+        text("↑ ↓ mover · Enter ejecutar · Esc cerrar").size(11).color(MUTED),
+    ]
+    .spacing(12)
+    .max_width(640)
+    .into()
 }
 
 /// Lanzador: un botón por agente, en el workspace y la carpeta del panel enfocado.
@@ -730,6 +819,39 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 update(app, Message::ConfirmClose)
             }
         }
+        Message::OpenPalette => {
+            if app.palette.is_some() {
+                app.palette = None;
+                return Task::none();
+            }
+            app.palette = Some(String::new());
+            app.palette_cursor = 0;
+            iced::widget::text_input::focus(palette_input_id())
+        }
+        Message::ClosePalette => {
+            app.palette = None;
+            Task::none()
+        }
+        Message::PaletteQuery(query) => {
+            app.palette = Some(query);
+            app.palette_cursor = 0;
+            Task::none()
+        }
+        Message::PaletteMove(delta) => {
+            let n = palette_results(app).len();
+            if n > 0 {
+                app.palette_cursor = (app.palette_cursor as isize + delta).rem_euclid(n as isize) as usize;
+            }
+            Task::none()
+        }
+        Message::PaletteRun(index) => {
+            let chosen = palette_results(app).into_iter().nth(index).map(|item| item.message);
+            app.palette = None;
+            match chosen {
+                Some(message) => update(app, message),
+                None => Task::none(),
+            }
+        }
         Message::OpenLauncher => {
             app.form = None;
             app.new_ws = None;
@@ -884,6 +1006,16 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Event(Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })) => {
+            // La paleta tiene su propio teclado: flechas, Enter y Esc; lo demás lo escribe su campo.
+            if app.palette.is_some() {
+                return match &key {
+                    Key::Named(Named::Escape) => update(app, Message::ClosePalette),
+                    Key::Named(Named::ArrowDown) => update(app, Message::PaletteMove(1)),
+                    Key::Named(Named::ArrowUp) => update(app, Message::PaletteMove(-1)),
+                    _ if modifiers.command() && matches!(&key, Key::Character(c) if c.as_str() == "k") => update(app, Message::ClosePalette),
+                    _ => Task::none(),
+                };
+            }
             // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
             if modifiers.command() && app.new_ws.is_none() && !app.launcher {
                 if let Some(message) = shortcut(&key, modifiers) {
@@ -1294,6 +1426,8 @@ fn view(app: &App) -> Element<'_, Message> {
     let state_color = selected_pane.map(|p| status_color(p.status)).unwrap_or(MUTED);
     let body_content: Element<'_, Message> = if body_mode(app) == Body::NewWorkspace {
         new_workspace_view(app)
+    } else if body_mode(app) == Body::Palette {
+        palette_view(app)
     } else if body_mode(app) == Body::Launcher {
         launcher_view(app)
     } else if body_mode(app) == Body::Welcome {
@@ -1815,5 +1949,45 @@ mod tests {
         let mut app = App { panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::CloseFocused);
         assert!(!app.confirm_close, "parado: no pregunta");
+    }
+
+    /// C: la paleta lista workspaces, paneles y acciones; la búsqueda los filtra y Enter ejecuta el elegido.
+    #[test]
+    fn paleta_busca_y_ejecuta() {
+        let mut p = pane_info(4, "claude", Status::Working);
+        p.workspace = Some("repo/main".into());
+        let mut app = App { panes: vec![p], ..Default::default() };
+        let _ = update(&mut app, Message::OpenPalette);
+        assert_eq!(body_mode(&app), Body::Palette);
+        let _ = update(&mut app, Message::PaletteQuery("panel claude".into()));
+        // El panel aparece entre los resultados; el primero puede ser una acción que también casa.
+        let index = palette_results(&app).iter().position(|i| i.label == "Panel · claude").expect("el panel casa");
+        let _ = update(&mut app, Message::PaletteRun(index));
+        assert!(app.palette.is_none(), "al ejecutar, la paleta se cierra");
+        assert_eq!(app.selected, Some(4), "el panel elegido queda seleccionado");
+    }
+
+    /// C: las flechas dan la vuelta por los resultados; una búsqueda sin resultados no rompe nada.
+    #[test]
+    fn paleta_flechas_dan_la_vuelta_y_busqueda_vacia() {
+        let mut app = App { palette: Some(String::new()), ..Default::default() };
+        let total = palette_results(&app).len();
+        assert!(total >= 9, "al menos los comandos");
+        let _ = update(&mut app, Message::PaletteMove(-1));
+        assert_eq!(app.palette_cursor, total - 1);
+        let _ = update(&mut app, Message::PaletteQuery("zzqx".into()));
+        assert!(palette_results(&app).is_empty());
+        let _ = update(&mut app, Message::PaletteMove(1));
+        let _ = update(&mut app, Message::PaletteRun(0));
+        assert!(app.palette.is_none());
+    }
+
+    /// C: Cmd+K y Cmd+Shift+P abren la paleta.
+    #[test]
+    fn atajos_de_la_paleta() {
+        let k = Key::Character("k".into());
+        assert!(matches!(shortcut(&k, keyboard::Modifiers::COMMAND), Some(Message::OpenPalette)));
+        let p = Key::Character("P".into());
+        assert!(matches!(shortcut(&p, keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenPalette)));
     }
 }
