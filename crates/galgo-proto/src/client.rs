@@ -19,20 +19,22 @@ pub fn connect() -> Result<UnixStream> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(dir)?;
     let log_path = dir.join("galgod.log");
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW: i32 = 0x100;
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW: i32 = 0x20000;
     let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600)
-        .custom_flags(O_NOFOLLOW).open(&log_path)
+        .custom_flags(libc::O_NOFOLLOW).open(&log_path)
         .with_context(|| format!("no pude abrir {}", log_path.display()))?;
     log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let galgod = std::env::current_exe()?.with_file_name("galgod");
-    let mut child = Command::new(&galgod)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .process_group(0)
+    let mut cmd = Command::new(&galgod);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log));
+    // Sesión propia: un daemon arrancado desde un panel no debe morir con el `kill` de ese panel.
+    // SAFETY: setsid es seguro entre fork y exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("no pude iniciar {}", galgod.display()))?;
     for _ in 0..50 {

@@ -29,6 +29,9 @@ pub enum EnvCmd {
         dirs: Vec<PathBuf>,
         #[arg(long, default_value = ".env")]
         file: String,
+        /// Permite escribir un valor vacío (por defecto se rechaza).
+        #[arg(long)]
+        allow_empty: bool,
     },
     /// Quita una variable de uno o varios directorios.
     Unset {
@@ -77,16 +80,19 @@ pub fn run(cmd: &EnvCmd) -> Result<()> {
             }
             Ok(())
         }
-        EnvCmd::Set { key, dirs, file } => {
+        EnvCmd::Set { key, dirs, file, allow_empty } => {
             check_key(key)?;
             let value = read_value(key)?;
-            if value.is_empty() {
-                eprintln!("aviso: el valor está vacío");
+            if value.is_empty() && !allow_empty {
+                bail!("el valor está vacío; no se escribió nada (usa --allow-empty si es lo que quieres)");
+            }
+            if value.contains('\'') && value.contains(['$', '`', '\\']) {
+                eprintln!("aviso: con una comilla simple el valor va entre comillas dobles; `source` interpretaría $, ` y \\");
             }
             for d in dirs {
-                let path = target(d, file)?;
+                let path = target_w(d, file)?;
                 locked(d, || {
-                    let new = set_in(&read_or_empty(&path)?, key, &value);
+                    let new = set_in(&read_or_empty_nofollow(&path)?, key, &value);
                     write_private(&path, &new)
                 })?;
                 let mut warn = String::new();
@@ -103,9 +109,9 @@ pub fn run(cmd: &EnvCmd) -> Result<()> {
         EnvCmd::Unset { key, dirs, file } => {
             check_key(key)?;
             for d in dirs {
-                let path = target(d, file)?;
+                let path = target_w(d, file)?;
                 let changed = locked(d, || {
-                    let text = read_or_empty(&path)?;
+                    let text = read_or_empty_nofollow(&path)?;
                     let new = unset_in(&text, key);
                     if new == text {
                         return Ok(false);
@@ -159,6 +165,15 @@ pub fn run(cmd: &EnvCmd) -> Result<()> {
 }
 
 fn target(dir: &Path, file: &str) -> Result<PathBuf> {
+    target_for(dir, file, false)
+}
+
+/// Para escribir: rechaza enlaces simbólicos. Leer a través de un enlace no expone nada.
+fn target_w(dir: &Path, file: &str) -> Result<PathBuf> {
+    target_for(dir, file, true)
+}
+
+fn target_for(dir: &Path, file: &str, write: bool) -> Result<PathBuf> {
     if file.contains('/') || file == ".." || file.is_empty() {
         bail!("--file debe ser un nombre de archivo, sin rutas");
     }
@@ -166,7 +181,7 @@ fn target(dir: &Path, file: &str) -> Result<PathBuf> {
         bail!("{} no es un directorio", dir.display());
     }
     let path = dir.join(file);
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+    if write && std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         bail!("{} es un enlace simbólico; galgo no escribe secretos a través de enlaces", path.display());
     }
     Ok(path)
@@ -176,9 +191,16 @@ fn target(dir: &Path, file: &str) -> Result<PathBuf> {
 fn locked<T>(dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     use std::os::fd::AsRawFd;
     let d = std::fs::File::open(dir).with_context(|| format!("no se pudo abrir {}", dir.display()))?;
-    // SAFETY: flock sobre un descriptor válido que vive hasta el final de la función.
-    if unsafe { libc::flock(d.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        bail!("no se pudo bloquear {}", dir.display());
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        // SAFETY: flock sobre un descriptor válido que vive hasta el final de la función.
+        if unsafe { libc::flock(d.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        if Instant::now() >= end {
+            bail!("{} está bloqueado por otro proceso de galgo env desde hace 10 s", dir.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     f()
 }
@@ -191,6 +213,18 @@ fn check_key(key: &str) -> Result<()> {
         bail!("nombre de variable inválido: {key} (letras, dígitos y _; no empieza con dígito)");
     }
     Ok(())
+}
+
+/// Lectura para editar: no sigue enlaces (cierra la carrera entre la comprobación y la lectura).
+fn read_or_empty_nofollow(path: &Path) -> Result<String> {
+    let mut f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e).with_context(|| format!("no se pudo leer {} (¿enlace simbólico?)", path.display())),
+    };
+    let mut s = String::new();
+    f.read_to_string(&mut s).with_context(|| format!("no se pudo leer {}", path.display()))?;
+    Ok(s)
 }
 
 fn read_or_empty(path: &Path) -> Result<String> {
@@ -278,26 +312,64 @@ fn read_value(key: &str) -> Result<String> {
     Ok(s)
 }
 
+static SAVED_TERMIOS: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+
+extern "C" fn restore_and_exit(sig: libc::c_int) {
+    if let Some(old) = SAVED_TERMIOS.get() {
+        // SAFETY: tcsetattr y _exit son seguros en un manejador de señales.
+        unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, old) };
+    }
+    unsafe { libc::_exit(128 + sig) };
+}
+
+/// Lee un valor sin eco en modo no canónico: no hay límite de línea (pegar un JWT largo funciona) y
+/// Ctrl+C, Ctrl+D y Ctrl+Z cancelan al instante. Una señal externa también restaura el terminal.
 fn read_hidden() -> Result<String> {
-    // SAFETY: termios sobre el descriptor 0, que es un terminal; se restaura siempre.
+    // SAFETY: termios y read sobre el descriptor 0, que es un terminal; se restaura siempre.
     unsafe {
         let mut old: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(0, &mut old) != 0 {
             bail!("no se pudo leer el terminal");
         }
-        let mut quiet = old;
-        quiet.c_lflag &= !(libc::ECHO | libc::ISIG);
-        libc::tcsetattr(0, libc::TCSAFLUSH, &quiet);
-        let mut line = String::new();
-        let r = std::io::stdin().read_line(&mut line);
+        let _ = SAVED_TERMIOS.set(old);
+        let mut raw = old;
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        let handler = restore_and_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let sigs = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGTSTP];
+        let prev: Vec<libc::sighandler_t> = sigs.iter().map(|&s| libc::signal(s, handler)).collect();
+        libc::tcsetattr(0, libc::TCSAFLUSH, &raw);
+        let result = read_hidden_bytes();
         libc::tcsetattr(0, libc::TCSAFLUSH, &old);
-        r?;
-        // Con ISIG apagado Ctrl+C y Ctrl+Z llegan como bytes: así el eco siempre se restaura.
-        if line.contains(['\x03', '\x1a']) {
-            bail!("cancelado");
+        for (&s, &p) in sigs.iter().zip(&prev) {
+            libc::signal(s, p);
         }
-        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+        result
     }
+}
+
+fn read_hidden_bytes() -> Result<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let mut b = 0u8;
+        // SAFETY: lee un byte del descriptor 0 a una variable local.
+        let n = unsafe { libc::read(0, (&mut b as *mut u8).cast(), 1) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        match (n, b) {
+            (1, b'\n' | b'\r') => break,
+            (1, 0x7f | 0x08) => {
+                while buf.pop().is_some_and(|c| (c & 0xC0) == 0x80) {}
+            }
+            (1, 0x03 | 0x04 | 0x1a) | (0, _) | (-1, _) => bail!("cancelado"),
+            (1, c) if c < 0x20 => bail!("carácter de control no permitido en el valor"),
+            (1, c) => buf.push(c),
+            _ => bail!("cancelado"),
+        }
+    }
+    String::from_utf8(buf).map_err(|_| anyhow::anyhow!("el valor no es UTF-8 válido"))
 }
 
 // ---- Edición de texto .env (pura, con pruebas) ----
@@ -359,12 +431,15 @@ fn scan(lines: &[&str]) -> Vec<Entry> {
             match close_quote(inner, q) {
                 Some(end) => empty = inner[..end].is_empty(),
                 None => {
-                    // Valor multilínea: se consume hasta la línea que cierra la comilla.
+                    // Valor multilínea: se consume hasta la línea que cierra la comilla. Si nunca
+                    // cierra es un error del archivo: se trata como una sola línea, sin tragarse el resto.
                     let mut j = i + 1;
                     while j < lines.len() && close_quote(lines[j], q).is_none() {
                         j += 1;
                     }
-                    i = j.min(lines.len() - 1);
+                    if j < lines.len() {
+                        i = j;
+                    }
                 }
             }
         } else {
@@ -387,15 +462,16 @@ pub fn is_set(text: &str, key: &str) -> bool {
     keys_in(text).iter().any(|(k, empty)| k == key && !empty)
 }
 
-/// Comillas simples (literales para bash, dotenv y python-dotenv) salvo que el valor tenga `'` o
-/// saltos de línea; entonces comillas dobles escapando todo lo que bash interpretaría.
+/// Comillas simples (literales para bash, dotenv y python-dotenv) salvo que el valor tenga `'`.
+/// Entonces comillas dobles escapando solo `"` y `\`; un salto de línea va tal cual dentro de las
+/// comillas (lo leen igual bash y los dotenv).
 fn quote(value: &str) -> String {
     let plain = !value.is_empty()
         && value.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:@+,=%".contains(c));
     if plain {
         return value.to_string();
     }
-    if !value.contains(['\'', '\n', '\r']) {
+    if !value.contains('\'') {
         return format!("'{value}'");
     }
     let mut s = String::from("\"");
@@ -403,10 +479,6 @@ fn quote(value: &str) -> String {
         match c {
             '"' => s.push_str("\\\""),
             '\\' => s.push_str("\\\\"),
-            '\n' => s.push_str("\\n"),
-            '\r' => s.push_str("\\r"),
-            '$' => s.push_str("\\$"),
-            '`' => s.push_str("\\`"),
             c => s.push(c),
         }
     }
@@ -486,7 +558,7 @@ mod tests {
     fn quoting_is_literal_for_shells() {
         assert_eq!(quote("sk-abc.123"), "sk-abc.123");
         assert_eq!(quote("a b#c$d`e\\f\"g"), "'a b#c$d`e\\f\"g'");
-        assert_eq!(quote("it's\nx`y$z"), "\"it's\\nx\\`y\\$z\"");
+        assert_eq!(quote("it's\"x\\y"), "\"it's\\\"x\\\\y\"");
         assert_eq!(quote(""), "''");
     }
 
@@ -504,6 +576,13 @@ mod tests {
         assert_eq!(set_in("A=1\r\nB=2\r\n", "A", "9"), "A=9\r\nB=2\r\n");
         assert_eq!(set_in("\u{feff}A=1\n", "A", "2"), "A=2\n");
         assert_eq!(set_in("exports=1\n", "exports", "x"), "exports=x\n");
+    }
+
+    #[test]
+    fn unclosed_quote_does_not_swallow_the_file() {
+        let t = "A=\"oops\nB=1\nC=2\n";
+        assert_eq!(keys_in(t).iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["A", "B", "C"]);
+        assert_eq!(set_in(t, "A", "x"), "A=x\nB=1\nC=2\n");
     }
 
     #[test]

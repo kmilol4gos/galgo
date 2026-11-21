@@ -71,6 +71,9 @@ struct Pane {
     last_summary: Option<String>,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
     last_blocked: Option<String>,
+    /// Procesos que seguían en la sesión del panel cuando el líder salió (el líder aún sin recolectar,
+    /// así que su pid no pudo reutilizarse). Solo estos se barren después: nunca un pid nuevo.
+    orphans: Vec<i32>,
     waiting_on: Option<(u32, Instant)>,
     /// Ya entregó su resultado en este turno (`galgo done` o el evento de fin de turno).
     /// Solo se limpia con un prompt nuevo o con un envío con Enter.
@@ -307,6 +310,7 @@ impl Daemon {
             inbox: Vec::new(),
             last_summary: None,
             last_blocked: None,
+            orphans: Vec::new(),
             waiting_on: None,
             reported: false,
         };
@@ -337,8 +341,19 @@ impl Daemon {
     }
 
     fn mark_closed(&self, id: u32) {
-        if let Some(p) = self.state.lock().unwrap().panes.get_mut(&id) {
+        let sid = {
+            let mut st = self.state.lock().unwrap();
+            let Some(p) = st.panes.get_mut(&id) else { return };
             p.exited = true;
+            p.pid
+        };
+        // El líder todavía no se recolectó: su pid sigue siendo suyo y la lista de la sesión es fiable.
+        if let Some(sid) = sid {
+            let me = unsafe { libc::getpid() };
+            let found: Vec<i32> = session_pids(sid as i32).into_iter().filter(|&p| p != me && p != sid as i32).collect();
+            if let Some(p) = self.state.lock().unwrap().panes.get_mut(&id) {
+                p.orphans = found;
+            }
         }
     }
 
@@ -602,12 +617,12 @@ impl Daemon {
                         HookEvent::PromptSubmitted => {
                             let p = st.panes.get_mut(&id).unwrap();
                             p.reported = false;
+                            p.last_blocked = None;
                             p.status = Status::Working;
                         }
                         HookEvent::Working => {
                             // Una herramienta que termina no cambia un resultado ya entregado.
                             let p = st.panes.get_mut(&id).unwrap();
-                            p.last_blocked = None;
                             if !matches!(p.status, Status::Done | Status::Failed) {
                                 p.status = Status::Working;
                             }
@@ -704,16 +719,22 @@ impl Daemon {
                 Ok(json!({}))
             }
             Request::Kill { pane } => {
-                let (id, name, sid, exited) = {
+                let (id, name, sid, exited, orphans) = {
                     let st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
                     let p = &st.panes[&id];
-                    (id, p.name.clone(), p.pid, p.exited)
+                    (id, p.name.clone(), p.pid, p.exited, p.orphans.clone())
                 };
                 let Some(sid) = sid else { bail!("el panel {name} ya terminó") };
                 let sid = sid as i32;
                 // Miembros de la sesión antes de cualquier señal: solo estos se barren (#13).
-                let before = tokio::task::spawn_blocking(move || session_pids(sid)).await?;
+                // Con el líder ya salido no se vuelve a listar: su pid pudo reutilizarse.
+                let before = if exited {
+                    // Solo los capturados al salir el líder que siguen en la sesión.
+                    orphans.iter().copied().filter(|&p| unsafe { libc::getsid(p) } == sid).collect()
+                } else {
+                    tokio::task::spawn_blocking(move || session_pids(sid)).await?
+                };
                 let mut exited = exited;
                 if !exited {
                     let mut st = self.state.lock().unwrap();
