@@ -74,6 +74,23 @@ galgo hooks uninstall claude      # quita solo lo de galgo
 
 Hace una copia de respaldo de tu `settings.json`, conserva lo que ya tengas y no toca un archivo que no sea JSON válido. Los hooks solo actúan dentro de paneles de galgo.
 
+### Variables de entorno sin abrir un IDE
+
+```sh
+galgo env set API_KEY --dir ~/proy/main --dir ~/proy/feature-x   # pide el valor sin eco
+echo "$TOKEN" | galgo env set API_KEY --dir .                      # o por stdin
+galgo env list --dir ~/proy/main     # nombres, nunca valores; avisa si el archivo no está en .gitignore
+galgo env unset API_KEY --dir .
+```
+
+Un agente que necesita una variable la pide sin que el valor pase por su conversación:
+
+```sh
+galgo env request DB_URL --reason "migraciones"   # avisa al manager, queda blocked y sigue cuando aparece
+```
+
+El valor nunca va por argv ni por el daemon; se escribe de forma atómica, conserva lo que ya hay en el archivo y los archivos nuevos quedan en `0600`.
+
 ### Servidor MCP
 
 `galgo-mcp` expone el daemon a cualquier cliente MCP por stdio: `galgo_list`, `galgo_spawn`, `galgo_send`, `galgo_read`, `galgo_wait`, `galgo_done`, `galgo_inbox` y `galgo_ack`.
@@ -84,7 +101,7 @@ Hay un skill listo para enseñar a un agente a usar galgo en [`skills/galgo`](sk
 
 - El socket queda con permisos `0600` en un directorio `0700`: quien lo alcance puede escribir en todos los paneles.
 - `--inject` escribe texto en la terminal de otro panel. Úsalo con agentes, no con shells. Los caracteres de control se filtran.
-- Los secretos no viajan por el protocolo. Ningún comando de galgo lee ni escribe archivos `.env`.
+- Los secretos no viajan por el protocolo ni por argv. Solo `galgo env` toca archivos `.env`, y lo hace localmente.
 - Los hooks nunca imprimen por stdout ni fallan: salen siempre con código 0.
 
 ## Pruebas
@@ -97,7 +114,7 @@ scripts/e2e.sh     # daemon real, PTYs reales, agentes simulados
 ## Hoja de ruta
 
 - Interfaz gráfica nativa para macOS, cliente del daemon con varias ventanas. Plan en [`docs/gui-plan.md`](docs/gui-plan.md).
-- Panel de variables de entorno: poner una variable en varios worktrees sin abrir un IDE, y que un agente la pida sin que el valor pase por su conversación.
+- Panel gráfico de variables de entorno (la CLI `galgo env` ya existe).
 - Estado de agentes por la secuencia OSC 7501 y hooks para más agentes además de Claude Code.
 - Persistencia del inbox entre reinicios del daemon.
 - Linux.

@@ -556,5 +556,24 @@ grep -q '"delivered"' "$TMP/o63"; check "tras vencer la escritura, el mensaje vu
 kill "$P63" 2>/dev/null; wait "$P63" 2>/dev/null
 GALGO_SOCKET=$G63 galgo stop >/dev/null 2>&1
 
+echo "80. galgo env: pone variables sin pasar por el daemon ni por argv"
+E80="$TMP/e80"; mkdir -p "$E80/a" "$E80/b"
+printf '# nota\nFOO=1\n' > "$E80/a/.env"
+printf 'sk-secreto 80\n' | galgo env set API_KEY --dir "$E80/a" --dir "$E80/b" >/dev/null
+grep -q '^API_KEY="sk-secreto 80"$' "$E80/a/.env" && grep -q '^FOO=1$' "$E80/a/.env"; check "escribe en varios directorios y conserva lo demás" $?
+[ "$(stat -f %Lp "$E80/b/.env" 2>/dev/null || stat -c %a "$E80/b/.env")" = "600" ]; check "archivo nuevo con permisos 0600" $?
+galgo env list --dir "$E80/a" | grep -q "API_KEY" && ! galgo env list --dir "$E80/a" | grep -q "secreto"; check "list muestra nombres, no valores" $?
+galgo spawn m80 -- bash --norc >/dev/null
+galgo spawn w80 --manager m80 -- bash --norc >/dev/null
+galgo send w80 "cd $E80/b && galgo env request DB_URL --reason 'migraciones' --timeout 15"
+sleep 1.5
+galgo inbox --pane m80 | grep -q "necesita la variable DB_URL"; check "el manager recibe la petición" $?
+galgo ls | grep w80 | grep -q blocked; check "el worker queda blocked mientras espera" $?
+printf 'postgres://x\n' | galgo env set DB_URL --dir "$E80/b" >/dev/null
+sleep 1.5
+galgo read w80 | grep -q "DB_URL disponible"; check "el worker sigue al aparecer la variable" $?
+galgo read w80 | grep -q "postgres://x"; [ $? -ne 0 ]; check "el valor nunca aparece en la conversación" $?
+galgo inbox --pane m80 | grep -q "postgres://x"; [ $? -ne 0 ]; check "ni en el inbox del manager" $?
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

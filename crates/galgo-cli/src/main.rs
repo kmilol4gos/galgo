@@ -1,6 +1,7 @@
 //! galgo: CLI para controlar paneles y agentes a través del daemon.
 
 mod claude;
+mod env;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -85,6 +86,11 @@ enum Cmd {
     Stop,
     /// Lo invoca el agente en cada evento (lee el JSON del evento por stdin). No imprime nada.
     Hook { agent: claude::Agent },
+    /// Variables de entorno (.env) sin abrir un IDE; los valores no pasan por el daemon.
+    Env {
+        #[command(subcommand)]
+        action: env::EnvCmd,
+    },
     /// Instala o quita los hooks de un agente.
     Hooks {
         #[command(subcommand)]
@@ -104,6 +110,7 @@ fn run() -> Result<()> {
     match &cli.cmd {
         Cmd::Hook { .. } => std::process::exit(claude::run_hook()),
         Cmd::Hooks { action } => return claude::hooks_command(action),
+        Cmd::Env { action } => return env::run(action),
         _ => {}
     }
     let req = match &cli.cmd {
@@ -139,7 +146,7 @@ fn run() -> Result<()> {
         Cmd::Ack { msg, pane } => Request::Ack { pane: pane.clone(), msg: *msg },
         Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
         Cmd::Stop => Request::Shutdown,
-        Cmd::Hook { .. } | Cmd::Hooks { .. } => unreachable!("se atienden antes"),
+        Cmd::Hook { .. } | Cmd::Hooks { .. } | Cmd::Env { .. } => unreachable!("se atienden antes"),
     };
 
     // `stop` no necesita arrancar un daemon que no existe.
