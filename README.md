@@ -32,7 +32,7 @@ scripts/install.sh
 export PATH="$HOME/.galgo/bin:$PATH"
 ```
 
-El instalador compila en release `galgo`, `galgod`, `galgo-mcp` y `galgo-gui`; la GUI usa un `CARGO_TARGET_DIR` independiente. Instala los cuatro juntos en `~/.galgo/bin`, sin sudo, e imprime la línea para el PATH sin modificar tu `.zshrc`. Para elegir otro destino, `PREFIX` es **el directorio exacto de binarios**, no su padre:
+El instalador compila en release `galgo`, `galgod`, `galgo-mcp` y `galgo-gui`; la GUI usa un `CARGO_TARGET_DIR` independiente. Instala los cuatro juntos en `~/.galgo/bin`, sin sudo, e imprime la línea para el PATH de bash/zsh sin modificar tu `.zshrc`. Si ya hay un daemon corriendo, sigue usando la versión y el entorno anteriores: guarda el trabajo de sus paneles y ejecuta `galgo stop` para que el siguiente cliente arranque el nuevo (esto detiene todos los paneles). Para elegir otro destino, `PREFIX` es **el directorio exacto de binarios**, no su padre; usa `$HOME` en lugar de una tilde literal entre comillas:
 
 ```sh
 PREFIX="$HOME/bin" scripts/install.sh
@@ -49,11 +49,15 @@ scripts/make-app.sh                       # crea ./galgo.app
 open galgo.app
 ```
 
-Puedes mover `galgo.app` a `~/Applications` o `/Applications` y abrirla desde Finder, Spotlight o el Dock. El bundle lleva sus propios binarios; conecta con el daemon existente o lo inicia si no corre. Por ahora usa el icono genérico de macOS y no está firmado ni notarizado; macOS puede exigir autorización para abrirlo. El script no reemplaza una app existente. Para elegir rutas, consulta `scripts/make-app.sh --help`.
+Puedes mover `galgo.app` a `~/Applications` o `/Applications` y abrirla desde Finder, Spotlight o el Dock. El bundle lleva sus propios binarios; conecta con el daemon existente o lo inicia si no corre. Al iniciarlo añade al PATH `~/.local/bin`, `~/.opencode/bin`, `~/.cargo/bin`, `~/.npm-global/bin`, `~/.bun/bin`, `/opt/homebrew/bin` y `/usr/local/bin`. **No ejecuta la shell de login ni carga variables de `.zshrc`**: configura aparte las variables de proveedor que necesiten los agentes. Si el daemon ya estaba activo, conserva su PATH y entorno anteriores; detenerlo con `galgo stop` cierra sus paneles. El lanzador muestra una alerta si no puede conectar o arrancar el daemon.
 
-Los tags `v*` activan el workflow de release de macOS, que publica un `.tar.gz` con `bin/` y `galgo.app`. Los binarios del archivo son para la arquitectura del runner indicada en el nombre; no son universales.
+Por ahora la app usa el icono genérico de macOS y no está firmada ni notarizada; Gatekeeper puede bloquear la app descargada y requerir autorización. El script requiere Python 3 y no reemplaza una app existente, tampoco si aparece durante la creación. Para elegir rutas, consulta `scripts/make-app.sh --help`.
+
+Los tags `v*` activan el workflow de release de macOS, pero solo se publican los que cumplen `vMAJOR.MINOR.PATCH` con un sufijo opcional `-PRERELEASE` de letras, números y puntos. El workflow publica un `.tar.gz` con `bin/` y `galgo.app`; los binarios son para la arquitectura del runner indicada en el nombre, no son universales. Se recomienda proteger los tags `v*` con reglas del repositorio.
 
 ## Uso
+
+Para el flujo diario, la GUI y la transición desde herdr, consulta la [guía de uso](docs/guia-uso.md).
 
 ```sh
 galgo spawn manager -- claude
@@ -118,16 +122,25 @@ El valor nunca va por argv ni por el daemon; se escribe de forma atómica, conse
 
 Hay un skill listo para enseñar a un agente a usar galgo en [`skills/galgo`](skills/galgo/SKILL.md).
 
+### Workspaces
+
+Un workspace agrupa los paneles de un proyecto o de una feature: `inventia/cotizacion`, `galgo/main`. Es un nombre libre.
+
+- **Al crear:** `galgo spawn w --workspace inventia/cotizacion -- claude`. Sin `--workspace`, el daemon lo deduce del repo git del directorio (`--cwd`, o el actual): `<repo>/<rama>`. Fuera de un repo no hay workspace.
+- **Al listar:** `galgo ls` agrupa por workspace, con un resumen de atención por grupo (bloqueados, entregas pendientes). `galgo ls --workspace W` muestra solo ese grupo, también con `--json`. Las herramientas MCP `galgo_spawn` y `galgo_list` aceptan el mismo campo.
+- **En la GUI:** la barra lateral agrupa los paneles. Cada grupo se pliega con su cabecera. El formulario de «Nuevo panel» hereda el workspace del panel seleccionado, y el título de la ventana cuenta los paneles que piden atención en todos los grupos.
+- **Estado:** el workspace se guarda con el resto del estado (ver «Estado entre reinicios»). Un estado anterior sin ese campo se carga igual.
+
 ### Estado entre reinicios
 
-El daemon guarda en `state.json`, junto al socket (`~/.galgo/state.json`; `GALGO_STATE` lo cambia), los mensajes del inbox que nadie ha confirmado y la lista de paneles. La escritura es atómica y el archivo queda con permisos `0600`. Se guarda al cambiar algo, no en cada lectura.
+El daemon guarda el inbox sin confirmar y la lista de paneles en un archivo junto al socket: `galgo.sock` → `galgo.state.json` (`~/.galgo/galgo.state.json` por defecto; `GALGO_STATE` lo cambia). Así dos daemons en el mismo directorio no comparten estado. La escritura es atómica, el archivo queda con permisos `0600`, y el directorio debe ser privado (no escribible por otros).
 
-Al reiniciar:
-
-- **Los mensajes sin confirmar siguen en el inbox.** Un resultado no se pierde por reiniciar el daemon.
-- **Los paneles no sobreviven.** Su proceso muere con el daemon. Cada panel que existía vuelve como panel sin proceso: aparece en `galgo ls` con estado `exited`, y su manager recibe un aviso («el daemon se reinició; el panel X ya no existe»). Un `spawn` con el mismo nombre lo reemplaza y hereda su inbox.
-- **Los ids de mensaje llevan un epoch** en la parte alta (`epoch << 32 | secuencia`). Un `ack` de un mensaje de la ejecución anterior confirma ese mensaje si sigue en el inbox. Un id de otra ejecución que ya no existe se rechaza con un aviso, sin confirmar nada.
-- **Un archivo corrupto o de otra versión se ignora** con un aviso en el log del daemon (`~/.galgo/galgod.log`). El daemon arranca con un estado vacío y lo sobrescribe en el siguiente cambio.
+- **Cuándo se guarda.** Solo cuando cambia el inbox o la lista de paneles, agrupado: un guardado espera 200 ms y escribe una vez. Los `send` no escriben nada, y el apagado guarda lo pendiente antes de salir.
+- **Mensajes sin confirmar** siguen en el inbox tras reiniciar: un resultado no se pierde.
+- **Los paneles no sobreviven.** Cada panel que existía vuelve como panel sin proceso (`exited` en `galgo ls`), y su manager recibe el aviso «el daemon se reinició; el panel X ya no existe». Un panel sin proceso y sin mensajes pendientes no se guarda.
+- **Reutilizar y quitar.** `galgo spawn` con el nombre de un panel sin proceso lo reemplaza y hereda su inbox. `galgo kill` quita un panel sin proceso y pasa sus mensajes pendientes a su manager. Si no tiene manager vivo y tiene mensajes pendientes, `kill` se rechaza: confírmalos con `galgo ack` antes.
+- **Ids de mensaje con epoch.** Cada arranque tiene un epoch (los segundos de la hora de arranque) en la parte alta del id. Un `ack` de otra ejecución que ya no existe se rechaza sin confirmar nada. El epoch no depende del archivo: si el estado falta o está corrupto, no vuelve a 1.
+- **Un archivo que no sirve se aparta, no se sobrescribe.** Si no es un archivo regular, es demasiado grande, está corrupto o es de otra versión, el daemon lo ignora con aviso en el log (`~/.galgo/galgod.log`) y lo deja como `<nombre>.corrupt-<segundos>` para revisarlo. Arranca sin estado.
 
 ## Seguridad
 

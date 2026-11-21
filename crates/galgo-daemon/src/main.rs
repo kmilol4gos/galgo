@@ -90,6 +90,9 @@ struct Pane {
     _master: Option<Box<dyn MasterPty + Send>>,
     /// Panel restaurado tras un reinicio del daemon: existe en la lista y en el inbox, pero su proceso murió.
     ghost: bool,
+    /// Workspace del panel ("<proyecto>/<rama>" o un nombre libre) y su directorio de trabajo.
+    workspace: Option<String>,
+    cwd: Option<String>,
     inbox: Vec<InboxMsg>,
     last_summary: Option<String>,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
@@ -118,7 +121,15 @@ impl ChildKiller for GhostKiller {
 
 impl Pane {
     /// Panel restaurado: sin PTY. Las órdenes que lo necesitan fallan con un error claro.
-    fn ghost(id: u32, name: String, cmd: Vec<String>, manager: Option<u32>, inbox: Vec<InboxMsg>) -> Pane {
+    fn ghost(
+        id: u32,
+        name: String,
+        cmd: Vec<String>,
+        manager: Option<u32>,
+        inbox: Vec<InboxMsg>,
+        workspace: Option<String>,
+        cwd: Option<String>,
+    ) -> Pane {
         // Entrada cerrada desde el principio: escribir en un panel sin proceso da "no acepta entrada".
         let (input, rx) = sync_channel::<Vec<u8>>(1);
         drop(rx);
@@ -138,6 +149,8 @@ impl Pane {
             touched_since_report: false,
             _master: None,
             ghost: true,
+            workspace,
+            cwd,
             inbox,
             last_summary: None,
             last_blocked: None,
@@ -161,9 +174,22 @@ struct State {
     panes: BTreeMap<u32, Pane>,
     /// Nombres que un spawn en curso ya reservó y aún no tienen panel.
     reserved: HashSet<String>,
+    /// Se incrementa con cada cambio persistente (inbox, paneles). El guardado solo escribe si cambió.
+    version: u64,
 }
 
 impl State {
+    /// Marca un cambio persistente.
+    fn touch(&mut self) {
+        self.version += 1;
+    }
+
+    /// Id nuevo de mensaje: el epoch en la parte alta, así un ack de otra ejecución no lo confunde.
+    fn next_msg_id(&mut self) -> u64 {
+        self.next_msg += 1;
+        (self.epoch << 32) | (self.next_msg & 0xFFFF_FFFF)
+    }
+
     fn resolve(&self, r: &str) -> Result<u32> {
         if let Ok(id) = r.parse::<u32>() {
             if self.panes.contains_key(&id) {
@@ -178,9 +204,8 @@ impl State {
     }
 
     fn push(&mut self, to: u32, from: u32, kind: &'static str, summary: String) {
-        self.next_msg += 1;
-        // Epoch en la parte alta: un ack de otra ejecución del daemon no puede confirmar un mensaje de esta.
-        let id = (self.epoch << 32) | (self.next_msg & 0xFFFF_FFFF);
+        let id = self.next_msg_id();
+        self.touch();
         let from_name = self.panes.get(&from).map(|p| p.name.clone()).unwrap_or_default();
         if let Some(p) = self.panes.get_mut(&to) {
             p.inbox.push(InboxMsg {
@@ -216,6 +241,8 @@ impl State {
             orphan: oldest.is_some_and(|s| s >= orphan_secs),
             waiting_on: p.waiting_on.and_then(|(t, _)| self.panes.get(&t)).map(|t| t.name.clone()),
             waiting_secs: p.waiting_on.map(|(_, at)| at.elapsed().as_secs()),
+            workspace: p.workspace.clone(),
+            cwd: p.cwd.clone(),
         }
     }
 }
@@ -225,6 +252,8 @@ struct Daemon {
     /// Dónde se guarda el estado entre reinicios, y un candado para escribirlo en orden.
     state_path: PathBuf,
     persist_lock: Mutex<()>,
+    /// Avisa al hilo de guardado de que hubo cambios. Enviar no bloquea.
+    persist_tx: std::sync::mpsc::Sender<()>,
     notify: Notify,
     socket: PathBuf,
     orphan_secs: u64,
@@ -308,6 +337,49 @@ fn token(gen: u64, offset: u16) -> u64 {
     (gen << 16) | offset as u64
 }
 
+/// Retardo del guardado: los cambios que llegan seguidos se escriben juntos.
+const PERSIST_DELAY: Duration = Duration::from_millis(200);
+
+/// Hilo de guardado: espera un cambio, deja pasar el retardo para agrupar los que vengan, y escribe.
+fn persist_loop(d: Arc<Daemon>, rx: std::sync::mpsc::Receiver<()>) {
+    let mut last = None;
+    while rx.recv().is_ok() {
+        std::thread::sleep(PERSIST_DELAY);
+        while rx.try_recv().is_ok() {}
+        d.write_state(&mut last, false);
+    }
+}
+
+/// Deduce el workspace de un directorio dentro de un repo git: "<repo>/<rama>". Sin git, o con el
+/// HEAD desligado, devuelve `None` o solo el nombre del repo. Nunca falla: git ausente no es un error.
+fn workspace_for(cwd: Option<&str>) -> Option<String> {
+    let dir = cwd?;
+    let top = git_out(dir, &["rev-parse", "--show-toplevel"])?;
+    let branch = git_out(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    Some(workspace_name(&top, &branch))
+}
+
+fn git_out(dir: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// "<repo>/<rama>" a partir de la raíz del repo y la rama. El HEAD desligado ("HEAD") deja solo el repo.
+fn workspace_name(top: &str, branch: &str) -> String {
+    let repo = std::path::Path::new(top).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| top.to_string());
+    if branch.is_empty() || branch == "HEAD" { repo } else { format!("{repo}/{branch}") }
+}
+
 fn is_session_marker(key: &str) -> bool {
     const EXACT: [&str; 11] = [
         "CLAUDECODE",
@@ -344,8 +416,12 @@ impl Daemon {
         inject: bool,
         rows: u16,
         cols: u16,
+        workspace: Option<String>,
     ) -> Result<u32> {
         check_size(rows, cols)?;
+        // Sin workspace explícito, se deduce del repo git del directorio ("<repo>/<rama>"), si lo hay.
+        let workspace = workspace.filter(|w| !w.trim().is_empty()).or_else(|| workspace_for(cwd.as_deref()));
+        let cwd_saved = cwd.clone();
         if name.trim().is_empty() || name.parse::<u32>().is_ok() {
             bail!("nombre inválido: no puede estar vacío ni ser solo un número");
         }
@@ -361,7 +437,7 @@ impl Daemon {
         // dos spawns concurrentes con el mismo nombre no pueden pasar los dos.
         let (id, manager_id, mut reservation) = {
             let mut st = self.state.lock().unwrap();
-            if st.panes.values().any(|p| p.name == name) || st.reserved.contains(&name) {
+            if st.panes.values().any(|p| !p.ghost && p.name == name) || st.reserved.contains(&name) {
                 bail!("ya existe un panel llamado {name}");
             }
             let m = match manager {
@@ -434,6 +510,8 @@ impl Daemon {
             touched_since_report: false,
             _master: Some(pair.master),
             ghost: false,
+            workspace,
+            cwd: cwd_saved,
             inbox: Vec::new(),
             last_summary: None,
             last_blocked: None,
@@ -452,6 +530,7 @@ impl Daemon {
                 }
             }
             st.panes.insert(id, pane);
+            st.touch();
         }
         reservation.name = None;
 
@@ -483,7 +562,9 @@ impl Daemon {
             let mut st = self.state.lock().unwrap();
             let Some(p) = st.panes.get_mut(&id) else { return };
             p.exited = true;
-            p.pid
+            let pid = p.pid;
+            st.touch();
+            pid
         };
         // El líder todavía no se recolectó: su pid sigue siendo suyo y la lista de la sesión es fiable.
         if let Some(sid) = sid {
@@ -500,6 +581,7 @@ impl Daemon {
     fn on_exit(&self, id: u32, code: Option<u32>) {
         let manager = {
             let mut st = self.state.lock().unwrap();
+            st.touch();
             let Some(p) = st.panes.get_mut(&id) else { return };
             let notify = !p.reported || p.touched_since_report;
             p.exited = true;
@@ -520,7 +602,7 @@ impl Daemon {
         if let Some(m) = manager {
             self.try_inject(m);
         }
-        self.persist();
+        self.mark_dirty();
     }
 
     /// Encola en el panel los mensajes pendientes si pidió `inject` y está `idle`.
@@ -663,10 +745,11 @@ impl Daemon {
 
     /// Atiende una solicitud. `wait` devuelve además el mensaje a confirmar tras responder.
     async fn dispatch(self: &Arc<Self>, req: Request) -> (Result<Value>, Option<(u32, u64)>) {
-        // Solo lo que cambia el estado persistente se guarda: las lecturas (snapshots, ls) no.
+        // Solo lo que puede cambiar el inbox o la lista de paneles avisa al guardado. Un `Send` no cambia
+        // nada persistente (el texto no se guarda), y las lecturas tampoco: no se escribe nada por ellos.
         let mutating = matches!(
             req,
-            Request::Spawn { .. } | Request::Send { .. } | Request::Done { .. } | Request::Hook { .. }
+            Request::Spawn { .. } | Request::Done { .. } | Request::Hook { .. }
                 | Request::Ack { .. } | Request::Kill { .. } | Request::Wait { .. }
         );
         let out = match req {
@@ -676,27 +759,44 @@ impl Daemon {
             other => (self.handle(other).await, None),
         };
         if mutating {
-            self.persist();
+            self.mark_dirty();
         }
         out
     }
 
-    /// Guarda el estado en disco. Un fallo se avisa en el log: el daemon sigue funcionando.
-    fn persist(&self) {
+    /// Marca el estado como cambiado. El hilo de guardado escribe poco después, agrupando los cambios
+    /// seguidos. No bloquea: no hay escritura en el hilo de la petición.
+    fn mark_dirty(&self) {
+        let _ = self.persist_tx.send(());
+    }
+
+    /// Escribe ahora, sin esperar al hilo (arranque y apagado).
+    fn persist_now(&self) {
+        let mut last = None;
+        self.write_state(&mut last, true);
+    }
+
+    /// Escribe el estado si cambió desde la última escritura (`last` recuerda la versión escrita).
+    /// Un fallo se avisa en el log: el daemon sigue funcionando.
+    fn write_state(&self, last: &mut Option<u64>, force: bool) {
         let _order = self.persist_lock.lock().unwrap();
-        let saved = {
+        let (version, saved) = {
             let st = self.state.lock().unwrap();
-            persist::snapshot(&st)
+            if !force && *last == Some(st.version) {
+                return;
+            }
+            (st.version, persist::snapshot(&st))
         };
-        if let Err(e) = persist::write(&self.state_path, &saved) {
-            eprintln!("galgod: no pude guardar el estado: {e:#}");
+        match persist::write(&self.state_path, &saved) {
+            Ok(()) => *last = Some(version),
+            Err(e) => eprintln!("galgod: no pude guardar el estado: {e:#}"),
         }
     }
 
     async fn handle(self: &Arc<Self>, req: Request) -> Result<Value> {
         match req {
-            Request::Spawn { name, cmd, cwd, manager, inject, rows, cols } => {
-                let id = self.spawn_pane(name, cmd, cwd, manager, inject, rows, cols)?;
+            Request::Spawn { name, cmd, cwd, manager, inject, rows, cols, workspace } => {
+                let id = self.spawn_pane(name, cmd, cwd, manager, inject, rows, cols, workspace)?;
                 let st = self.state.lock().unwrap();
                 Ok(serde_json::to_value(st.info(&st.panes[&id], self.orphan_secs))?)
             }
@@ -945,6 +1045,9 @@ impl Daemon {
                 Ok(json!({}))
             }
             Request::Kill { pane } => {
+                if let Some(out) = self.forget_ghost(&pane)? {
+                    return Ok(out);
+                }
                 let (id, name, sid, exited, orphans) = {
                     let st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
@@ -993,14 +1096,43 @@ impl Daemon {
             }
             Request::Shutdown => {
                 let socket = self.socket.clone();
+                let me = Arc::clone(self);
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Lo pendiente del hilo de guardado se escribe antes de salir.
+                    me.persist_now();
                     let _ = std::fs::remove_file(socket);
                     std::process::exit(0);
                 });
                 Ok(json!({}))
             }
         }
+    }
+
+    /// Quita un panel restaurado (sin proceso). Su inbox sin confirmar pasa a su manager vivo. Si tiene
+    /// mensajes pendientes y no hay manager al que pasarlos, se rechaza sin tocar nada: nunca se descarta
+    /// un resultado en silencio.
+    fn forget_ghost(&self, pane: &str) -> Result<Option<Value>> {
+        let mut st = self.state.lock().unwrap();
+        let id = st.resolve(pane)?;
+        if !st.panes[&id].ghost {
+            return Ok(None);
+        }
+        let manager = st.panes[&id].manager.filter(|m| st.panes.contains_key(m));
+        let pending = st.panes[&id].inbox.iter().filter(|m| !m.acked).count();
+        if pending > 0 && manager.is_none() {
+            bail!(
+                "el panel {pane} tiene {pending} mensaje(s) sin confirmar y no tiene manager al que pasarlos; confírmalos con galgo ack o reasigna un manager"
+            );
+        }
+        let ghost = st.panes.remove(&id).unwrap();
+        let mut moved = 0usize;
+        for m in ghost.inbox.into_iter().filter(|m| !m.acked) {
+            st.panes.get_mut(&manager.unwrap()).unwrap().inbox.push(m);
+            moved += 1;
+        }
+        st.touch();
+        Ok(Some(json!({ "removed": ghost.name, "moved": moved })))
     }
 
     /// Reintenta cada cierto tiempo los mensajes que nadie ha confirmado.
@@ -1086,7 +1218,7 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
                 d.hold(pane, msg, d.ack_secs);
             } else if written {
                 d.confirm(pane, msg);
-                d.persist();
+                d.mark_dirty();
             } else {
                 d.release(pane, msg);
             }
@@ -1110,22 +1242,24 @@ async fn main() -> Result<()> {
         }
         std::fs::remove_file(&socket)?;
     }
+    // Estado del arranque anterior, antes de aceptar conexiones: inbox sin confirmar y paneles (que vuelven
+    // sin proceso). Un archivo que no sirve se aparta con aviso. El epoch no depende del archivo.
+    let state_path = persist::state_path(&socket);
+    let saved = persist::load(&state_path);
+    let mut state = State { epoch: persist::epoch_for(saved.as_ref()), ..State::default() };
+    if let Some(s) = saved {
+        persist::restore(&mut state, s);
+    }
+    let (persist_tx, persist_rx) = std::sync::mpsc::channel::<()>();
     let listener = UnixListener::bind(&socket)?;
     // Quien alcance el socket puede escribir en todos los paneles: solo el dueño.
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
-    // Estado del arranque anterior: inbox sin confirmar y paneles (que vuelven sin proceso).
-    // Un archivo ilegible se ignora con aviso; el epoch siempre sube, así los ids nuevos no chocan.
-    let state_path = persist::state_path(&socket);
-    let saved = persist::load(&state_path);
-    let mut state = State { epoch: saved.as_ref().map_or(1, |s| s.epoch + 1), ..State::default() };
-    if let Some(s) = saved {
-        persist::restore(&mut state, s);
-    }
     let daemon = Arc::new(Daemon {
         state: Mutex::new(state),
         state_path,
         persist_lock: Mutex::new(()),
+        persist_tx,
         notify: Notify::new(),
         socket: socket.clone(),
         orphan_secs: env_u64("GALGO_ORPHAN_SECS", 30),
@@ -1133,8 +1267,13 @@ async fn main() -> Result<()> {
         retry: Duration::from_secs(env_u64("GALGO_RETRY_SECS", 60)),
         write_timeout: Duration::from_secs(env_u64("GALGO_WRITE_TIMEOUT_SECS", 10)),
     });
-    // El epoch nuevo queda guardado antes de aceptar la primera conexión.
-    daemon.persist();
+    // El epoch nuevo queda guardado antes de aceptar la primera conexión; luego el hilo de guardado
+    // escribe lo que cambie, agrupado y fuera del hilo de las peticiones.
+    daemon.persist_now();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || persist_loop(d, persist_rx));
+    }
     eprintln!("galgod escuchando en {}", socket.display());
 
     let d = Arc::clone(&daemon);
@@ -1250,5 +1389,131 @@ mod tests_sesion {
         let g = fresh_gen();
         assert!(g > 1_000_000, "la generación inicial viene de la hora de arranque");
         assert!(g < (1 << 40));
+    }
+}
+
+#[cfg(test)]
+mod tests_workspace {
+    use super::*;
+
+    /// "<repo>/<rama>": el repo es el último componente de la raíz; el HEAD desligado deja solo el repo.
+    #[test]
+    fn nombre_de_workspace_desde_repo_y_rama() {
+        assert_eq!(workspace_name("/Users/ana/proyectos/galgo", "feat/panel"), "galgo/feat/panel");
+        assert_eq!(workspace_name("/Users/ana/proyectos/galgo", "main"), "galgo/main");
+        assert_eq!(workspace_name("/Users/ana/proyectos/galgo", "HEAD"), "galgo");
+        assert_eq!(workspace_name("/Users/ana/proyectos/galgo", ""), "galgo");
+    }
+
+    /// Sin cwd, o fuera de un repo, no hay workspace deducido ni error.
+    #[test]
+    fn sin_repo_no_hay_workspace() {
+        assert_eq!(workspace_for(None), None);
+        let dir = std::env::temp_dir().join(format!("galgo-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Un directorio temporal fuera de cualquier repo: git falla y la deducción no hace nada.
+        let d = dir.to_string_lossy().to_string();
+        let _ = workspace_for(Some(&d));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Un repo real: la deducción sale de git, con la rama actual.
+    #[test]
+    fn deduce_repo_y_rama_de_git() {
+        let dir = std::env::temp_dir().join(format!("galgo-ws-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        run(&["init", "-q", "-b", "feat-x"]);
+        run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let d = dir.to_string_lossy().to_string();
+        let ws = workspace_for(Some(&d));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Los directorios temporales de macOS pueden estar bajo un enlace: solo se comprueba la rama y el nombre.
+        let ws = ws.expect("git debe deducir el workspace");
+        assert!(ws.ends_with("/feat-x"), "{ws}");
+        assert!(ws.starts_with("galgo-ws-git-"), "{ws}");
+    }
+}
+
+#[cfg(test)]
+mod tests_fantasmas {
+    use super::*;
+
+    fn daemon_con(state: State) -> Arc<Daemon> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Arc::new(Daemon {
+            state: Mutex::new(state),
+            state_path: std::env::temp_dir().join("galgo-no-se-usa.json"),
+            persist_lock: Mutex::new(()),
+            persist_tx: tx,
+            notify: Notify::new(),
+            socket: PathBuf::from("/dev/null"),
+            orphan_secs: 30,
+            ack_secs: 5,
+            retry: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(10),
+        })
+    }
+
+    fn fantasma(id: u32, name: &str, manager: Option<u32>) -> Pane {
+        Pane::ghost(id, name.into(), vec!["bash".into()], manager, vec![], None, None)
+    }
+
+    fn msg(id: u64, from: u32, summary: &str) -> InboxMsg {
+        InboxMsg {
+            id,
+            from,
+            from_name: "w".into(),
+            kind: "done",
+            summary: summary.into(),
+            created: Instant::now(),
+            acked: false,
+            claimed: false,
+            hold_until: None,
+            last_inject: None,
+        }
+    }
+
+    /// M1: quitar un fantasma pasa su inbox sin confirmar a su manager; el nombre queda libre.
+    #[test]
+    fn quitar_un_fantasma_pasa_su_inbox_al_manager() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(1, fantasma(1, "mgr", None));
+        let mut w = fantasma(2, "w", Some(1));
+        w.inbox.push(msg(10, 2, "resultado"));
+        st.panes.insert(2, w);
+        let d = daemon_con(st);
+        let out = d.forget_ghost("w").unwrap().expect("era un fantasma");
+        assert_eq!(out["moved"], 1);
+        let st = d.state.lock().unwrap();
+        assert!(!st.panes.contains_key(&2), "el fantasma desaparece");
+        assert_eq!(st.panes[&1].inbox[0].summary, "resultado", "el resultado llega al manager");
+    }
+
+    /// M1: un panel con proceso no se trata como fantasma.
+    #[test]
+    fn un_panel_vivo_no_se_quita_como_fantasma() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let mut vivo = fantasma(5, "vivo", None);
+        vivo.ghost = false;
+        st.panes.insert(5, vivo);
+        let d = daemon_con(st);
+        assert!(d.forget_ghost("vivo").unwrap().is_none());
+    }
+
+    /// M1: sin manager vivo, un fantasma con mensajes pendientes no se quita (no se pierde ningún resultado).
+    #[test]
+    fn no_quitar_un_fantasma_con_pendientes_sin_manager() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let mut w = fantasma(2, "w", None);
+        w.inbox.push(msg(10, 2, "importante"));
+        st.panes.insert(2, w);
+        let d = daemon_con(st);
+        assert!(d.forget_ghost("w").is_err());
+        let st = d.state.lock().unwrap();
+        assert!(st.panes.contains_key(&2), "el fantasma sigue");
+        assert_eq!(st.panes[&2].inbox[0].summary, "importante");
     }
 }

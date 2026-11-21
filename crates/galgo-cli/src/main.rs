@@ -35,11 +35,18 @@ enum Cmd {
         inject: bool,
         #[arg(long)]
         cwd: Option<String>,
+        /// Workspace del panel, p. ej. "inventia/cotizacion". Si falta, se deduce del repo git de --cwd.
+        #[arg(long)]
+        workspace: Option<String>,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
     /// Lista paneles. Marca los que tienen entregas sin confirmar.
-    Ls,
+    /// Lista paneles agrupados por workspace. Con --workspace, solo los de ese workspace.
+    Ls {
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Escribe texto en un panel.
     Send {
         pane: String,
@@ -123,7 +130,8 @@ fn run() -> Result<()> {
         _ => {}
     }
     let req = match &cli.cmd {
-        Cmd::Spawn { name, manager, inject, cwd, cmd } => Request::Spawn {
+        Cmd::Spawn { name, manager, inject, cwd, workspace, cmd } => Request::Spawn {
+            workspace: workspace.clone(),
             name: name.clone(),
             cmd: cmd.clone(),
             cwd: {
@@ -136,7 +144,7 @@ fn run() -> Result<()> {
             rows: 40,
             cols: 140,
         },
-        Cmd::Ls => Request::List,
+        Cmd::Ls { .. } => Request::List,
         Cmd::Send { pane, text, no_enter } => {
             Request::Send { pane: pane.clone(), text: text.clone(), enter: !no_enter }
         }
@@ -172,10 +180,15 @@ fn run() -> Result<()> {
         (Cmd::Wait { .. }, Some(msg), Some(pane)) => Some((pane, msg)),
         _ => None,
     };
+    // `ls --workspace W` filtra la respuesta antes de imprimirla, igual en --json que en texto.
+    let data = match &cli.cmd {
+        Cmd::Ls { workspace: Some(w) } => filter_workspace(resp.data, w),
+        _ => resp.data,
+    };
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&resp.data)?);
+        println!("{}", serde_json::to_string_pretty(&data)?);
     } else {
-        print_human(&cli.cmd, resp.data)?;
+        print_human(&cli.cmd, data)?;
     }
     // Se confirma después de imprimir: si el proceso muere antes, el mensaje sigue pendiente.
     if let Some((pane, msg)) = ack {
@@ -187,35 +200,77 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// Paneles de un workspace concreto. Una respuesta que no es una lista se devuelve tal cual.
+fn filter_workspace(data: Value, workspace: &str) -> Value {
+    match data {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .filter(|p| p["workspace"].as_str() == Some(workspace))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Encabezado de un grupo: nombre del workspace y resumen de atención de sus paneles.
+fn workspace_header(workspace: Option<&str>, group: &[&PaneInfo]) -> String {
+    let blocked = group.iter().filter(|p| p.status == Status::Blocked).count();
+    let pending = group.iter().filter(|p| p.unacked > 0 || p.orphan).count();
+    let name = workspace.unwrap_or("sin workspace");
+    let mut notes = Vec::new();
+    if blocked > 0 {
+        notes.push(format!("{blocked} bloqueado(s)"));
+    }
+    if pending > 0 {
+        notes.push(format!("{pending} con entregas pendientes"));
+    }
+    if notes.is_empty() {
+        format!("── {name} ({})", group.len())
+    } else {
+        format!("── {name} ({}) · {}", group.len(), notes.join(" · "))
+    }
+}
+
+fn print_pane(p: &PaneInfo) {
+    let mut notes = Vec::new();
+    if let Some(m) = &p.manager {
+        notes.push(format!("reporta a {m}"));
+    }
+    if let (Some(t), Some(s)) = (&p.waiting_on, p.waiting_secs) {
+        notes.push(format!("espera a {t} hace {s}s"));
+    }
+    if p.orphan {
+        notes.push(format!(
+            "ENTREGA SIN CONFIRMAR hace {}s ({} mensaje(s))",
+            p.oldest_unacked_secs.unwrap_or(0),
+            p.unacked
+        ));
+    } else if p.unacked > 0 {
+        notes.push(format!("{} mensaje(s) pendiente(s)", p.unacked));
+    }
+    println!("{:>3}  {:<20} {:<8} {}", p.id, p.name, p.status, notes.join(" · "));
+}
+
 fn print_human(cmd: &Cmd, data: Value) -> Result<()> {
     match cmd {
         Cmd::Spawn { .. } => {
             let p: PaneInfo = serde_json::from_value(data)?;
-            println!("panel {} ({}) creado", p.id, p.name);
+            match &p.workspace {
+                Some(w) => println!("panel {} ({}) creado en {w}", p.id, p.name),
+                None => println!("panel {} ({}) creado", p.id, p.name),
+            }
         }
-        Cmd::Ls => {
+        Cmd::Ls { .. } => {
             let panes: Vec<PaneInfo> = serde_json::from_value(data)?;
             if panes.is_empty() {
                 println!("sin paneles");
             }
-            for p in panes {
-                let mut notes = Vec::new();
-                if let Some(m) = &p.manager {
-                    notes.push(format!("reporta a {m}"));
+            for (ws, group) in galgo_proto::group_by_workspace(&panes) {
+                println!("{}", workspace_header(ws.as_deref(), &group));
+                for p in group {
+                    print_pane(p);
                 }
-                if let (Some(t), Some(s)) = (&p.waiting_on, p.waiting_secs) {
-                    notes.push(format!("espera a {t} hace {s}s"));
-                }
-                if p.orphan {
-                    notes.push(format!(
-                        "ENTREGA SIN CONFIRMAR hace {}s ({} mensaje(s))",
-                        p.oldest_unacked_secs.unwrap_or(0),
-                        p.unacked
-                    ));
-                } else if p.unacked > 0 {
-                    notes.push(format!("{} mensaje(s) pendiente(s)", p.unacked));
-                }
-                println!("{:>3}  {:<20} {:<8} {}", p.id, p.name, p.status, notes.join(" · "));
             }
         }
         Cmd::Read { .. } => println!("{}", data["text"].as_str().unwrap_or("")),
@@ -238,4 +293,41 @@ fn print_human(cmd: &Cmd, data: Value) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_workspace {
+    use super::*;
+    use serde_json::json;
+
+    fn pane(id: u32, status: Status, ws: Option<&str>, unacked: usize) -> PaneInfo {
+        serde_json::from_value(json!({
+            "id": id, "name": format!("p{id}"), "status": status, "manager": null, "cmd": [],
+            "unacked": unacked, "oldest_unacked_secs": null, "orphan": false,
+            "waiting_on": null, "waiting_secs": null, "workspace": ws, "cwd": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn filtra_por_workspace_exacto() {
+        let data = json!([
+            {"id": 1, "workspace": "inventia/cotizacion"},
+            {"id": 2, "workspace": "galgo/main"},
+            {"id": 3}
+        ]);
+        let out = filter_workspace(data, "inventia/cotizacion");
+        assert_eq!(out, json!([{"id": 1, "workspace": "inventia/cotizacion"}]));
+        // Una respuesta que no es lista (p. ej. un error de otro tipo) pasa tal cual.
+        assert_eq!(filter_workspace(json!({"x": 1}), "a"), json!({"x": 1}));
+    }
+
+    #[test]
+    fn encabezado_resume_atencion() {
+        let a = pane(1, Status::Blocked, Some("w"), 0);
+        let b = pane(2, Status::Idle, Some("w"), 2);
+        let c = pane(3, Status::Idle, Some("w"), 0);
+        assert_eq!(workspace_header(Some("w"), &[&a, &b, &c]), "── w (3) · 1 bloqueado(s) · 1 con entregas pendientes");
+        assert_eq!(workspace_header(None, &[&c]), "── sin workspace (1)");
+    }
 }

@@ -80,6 +80,31 @@ impl Attention {
     }
 }
 
+/// Resumen de atención de un grupo de paneles: "2 bloqueado(s) · 1 sin leer · 1 sin confirmar". Vacío si
+/// ninguno pide atención.
+pub fn group_summary(group: &[&PaneInfo], attention: &Attention) -> String {
+    let (mut blocked, mut unread, mut orphan) = (0, 0, 0);
+    for p in group {
+        match badge(p, attention.is_unread(p.id)) {
+            Some(Badge::Blocked) => blocked += 1,
+            Some(Badge::DoneUnread) => unread += 1,
+            Some(Badge::Orphan) => orphan += 1,
+            None => {}
+        }
+    }
+    let mut parts = Vec::new();
+    if blocked > 0 {
+        parts.push(format!("{blocked} bloqueado(s)"));
+    }
+    if unread > 0 {
+        parts.push(format!("{unread} sin leer"));
+    }
+    if orphan > 0 {
+        parts.push(format!("{orphan} sin confirmar"));
+    }
+    parts.join(" · ")
+}
+
 /// Título de la ventana: "galgo" o "galgo (N)" cuando N paneles piden atención.
 pub fn window_title(count: usize) -> String {
     if count == 0 { "galgo".into() } else { format!("galgo ({count})") }
@@ -115,6 +140,8 @@ mod tests {
             orphan: false,
             waiting_on: None,
             waiting_secs: None,
+            workspace: None,
+            cwd: None,
         }
     }
 
@@ -198,5 +225,20 @@ mod tests {
         assert_eq!(notification_text("w", Status::Blocked), "w necesita una decisión");
         let s = notification_script("a\"b", Status::Done);
         assert_eq!(s, "display notification \"a\\\"b terminó su turno\" with title \"galgo\"");
+    }
+
+    /// Resumen por grupo: cuenta bloqueados, sin leer y sin confirmar; vacío si no hay nada.
+    #[test]
+    fn resumen_de_grupo() {
+        let mut a = Attention::default();
+        a.observe(&[pane(1, "x", Status::Working), pane(2, "y", Status::Working)], None);
+        a.observe(&[pane(1, "x", Status::Done), pane(2, "y", Status::Blocked)], None);
+        let p1 = pane(1, "x", Status::Done);
+        let p2 = pane(2, "y", Status::Blocked);
+        let mut p3 = pane(3, "z", Status::Idle);
+        p3.orphan = true;
+        assert_eq!(group_summary(&[&p1, &p2], &a), "1 bloqueado(s) · 1 sin leer");
+        assert_eq!(group_summary(&[&p3], &a), "1 sin confirmar");
+        assert_eq!(group_summary(&[&pane(4, "w", Status::Idle)], &a), "");
     }
 }

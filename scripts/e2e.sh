@@ -952,5 +952,102 @@ PY112
 check "el token de vista sale de la hora de arranque y un offset distinto no devuelve unchanged" $?
 GALGO_SOCKET="$TMP/env112/g.sock" galgo stop >/dev/null 2>&1
 
+echo "113. workspaces: spawn, ls agrupado y filtrado, deducción desde git, estado anterior sin el campo"
+galgo spawn ws-a --workspace "inventia/cotizacion" -- bash --norc >/dev/null
+galgo spawn ws-b --workspace "galgo/main" -- bash --norc >/dev/null
+galgo ls | grep -q "── inventia/cotizacion (1)"; check "ls agrupa por workspace" $?
+galgo ls --workspace "galgo/main" | grep -q "ws-b"; check "ls --workspace muestra los del workspace" $?
+galgo ls --workspace "galgo/main" | grep -q "ws-a"; [ $? -ne 0 ]; check "ls --workspace oculta los demás" $?
+galgo --json ls --workspace "inventia/cotizacion" | grep -q '"workspace": "inventia/cotizacion"'; check "--json trae el workspace" $?
+REPO113="$TMP/repo113"
+mkdir -p "$REPO113"
+git -C "$REPO113" init -q -b feat-113
+git -C "$REPO113" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x
+galgo spawn ws-git --cwd "$REPO113" -- bash --norc >/dev/null
+galgo --json ls | python3 -c 'import json,sys; p=[x for x in json.load(sys.stdin) if x["name"]=="ws-git"][0]; sys.exit(0 if p["workspace"].endswith("/feat-113") and p["workspace"].startswith("repo113") else 1)'
+check "sin --workspace se deduce <repo>/<rama> de git" $?
+mkdir -p "$TMP/c113"
+printf '%s' '{"version":1,"epoch":1,"next_pane":1,"next_msg":0,"panes":[{"id":1,"name":"viejo","cmd":["bash"],"manager":null,"alive":false,"inbox":[]}]}' > "$TMP/c113/g.state.json"
+GALGO_SOCKET="$TMP/c113/g.sock" galgo ls | grep -q "viejo"; check "un estado anterior sin campo de workspace se carga" $?
+GALGO_SOCKET="$TMP/c113/g.sock" galgo stop >/dev/null 2>&1
+
+echo "120. M3: un Send no reescribe el estado; un cambio del inbox sí, agrupado"
+galgo spawn mw120 -- bash --norc >/dev/null
+galgo spawn sw120 --manager mw120 -- bash --norc >/dev/null
+sleep 0.8
+ST="$TMP/galgo.state.json"
+M0=$(python3 -c "import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)" "$ST")
+for i in $(seq 1 200); do galgo send sw120 "x" --no-enter >/dev/null; done
+sleep 0.5
+M1=$(python3 -c "import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)" "$ST")
+[ "$M0" = "$M1" ]; check "200 Send seguidos no reescriben state.json" $?
+galgo send sw120 $'\x15' --no-enter >/dev/null
+galgo send sw120 'galgo done --summary "cambio120"' >/dev/null
+sleep 0.8
+M2=$(python3 -c "import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)" "$ST")
+[ "$M1" != "$M2" ]; check "un resultado sí se guarda" $?
+
+echo "121. M2: sin state.json (o corrupto) el epoch no vuelve a 1; un ack de antes no confirma uno nuevo"
+mkdir -p "$TMP/c121" && chmod 700 "$TMP/c121"
+export GALGO_SOCKET="$TMP/c121/g.sock"
+galgo spawn m121 -- bash --norc >/dev/null
+galgo spawn w121 --manager m121 -- bash --norc >/dev/null
+galgo send w121 'galgo done --summary "viejo121"' >/dev/null
+sleep 0.8
+OLD121=$(galgo --json inbox --pane m121 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+galgo stop >/dev/null 2>&1; sleep 0.5
+printf '%s' '{corrupto' > "$TMP/c121/g.state.json"
+galgo ls >/dev/null
+ls "$TMP/c121" | grep -q "corrupt"; check "el estado corrupto se aparta, no se sobrescribe" $?
+galgo spawn m121b -- bash --norc >/dev/null 2>&1
+galgo spawn w121b --manager m121b -- bash --norc >/dev/null
+galgo send w121b 'galgo done --summary "nuevo121"' >/dev/null
+sleep 0.8
+galgo ack "$OLD121" --pane m121b >/dev/null 2>&1; [ $? -ne 0 ]; check "el ack de antes del corrupto se rechaza" $?
+galgo inbox --pane m121b | grep -q "nuevo121"; check "el mensaje nuevo sigue pendiente" $?
+unset GALGO_SOCKET
+galgo stop >/dev/null 2>&1 || true
+export GALGO_SOCKET="$TMP/galgo.sock"
+
+echo "122. M1: un fantasma con mensajes pendientes deja reutilizar su nombre (hereda el inbox) y se puede quitar"
+mkdir -p "$TMP/c122" && chmod 700 "$TMP/c122"
+export GALGO_SOCKET="$TMP/c122/g.sock"
+galgo spawn m122 -- bash --norc >/dev/null
+galgo spawn g122 --manager m122 -- bash --norc >/dev/null
+galgo spawn w122 --manager g122 -- bash --norc >/dev/null
+galgo send w122 'galgo done --summary "resultado122"' >/dev/null
+sleep 0.8
+galgo stop >/dev/null 2>&1; sleep 0.5
+galgo ls >/dev/null
+galgo spawn g122 --manager m122 -- bash --norc >/dev/null 2>&1; check "un fantasma con mensajes no bloquea su nombre" $?
+galgo inbox --pane g122 | grep -q "resultado122"; check "el nombre reutilizado hereda el inbox pendiente" $?
+galgo stop >/dev/null 2>&1; sleep 0.5
+galgo ls >/dev/null
+galgo kill g122 >/dev/null 2>&1; check "kill quita un fantasma" $?
+galgo inbox --pane m122 | grep -q "resultado122"; check "su resultado pasa al manager" $?
+galgo ls | grep -q " g122 "; [ $? -ne 0 ]; check "el fantasma desaparece de ls" $?
+unset GALGO_SOCKET
+galgo stop >/dev/null 2>&1 || true
+export GALGO_SOCKET="$TMP/galgo.sock"
+
+echo "123. B2: dos daemons en el mismo directorio no comparten estado"
+mkdir -p "$TMP/c123" && chmod 700 "$TMP/c123"
+GALGO_SOCKET="$TMP/c123/a.sock" galgo spawn soloA -- bash --norc >/dev/null
+GALGO_SOCKET="$TMP/c123/b.sock" galgo spawn soloB -- bash --norc >/dev/null
+sleep 0.8
+grep -q soloA "$TMP/c123/a.state.json" && ! grep -q soloB "$TMP/c123/a.state.json"; check "el estado de A solo tiene sus paneles" $?
+grep -q soloB "$TMP/c123/b.state.json" && ! grep -q soloA "$TMP/c123/b.state.json"; check "el estado de B solo tiene sus paneles" $?
+GALGO_SOCKET="$TMP/c123/a.sock" galgo stop >/dev/null 2>&1; GALGO_SOCKET="$TMP/c123/b.sock" galgo stop >/dev/null 2>&1
+
+echo "124. B3: un state.json que no es un archivo regular no cuelga el arranque"
+mkdir -p "$TMP/c124" && chmod 700 "$TMP/c124"
+mkfifo "$TMP/c124/g.state.json"
+GALGO_SOCKET="$TMP/c124/g.sock" galgo ls >/dev/null 2>&1 &
+LS124=$!
+sleep 3
+kill -0 "$LS124" 2>/dev/null; [ $? -ne 0 ]; check "galgo ls responde con un FIFO en el lugar del estado" $?
+kill "$LS124" 2>/dev/null; wait "$LS124" 2>/dev/null
+GALGO_SOCKET="$TMP/c124/g.sock" galgo stop >/dev/null 2>&1
+
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

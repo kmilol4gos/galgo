@@ -7,7 +7,7 @@ Uso: scripts/make-app.sh [--bin-dir DIRECTORIO] [--output RUTA/galgo.app]
 
 Empaqueta galgo, galgod, galgo-mcp y galgo-gui en un bundle autónomo.
 Por defecto usa ${PREFIX:-$HOME/.galgo/bin} y crea ./galgo.app.
-No reemplaza un bundle existente. Requiere macOS.
+No reemplaza un bundle existente. Requiere macOS y python3 (Command Line Tools).
 EOF
 }
 : "${HOME:?HOME debe estar definido}"
@@ -61,13 +61,31 @@ cat > "$APP/Contents/MacOS/galgo-launcher" <<'LAUNCHER'
 #!/bin/sh
 set -eu
 DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
+# Finder suele aportar un PATH mínimo. No ejecutar archivos de inicio de la shell:
+# agregar solo directorios habituales; si ya corre un daemon, este conserva su entorno.
+export PATH="$DIR:$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}"
 # CLI y daemon hermanos: la CLI conecta o arranca el daemon si no existe.
-export PATH="$DIR:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
-"$DIR/galgo" ls >/dev/null
+if ! "$DIR/galgo" ls >/dev/null; then
+    /usr/bin/osascript -e 'display alert "Galgo no pudo iniciar el daemon" message "Revisa galgod.log junto al socket de galgo y vuelve a intentarlo." as critical' || true
+    exit 1
+fi
 exec "$DIR/galgo-gui"
 LAUNCHER
 chmod 755 "$APP/Contents/MacOS/galgo-launcher"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
-mv "$APP" "$OUTPUT"
+# renamex_np(RENAME_EXCL) realiza la comprobación y el rename en una sola operación.
+# A diferencia de mv, no introduce el bundle dentro de un directorio aparecido en la carrera.
+python3 - "$APP" "$OUTPUT" <<'PY'
+import ctypes, errno, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+rename = libc.renamex_np
+rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+rename.restype = ctypes.c_int
+if rename(os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2]), 0x00000004) != 0:
+    err = ctypes.get_errno()
+    if err in (errno.EEXIST, errno.ENOTEMPTY):
+        sys.exit(f"Ya existe {sys.argv[2]}; no se reemplazó")
+    sys.exit(f"No se pudo crear {sys.argv[2]}: {os.strerror(err)}")
+PY
 printf 'Bundle creado: %s\n' "$OUTPUT"
 echo 'Puedes moverlo a /Applications o ~/Applications y abrirlo desde Finder o Spotlight.'

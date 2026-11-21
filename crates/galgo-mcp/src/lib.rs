@@ -142,7 +142,15 @@ fn run_tool(name: &str, args: &Value, daemon: &dyn Fn(Request) -> Result<Respons
     if !resp.ok {
         return Err(resp.error.unwrap_or_else(|| "error desconocido del daemon".into()));
     }
-    Ok(resp.data.to_string())
+    // `galgo_list` con `workspace` devuelve solo los paneles de ese workspace.
+    let data = match (name, args.get("workspace").and_then(Value::as_str)) {
+        ("galgo_list", Some(w)) => match resp.data {
+            Value::Array(items) => Value::Array(items.into_iter().filter(|p| p["workspace"].as_str() == Some(w)).collect()),
+            other => other,
+        },
+        _ => resp.data,
+    };
+    Ok(data.to_string())
 }
 
 fn build_request(name: &str, args: &Value, env: &Env) -> Result<Request, String> {
@@ -156,6 +164,7 @@ fn build_request(name: &str, args: &Value, env: &Env) -> Result<Request, String>
             inject: false,
             rows: 40,
             cols: 140,
+            workspace: opt_str(args, "workspace"),
         }),
         "galgo_send" => Ok(Request::Send {
             pane: str_arg(args, "pane")?,
@@ -235,8 +244,8 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "galgo_list",
-            "Lista los paneles con su estado, manager y entregas pendientes.",
-            json!({}),
+            "Lista los paneles con su estado, manager, workspace y entregas pendientes. Con workspace, solo los de ese workspace.",
+            json!({ "workspace": { "type": "string", "description": "Filtra por workspace exacto." } }),
             &[],
         ),
         tool(
@@ -246,6 +255,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "name": { "type": "string", "description": "Nombre único del panel." },
                 "cmd": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Comando y argumentos." },
                 "manager": { "type": "string", "description": "Panel que recibe el resultado de este." },
+                "workspace": { "type": "string", "description": "Workspace del panel, p. ej. \"inventia/cotizacion\". Si falta, se deduce del repo git de cwd." },
                 "cwd": { "type": "string", "description": "Directorio de trabajo. Por defecto, el del servidor MCP." },
             }),
             &["name", "cmd"],
@@ -522,5 +532,44 @@ mod tests {
     fn tools_call_sin_name_es_error_jsonrpc() {
         let r = call(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{}}"#, &no_daemon, None);
         assert_eq!(r["error"]["code"], -32602);
+    }
+
+    /// Workspace: `galgo_spawn` lo pasa al daemon; `galgo_list` filtra por él y devuelve el campo.
+    #[test]
+    fn workspace_en_spawn_y_filtro_en_list() {
+        let seen = RefCell::new(None);
+        let daemon = |req: Request| {
+            *seen.borrow_mut() = Some(req);
+            Ok(Response::ok(json!({})))
+        };
+        let args = json!({ "name": "w1", "cmd": ["bash"], "workspace": "inventia/cotizacion" });
+        call(&call_tool_line("galgo_spawn", args), &daemon, None);
+        match seen.borrow().as_ref() {
+            Some(Request::Spawn { workspace, .. }) => assert_eq!(workspace.as_deref(), Some("inventia/cotizacion")),
+            other => panic!("petición inesperada: {other:?}"),
+        }
+
+        let lista = |_: Request| {
+            Ok(Response::ok(json!([
+                {"id": 1, "name": "a", "workspace": "inventia/cotizacion"},
+                {"id": 2, "name": "b", "workspace": "galgo/main"}
+            ])))
+        };
+        let r = call(&call_tool_line("galgo_list", json!({ "workspace": "galgo/main" })), &lista, None);
+        let text: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, json!([{"id": 2, "name": "b", "workspace": "galgo/main"}]));
+        let r = call(&call_tool_line("galgo_list", json!({})), &lista, None);
+        let text: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn el_esquema_anuncia_workspace() {
+        let r = call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &no_daemon, None);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let spawn = tools.iter().find(|t| t["name"] == "galgo_spawn").unwrap();
+        assert!(spawn["inputSchema"]["properties"]["workspace"].is_object());
+        let list = tools.iter().find(|t| t["name"] == "galgo_list").unwrap();
+        assert!(list["inputSchema"]["properties"]["workspace"].is_object());
     }
 }

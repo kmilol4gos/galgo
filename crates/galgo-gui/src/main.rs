@@ -151,6 +151,8 @@ struct App {
     key_queue: Vec<String>,
     /// Tamaño con el que se pidió el último `Spawn`: es el tamaño del panel que nace.
     spawn_size: Option<(u16, u16)>,
+    /// Grupos de workspace plegados.
+    collapsed: std::collections::BTreeSet<String>,
     attention: Attention,
     /// Formulario de "Nuevo panel", abierto mientras existe.
     form: Option<NewPane>,
@@ -171,6 +173,9 @@ enum Message {
     Select(u32),
     Event(Event),
     Paste(Option<String>),
+    /// Pliega o despliega un grupo de workspace (la clave es el nombre; vacío = sin workspace).
+    ToggleGroup(String),
+    FormWorkspace(String),
     OpenForm,
     CancelForm,
     FormName(String),
@@ -633,8 +638,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
 
         // ---- Formulario de nuevo panel ----
+        Message::ToggleGroup(key) => {
+            if !app.collapsed.remove(&key) {
+                app.collapsed.insert(key);
+            }
+            Task::none()
+        }
+        Message::FormWorkspace(v) => {
+            if let Some(f) = app.form.as_mut() { f.workspace = v; }
+            Task::none()
+        }
         Message::OpenForm => {
-            app.form = Some(NewPane::default());
+            app.form = Some(NewPane { workspace: selected_workspace(app), ..NewPane::default() });
             app.form_error = None;
             Task::none()
         }
@@ -812,6 +827,8 @@ fn form_view<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
         text("Nuevo panel").size(18),
         text("Nombre").size(12).color(MUTED),
         text_input("p. ej. worker-tests", &f.name).on_input(Message::FormName).padding(8),
+        text("Workspace").size(12).color(MUTED),
+        text_input("p. ej. inventia/cotizacion (vacío = el del repo git)", &f.workspace).on_input(Message::FormWorkspace).padding(8),
         text("Comando").size(12).color(MUTED),
         pick_list(presets, Some(f.preset.label().to_string()), Message::FormPreset),
     ]
@@ -835,36 +852,60 @@ fn form_view<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
     container(form).padding(16).into()
 }
 
+/// Botón de un panel en la barra lateral: nombre, estado, insignia de atención y notas.
+fn pane_button<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
+    let mut notes = Vec::new();
+    if pane.orphan { notes.push("ENTREGA SIN CONFIRMAR".to_string()); }
+    else if pane.unacked > 0 { notes.push(format!("{} pendientes", pane.unacked)); }
+    if let Some(manager) = &pane.manager { notes.push(format!("reporta a {manager}")); }
+    if let Some(waiting) = &pane.waiting_on { notes.push(format!("espera a {waiting}")); }
+    let mut info = column![text(&pane.name).size(15), text(pane.status.as_str().to_uppercase()).size(11).color(status_color(pane.status))].spacing(5);
+    if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
+        let (label, color) = badge_look(b);
+        info = info.push(row![text("●").size(11).color(color), text(label).size(11).color(color)].spacing(6));
+    }
+    if !notes.is_empty() { info = info.push(text(notes.join(" · ")).size(11).color(if pane.orphan { status_color(Status::Blocked) } else { MUTED })); }
+    let selected = app.selected == Some(pane.id);
+    button(container(info).width(Length::Fill).padding(10)).width(Length::Fill).on_press(Message::Select(pane.id)).style(move |_, status| {
+        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style { background: Some(if selected { Color::from_rgb(0.14, 0.17, 0.20) } else if hover { Color::from_rgb(0.11, 0.12, 0.15) } else { SURFACE }.into()), text_color: TEXT, border: iced::border::rounded(6), ..Default::default() }
+    }).into()
+}
+
+/// Workspace del panel seleccionado: el que hereda un panel nuevo.
+fn selected_workspace(app: &App) -> String {
+    app.selected
+        .and_then(|id| app.panes.iter().find(|p| p.id == id))
+        .and_then(|p| p.workspace.clone())
+        .unwrap_or_default()
+}
+
 fn view(app: &App) -> Element<'_, Message> {
     let mut list = column![
         row![text("PANELES").size(12).color(MUTED), Space::with_width(Length::Fill), text(app.panes.len()).size(12).color(MUTED)].padding([0, 4]),
         button(text("+ Nuevo panel").size(13)).width(Length::Fill).on_press(Message::OpenForm),
     ].spacing(8);
     if app.panes.is_empty() { list = list.push(text("No hay paneles todavía.").size(14).color(MUTED)); }
-    for pane in &app.panes {
-        let mut notes = Vec::new();
-        if pane.orphan { notes.push("ENTREGA SIN CONFIRMAR".to_string()); }
-        else if pane.unacked > 0 { notes.push(format!("{} pendientes", pane.unacked)); }
-        if let Some(manager) = &pane.manager { notes.push(format!("reporta a {manager}")); }
-        if let Some(waiting) = &pane.waiting_on { notes.push(format!("espera a {waiting}")); }
-        let mut info = column![text(&pane.name).size(15), text(pane.status.as_str().to_uppercase()).size(11).color(status_color(pane.status))].spacing(5);
-        if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
-            let (label, color) = badge_look(b);
-            info = info.push(row![text("●").size(11).color(color), text(label).size(11).color(color)].spacing(6));
+    for (ws, group) in galgo_proto::group_by_workspace(&app.panes) {
+        let key = ws.clone().unwrap_or_default();
+        let folded = app.collapsed.contains(&key);
+        let label = ws.clone().unwrap_or_else(|| "sin workspace".into());
+        let summary = attention::group_summary(&group, &app.attention);
+        let arrow = if folded { "▸" } else { "▾" };
+        let detail = if summary.is_empty() { format!("{} panel(es)", group.len()) } else { format!("{} panel(es) · {summary}", group.len()) };
+        let head = column![text(format!("{arrow} {label}")).size(13), text(detail).size(11).color(MUTED)].spacing(2);
+        list = list.push(button(container(head).width(Length::Fill).padding([6, 8])).width(Length::Fill).on_press(Message::ToggleGroup(key)).style(|_, _| button::Style { background: None, text_color: TEXT, ..Default::default() }));
+        if !folded {
+            for pane in group {
+                list = list.push(pane_button(app, pane));
+            }
         }
-        if !notes.is_empty() { info = info.push(text(notes.join(" · ")).size(11).color(if pane.orphan { status_color(Status::Blocked) } else { MUTED })); }
-        let selected = app.selected == Some(pane.id);
-        list = list.push(button(container(info).width(Length::Fill).padding(10)).width(Length::Fill).on_press(Message::Select(pane.id)).style(move |_, status| {
-            let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            button::Style { background: Some(if selected { Color::from_rgb(0.14, 0.17, 0.20) } else if hover { Color::from_rgb(0.11, 0.12, 0.15) } else { SURFACE }.into()), text_color: TEXT, border: iced::border::rounded(6), ..Default::default() }
-        }));
     }
     let sidebar = container(scrollable(list).height(Length::Fill)).width(260).height(Length::Fill).padding(16).style(|_| container::Style { background: Some(SURFACE.into()), ..Default::default() });
     let selected_pane = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id));
     let title = selected_pane.map(|p| p.name.as_str()).unwrap_or("Sin paneles");
     let state = selected_pane.map(|p| p.status.as_str().to_uppercase()).unwrap_or_default();
     let state_color = selected_pane.map(|p| status_color(p.status)).unwrap_or(MUTED);
-
     let body_content: Element<'_, Message> = if let Some(f) = &app.form {
         form_view(app, f)
     } else {
@@ -1107,6 +1148,8 @@ mod tests {
             orphan: false,
             waiting_on: None,
             waiting_secs: None,
+            workspace: None,
+            cwd: None,
         }
     }
 
@@ -1222,5 +1265,27 @@ mod tests {
         let mut app = App { selected: Some(1), snap: Some(snap(&["a"], 1)), snap_gen: Some(3), ..Default::default() };
         let _ = update(&mut app, Message::Panes(Err("no hay daemon".into())));
         assert_eq!(app.snap_gen, None);
+    }
+
+    /// Workspace: el formulario de un panel nuevo hereda el workspace del seleccionado.
+    #[test]
+    fn el_formulario_hereda_el_workspace_del_seleccionado() {
+        let mut p = pane_info(1, "w", Status::Idle);
+        p.workspace = Some("inventia/cotizacion".into());
+        let mut app = App { panes: vec![p], selected: Some(1), ..Default::default() };
+        let _ = update(&mut app, Message::OpenForm);
+        assert_eq!(app.form.as_ref().unwrap().workspace, "inventia/cotizacion");
+        let _ = update(&mut app, Message::FormWorkspace("galgo/main".into()));
+        assert_eq!(app.form.as_ref().unwrap().workspace, "galgo/main");
+    }
+
+    /// Grupos: plegar y desplegar alterna la clave del grupo.
+    #[test]
+    fn plegar_y_desplegar_un_grupo() {
+        let mut app = App::default();
+        let _ = update(&mut app, Message::ToggleGroup("inventia/cotizacion".into()));
+        assert!(app.collapsed.contains("inventia/cotizacion"));
+        let _ = update(&mut app, Message::ToggleGroup("inventia/cotizacion".into()));
+        assert!(!app.collapsed.contains("inventia/cotizacion"));
     }
 }

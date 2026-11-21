@@ -104,6 +104,10 @@ pub enum Request {
         inject: bool,
         rows: u16,
         cols: u16,
+        /// Workspace del panel (p. ej. "inventia/cotizacion"). Si falta, el daemon lo deduce del repo git
+        /// del directorio de trabajo ("<repo>/<rama>").
+        #[serde(default)]
+        workspace: Option<String>,
     },
     List,
     Send {
@@ -266,6 +270,12 @@ pub struct PaneInfo {
     pub orphan: bool,
     pub waiting_on: Option<String>,
     pub waiting_secs: Option<u64>,
+    /// Workspace del panel. Ausente en daemons anteriores.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Directorio de trabajo del panel. Ausente en daemons anteriores.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,5 +323,67 @@ mod tests {
         assert!(serde_json::to_string(&con).unwrap().contains(r#""since":7"#));
         let viejo: Request = serde_json::from_str(r#"{"op":"snapshot","pane":"p"}"#).unwrap();
         assert!(matches!(viejo, Request::Snapshot { since: None, offset: 0, .. }));
+    }
+}
+
+/// Agrupa los paneles por workspace, en orden alfabético; los que no tienen workspace van al final.
+/// Dentro de cada grupo, el orden de la lista se conserva.
+pub fn group_by_workspace(panes: &[PaneInfo]) -> Vec<(Option<String>, Vec<&PaneInfo>)> {
+    let mut groups: Vec<(Option<String>, Vec<&PaneInfo>)> = Vec::new();
+    for p in panes {
+        match groups.iter_mut().find(|(w, _)| *w == p.workspace) {
+            Some((_, list)) => list.push(p),
+            None => groups.push((p.workspace.clone(), vec![p])),
+        }
+    }
+    groups.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    groups
+}
+
+#[cfg(test)]
+mod tests_grupos {
+    use super::*;
+
+    fn pane(id: u32, name: &str, ws: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            id,
+            name: name.into(),
+            status: Status::Idle,
+            manager: None,
+            cmd: vec![],
+            unacked: 0,
+            oldest_unacked_secs: None,
+            orphan: false,
+            waiting_on: None,
+            waiting_secs: None,
+            workspace: ws.map(String::from),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn agrupa_por_workspace_en_orden_y_deja_los_sin_workspace_al_final() {
+        let panes = vec![
+            pane(1, "a", Some("inventia/cotizacion")),
+            pane(2, "b", None),
+            pane(3, "c", Some("galgo/main")),
+            pane(4, "d", Some("inventia/cotizacion")),
+        ];
+        let groups = group_by_workspace(&panes);
+        let names: Vec<Option<&str>> = groups.iter().map(|(w, _)| w.as_deref()).collect();
+        assert_eq!(names, vec![Some("galgo/main"), Some("inventia/cotizacion"), None]);
+        // Dentro de un grupo se conserva el orden de la lista.
+        let cot: Vec<u32> = groups[1].1.iter().map(|p| p.id).collect();
+        assert_eq!(cot, vec![1, 4]);
+    }
+
+    #[test]
+    fn lista_vacia_no_tiene_grupos() {
+        assert!(group_by_workspace(&[]).is_empty());
     }
 }

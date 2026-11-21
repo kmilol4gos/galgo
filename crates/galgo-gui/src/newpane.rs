@@ -40,11 +40,13 @@ pub struct NewPane {
     pub cwd: String,
     /// Panel que recibe el resultado, si hay alguno.
     pub manager: Option<String>,
+    /// Workspace del panel ("inventia/cotizacion"). Vacío = que lo deduzca el daemon del repo git.
+    pub workspace: String,
 }
 
 impl Default for NewPane {
     fn default() -> Self {
-        Self { name: String::new(), preset: Preset::Claude, custom: String::new(), cwd: String::new(), manager: None }
+        Self { name: String::new(), preset: Preset::Claude, custom: String::new(), cwd: String::new(), manager: None, workspace: String::new() }
     }
 }
 
@@ -148,6 +150,7 @@ pub fn spawn_request(form: &NewPane, rows: u16, cols: u16, env: &Env) -> Result<
         inject: false,
         rows,
         cols,
+        workspace: Some(form.workspace.trim().to_string()).filter(|w| !w.is_empty()),
     })
 }
 
@@ -163,7 +166,7 @@ mod tests {
 
     fn parts(r: Request) -> (String, Vec<String>, Option<String>, Option<String>, u16, u16) {
         match r {
-            Request::Spawn { name, cmd, cwd, manager, rows, cols, inject } => {
+            Request::Spawn { name, cmd, cwd, manager, rows, cols, inject, .. } => {
                 assert!(!inject);
                 (name, cmd, cwd, manager, rows, cols)
             }
@@ -251,5 +254,20 @@ mod tests {
         assert!(spawn_request(&f, 40, 140, &ENV).unwrap_err().contains("absoluto"));
         f.cwd = "~otro/x".into();
         assert!(spawn_request(&f, 40, 140, &ENV).is_err());
+    }
+
+    /// Workspace: se pasa al `Spawn`; vacío significa que lo deduzca el daemon.
+    #[test]
+    fn workspace_del_formulario() {
+        let mut f = form("w", Preset::Shell);
+        f.workspace = "  inventia/cotizacion ".into();
+        match spawn_request(&f, 40, 140, &ENV).unwrap() {
+            Request::Spawn { workspace, .. } => assert_eq!(workspace.as_deref(), Some("inventia/cotizacion")),
+            other => panic!("{other:?}"),
+        }
+        match spawn_request(&form("w", Preset::Shell), 40, 140, &ENV).unwrap() {
+            Request::Spawn { workspace, .. } => assert_eq!(workspace, None),
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -4,22 +4,26 @@
 //! un resultado no se pierda, y la lista de paneles, para avisar a sus managers de que ya no existen.
 
 use super::{InboxMsg, Pane, State};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
+    io::{Read, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// Versión del formato. Un archivo de otra versión se ignora con aviso.
+/// Versión del formato. Un archivo de otra versión se pone a un lado con aviso.
 pub const VERSION: u32 = 1;
+/// Tamaño máximo aceptado al cargar: un archivo mayor no es un estado de galgo.
+const MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Largo máximo de un resumen guardado. Un `done --summary` enorme no engorda cada escritura.
+const MAX_SUMMARY: usize = 4096;
 
 #[derive(Serialize, Deserialize)]
 pub struct Saved {
     pub version: u32,
-    /// Ejecución del daemon que escribió el archivo. El siguiente arranque usa `epoch + 1`.
+    /// Ejecución del daemon que escribió el archivo. Ver `epoch_for`.
     pub epoch: u64,
     pub next_pane: u32,
     pub next_msg: u64,
@@ -32,6 +36,11 @@ pub struct SavedPane {
     pub name: String,
     pub cmd: Vec<String>,
     pub manager: Option<u32>,
+    /// Workspace y directorio. Un estado anterior no los tiene: se carga igual, sin workspace.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// El panel tenía proceso al guardar. Al restaurar, su manager recibe el aviso de que ya no existe.
     pub alive: bool,
     pub inbox: Vec<SavedMsg>,
@@ -48,60 +57,113 @@ pub struct SavedMsg {
     pub created_unix: u64,
 }
 
-/// Ruta del estado: `GALGO_STATE`, o `state.json` junto al socket.
+/// Ruta del estado: `GALGO_STATE`, o el socket con extensión `.state.json` (`galgo.sock` →
+/// `galgo.state.json`). Así dos daemons en el mismo directorio no comparten archivo.
 pub fn state_path(socket: &Path) -> PathBuf {
     if let Some(p) = std::env::var_os("GALGO_STATE") {
         return p.into();
     }
-    socket.parent().unwrap_or_else(|| Path::new(".")).join("state.json")
+    socket.with_extension("state.json")
 }
 
-/// Carga el estado. Nunca falla: un archivo ilegible, corrupto o de otra versión se ignora con aviso.
+/// Carga el estado. Nunca falla ni se cuelga: si el archivo no es un archivo regular de tamaño razonable,
+/// o no se puede leer, o está corrupto o es de otra versión, se ignora con aviso. Los que no sirven se
+/// ponen a un lado (`.corrupt-<tiempo>`) en lugar de sobrescribirlos.
 pub fn load(path: &Path) -> Option<Saved> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             eprintln!("galgod: estado ignorado ({}): {e}", path.display());
             return None;
         }
     };
+    if !meta.file_type().is_file() {
+        eprintln!("galgod: estado ignorado ({}): no es un archivo regular", path.display());
+        return None;
+    }
+    if meta.len() > MAX_BYTES {
+        eprintln!("galgod: estado ignorado ({}): demasiado grande ({} bytes)", path.display(), meta.len());
+        return None;
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = std::fs::File::open(path).and_then(|f| f.take(MAX_BYTES + 1).read_to_end(&mut bytes)) {
+        eprintln!("galgod: estado ignorado ({}): {e}", path.display());
+        return None;
+    }
     match serde_json::from_slice::<Saved>(&bytes) {
         Ok(s) if s.version == VERSION => Some(s),
         Ok(s) => {
             eprintln!("galgod: estado ignorado ({}): versión {} no soportada", path.display(), s.version);
+            quarantine(path);
             None
         }
         Err(e) => {
             eprintln!("galgod: estado ignorado ({}): {e}", path.display());
+            quarantine(path);
             None
         }
     }
 }
 
-/// Escritura atómica: temporal con permisos 0600 y `rename`. Un corte a medias no deja un archivo roto.
+/// Aparta un archivo que no sirve, sin borrarlo: queda `<nombre>.corrupt-<segundos>` para revisarlo.
+fn quarantine(path: &Path) {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let to = path.with_file_name(format!("{name}.corrupt-{}", unix_now()));
+    match std::fs::rename(path, &to) {
+        Ok(()) => eprintln!("galgod: el estado anterior queda en {}", to.display()),
+        Err(e) => eprintln!("galgod: no pude apartar el estado corrupto: {e}"),
+    }
+}
+
+/// Escritura atómica: temporal con nombre aleatorio, creado con `create_new` (no sigue enlaces ni
+/// reutiliza un archivo ajeno), permisos 0600, `fsync` y `rename`. El directorio del estado es del usuario.
 pub fn write(path: &Path, saved: &Saved) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        ensure_private_dir(dir)?;
     }
     let bytes = serde_json::to_vec(saved)?;
-    let tmp = path.with_file_name(format!("state.json.tmp.{}", std::process::id()));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "state.json".into());
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{:016x}", std::process::id(), random_u64()));
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("no pude crear {}", tmp.display()))?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        if let Err(e) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
     }
     std::fs::rename(&tmp, path).with_context(|| format!("no pude reemplazar {}", path.display()))?;
     Ok(())
 }
 
-/// Lo que se guarda del estado actual: solo los mensajes sin confirmar.
+/// Crea el directorio del estado con 0700, o comprueba que uno existente no sea escribible por otros.
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let mode = std::fs::metadata(dir)?.permissions().mode();
+    if mode & 0o022 != 0 {
+        bail!("el directorio del estado {} es escribible por otros; no guardo nada ahí", dir.display());
+    }
+    Ok(())
+}
+
+/// Epoch de esta ejecución. No sale del archivo de estado (si falta o está corrupto, volvería a 1 y los
+/// ids viejos chocarían con los nuevos): sale de la hora de arranque, y nunca es menor que el anterior + 1.
+/// Cabe en 32 bits, porque va en la parte alta del id de mensaje.
+pub fn epoch_for(saved: Option<&Saved>) -> u64 {
+    let now = unix_now() & 0xFFFF_FFFF;
+    let prev = saved.map_or(0, |s| s.epoch + 1);
+    now.max(prev).max(1)
+}
+
+/// Lo que se guarda del estado actual: solo los mensajes sin confirmar. Los fantasmas sin mensajes
+/// pendientes no se guardan (no tienen nada que conservar), y los resúmenes se acotan.
 pub fn snapshot(st: &State) -> Saved {
     let now_unix = unix_now();
     Saved {
@@ -112,11 +174,14 @@ pub fn snapshot(st: &State) -> Saved {
         panes: st
             .panes
             .values()
+            .filter(|p| !p.ghost || p.inbox.iter().any(|m| !m.acked))
             .map(|p| SavedPane {
                 id: p.id,
                 name: p.name.clone(),
                 cmd: p.cmd.clone(),
                 manager: p.manager,
+                workspace: p.workspace.clone(),
+                cwd: p.cwd.clone(),
                 alive: !p.ghost && !p.exited,
                 inbox: p
                     .inbox
@@ -127,7 +192,7 @@ pub fn snapshot(st: &State) -> Saved {
                         from: m.from,
                         from_name: m.from_name.clone(),
                         kind: m.kind.to_string(),
-                        summary: m.summary.clone(),
+                        summary: m.summary.chars().take(MAX_SUMMARY).collect(),
                         created_unix: now_unix.saturating_sub(m.created.elapsed().as_secs()),
                     })
                     .collect(),
@@ -158,7 +223,7 @@ pub fn restore(st: &mut State, saved: Saved) {
             hold_until: None,
             last_inject: None,
         });
-        let pane = Pane::ghost(sp.id, sp.name, sp.cmd, sp.manager, inbox.collect());
+        let pane = Pane::ghost(sp.id, sp.name, sp.cmd, sp.manager, inbox.collect(), sp.workspace, sp.cwd);
         st.panes.insert(sp.id, pane);
     }
     // El aviso va después de cargar todos los paneles, para que el nombre del que se fue esté disponible.
@@ -189,6 +254,12 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Número aleatorio para nombres temporales: el reloj en nanosegundos mezclado con el pid.
+fn random_u64() -> u64 {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    nanos ^ ((std::process::id() as u64) << 32) ^ 0x9E37_79B9_7F4A_7C15
+}
+
 /// Instante de creación equivalente a una marca de tiempo Unix guardada.
 fn instant_for(now_unix: u64, created_unix: u64) -> Instant {
     let age = Duration::from_secs(now_unix.saturating_sub(created_unix));
@@ -203,6 +274,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("galgo-persist-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Como el socket: el directorio del estado es privado.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         dir.join("state.json")
     }
 
@@ -213,12 +286,14 @@ mod tests {
             next_pane: 5,
             next_msg: 9,
             panes: vec![
-                SavedPane { id: 1, name: "mgr".into(), cmd: vec!["bash".into()], manager: None, alive: true, inbox: vec![] },
+                SavedPane { id: 1, name: "mgr".into(), cmd: vec!["bash".into()], manager: None, workspace: None, cwd: None, alive: true, inbox: vec![] },
                 SavedPane {
                     id: 2,
                     name: "w".into(),
                     cmd: vec!["claude".into()],
                     manager: Some(1),
+                    workspace: Some("inventia/cotizacion".into()),
+                    cwd: None,
                     alive: true,
                     inbox: vec![SavedMsg { id: (2 << 32) | 4, from: 2, from_name: "w".into(), kind: "done".into(), summary: "hecho".into(), created_unix: unix_now() }],
                 },
@@ -236,6 +311,33 @@ mod tests {
         assert!(load(&path).is_none(), "otra versión: se ignora");
     }
 
+    /// M2 y B3: un archivo corrupto se aparta (no se sobrescribe), y un no-regular no se lee.
+    #[test]
+    fn corrupto_se_aparta_y_un_fifo_no_se_lee() {
+        let path = tmp("aparta");
+        std::fs::write(&path, "{corrupto").unwrap();
+        assert!(load(&path).is_none());
+        assert!(!path.exists(), "el original queda apartado");
+        let dir = path.parent().unwrap();
+        let apartados = std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".corrupt-")).count();
+        assert_eq!(apartados, 1);
+
+        let fifo = dir.join("fifo.json");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Un FIFO sin escritor bloquearía la lectura: no debe leerse nunca.
+        assert!(load(&fifo).is_none());
+    }
+
+    /// M2: el epoch no depende del archivo: sin archivo o con uno corrupto, nunca vuelve a 1.
+    #[test]
+    fn epoch_no_vuelve_a_uno_sin_archivo() {
+        assert!(epoch_for(None) > 1_000_000, "sin estado, el epoch sale de la hora");
+        let viejo = saved_with_inbox();
+        assert!(epoch_for(Some(&viejo)) >= 4, "siempre sube respecto del anterior");
+        assert!(epoch_for(None) < (1u64 << 32), "cabe en 32 bits");
+    }
+
     #[test]
     fn escritura_atomica_con_permisos_privados() {
         use std::os::unix::fs::PermissionsExt;
@@ -244,6 +346,48 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(load(&path).unwrap().epoch, 3);
+        // No queda ningún temporal suelto.
+        let sueltos = std::fs::read_dir(path.parent().unwrap()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp.")).count();
+        assert_eq!(sueltos, 0);
+    }
+
+    /// B1: un temporal que alguien dejó en el camino no se sigue ni se reutiliza.
+    #[test]
+    fn no_sigue_un_enlace_en_el_camino_del_temporal() {
+        let path = tmp("enlace");
+        let victima = path.with_file_name("victima.txt");
+        std::fs::write(&victima, "contenido ajeno").unwrap();
+        // Un atacante no puede adivinar el nombre aleatorio; aun así, el destino del enlace queda intacto.
+        std::os::unix::fs::symlink(&victima, path.with_file_name(".state.json.tmp.0.0000000000000000")).unwrap();
+        write(&path, &saved_with_inbox()).unwrap();
+        assert_eq!(std::fs::read_to_string(&victima).unwrap(), "contenido ajeno");
+    }
+
+    /// B1: un directorio del estado escribible por otros se rechaza.
+    #[test]
+    fn rechaza_directorio_escribible_por_otros() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp("abierto");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(write(&path, &saved_with_inbox()).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// M1: un fantasma sin mensajes no se guarda; uno con mensajes sí.
+    #[test]
+    fn fantasmas_vacios_no_se_guardan() {
+        let mut st = State { epoch: 2, ..State::default() };
+        restore(&mut st, saved_with_inbox());
+        // El fantasma "w" tiene un mensaje y el "mgr" tiene el aviso: ambos se guardan.
+        assert_eq!(snapshot(&st).panes.len(), 2);
+        // Sin mensajes pendientes, el fantasma desaparece del siguiente guardado.
+        for p in st.panes.values_mut() {
+            for m in p.inbox.iter_mut() {
+                m.acked = true;
+            }
+        }
+        assert!(snapshot(&st).panes.is_empty());
     }
 
     /// Un panel vivo vuelve como fantasma, su manager recibe el aviso y el mensaje sigue en el inbox.
@@ -261,5 +405,16 @@ mod tests {
         assert_eq!(st.next_pane, 5);
         // El aviso de arranque consume un id: el contador sigue donde estaba.
         assert_eq!(st.next_msg, 10);
+    }
+
+    /// Un resumen enorme se guarda acotado.
+    #[test]
+    fn resumen_acotado_al_guardar() {
+        let mut st = State { epoch: 2, ..State::default() };
+        restore(&mut st, saved_with_inbox());
+        st.panes.get_mut(&2).unwrap().inbox[0].summary = "x".repeat(MAX_SUMMARY * 3);
+        let guardado = snapshot(&st);
+        let resumen = &guardado.panes.iter().find(|p| p.id == 2).unwrap().inbox[0].summary;
+        assert_eq!(resumen.chars().count(), MAX_SUMMARY);
     }
 }
