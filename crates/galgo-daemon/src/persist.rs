@@ -15,6 +15,13 @@ use std::{
 
 /// Versión del formato. Un archivo de otra versión se pone a un lado con aviso.
 pub const VERSION: u32 = 1;
+/// El id de mensaje es `epoch << 32 | contador`: con un epoch de 20 bits el máximo es 2^52 − 1, por debajo de
+/// 2^53, así que cabe exacto en un número de JavaScript (Node, Claude Code, una GUI web).
+pub const EPOCH_BITS: u32 = 20;
+pub const EPOCH_MAX: u64 = (1 << EPOCH_BITS) - 1;
+/// Límite de precisión de un número en JavaScript: ningún id puede llegar aquí.
+pub const ID_LIMIT: u64 = 1 << 53;
+
 /// Tamaño máximo aceptado al cargar: un archivo mayor no es un estado de galgo.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Largo máximo de un resumen guardado. Un `done --summary` enorme no engorda cada escritura.
@@ -156,10 +163,18 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 /// Epoch de esta ejecución. No sale del archivo de estado (si falta o está corrupto, volvería a 1 y los
 /// ids viejos chocarían con los nuevos): sale de la hora de arranque, y nunca es menor que el anterior + 1.
 /// Cabe en 32 bits, porque va en la parte alta del id de mensaje.
+///
+/// Probabilidad de colisión: el epoch tiene 20 bits y, si sale de la hora, da la vuelta cada ~12,1 días. Dos
+/// mensajes solo pueden chocar si el contador también coincide: el contador sigue desde el estado guardado,
+/// así que solo se repite si el estado se pierde y el epoch vuelve a darse mientras un mensaje de aquel
+/// epoch sigue sin confirmar (~1 entre 10⁶ por reinicio sin estado, según la hora).
 pub fn epoch_for(saved: Option<&Saved>) -> u64 {
-    let now = unix_now() & 0xFFFF_FFFF;
-    let prev = saved.map_or(0, |s| s.epoch + 1);
-    now.max(prev).max(1)
+    let now = unix_now() % EPOCH_MAX + 1;
+    match saved {
+        // Distinto del anterior: si la hora no avanzó lo suficiente, se toma el siguiente (con vuelta).
+        Some(s) if s.epoch >= 1 && s.epoch <= EPOCH_MAX && now <= s.epoch => s.epoch % EPOCH_MAX + 1,
+        _ => now,
+    }
 }
 
 /// Lo que se guarda del estado actual: solo los mensajes sin confirmar. Los fantasmas sin mensajes
@@ -211,19 +226,24 @@ pub fn restore(st: &mut State, saved: Saved) {
         if sp.alive {
             lost.push((sp.id, sp.name.clone(), sp.manager));
         }
-        let inbox = sp.inbox.into_iter().map(|m| InboxMsg {
-            id: m.id,
-            from: m.from,
-            from_name: m.from_name,
-            kind: static_kind(&m.kind),
-            summary: m.summary,
-            created: instant_for(now_unix, m.created_unix),
-            acked: false,
-            claimed: false,
-            hold_until: None,
-            last_inject: None,
-        });
-        let pane = Pane::ghost(sp.id, sp.name, sp.cmd, sp.manager, inbox.collect(), sp.workspace, sp.cwd);
+        let mut inbox = Vec::new();
+        for m in sp.inbox {
+            // Un id de un formato anterior (≥ 2^53) no cabe en JavaScript: el mensaje recibe un id nuevo.
+            let id = if m.id < ID_LIMIT { m.id } else { st.next_msg_id() };
+            inbox.push(InboxMsg {
+                id,
+                from: m.from,
+                from_name: m.from_name,
+                kind: static_kind(&m.kind),
+                summary: m.summary,
+                created: instant_for(now_unix, m.created_unix),
+                acked: false,
+                claimed: false,
+                hold_until: None,
+                last_inject: None,
+            });
+        }
+        let pane = Pane::ghost(sp.id, sp.name, sp.cmd, sp.manager, inbox, sp.workspace, sp.cwd);
         st.panes.insert(sp.id, pane);
     }
     // El aviso va después de cargar todos los paneles, para que el nombre del que se fue esté disponible.
@@ -332,10 +352,11 @@ mod tests {
     /// M2: el epoch no depende del archivo: sin archivo o con uno corrupto, nunca vuelve a 1.
     #[test]
     fn epoch_no_vuelve_a_uno_sin_archivo() {
-        assert!(epoch_for(None) > 1_000_000, "sin estado, el epoch sale de la hora");
+        let sin = epoch_for(None);
+        assert!((1..=EPOCH_MAX).contains(&sin), "sin estado, el epoch sale de la hora y cabe en 20 bits");
         let viejo = saved_with_inbox();
         assert!(epoch_for(Some(&viejo)) >= 4, "siempre sube respecto del anterior");
-        assert!(epoch_for(None) < (1u64 << 32), "cabe en 32 bits");
+
     }
 
     #[test]
@@ -416,5 +437,33 @@ mod tests {
         let guardado = snapshot(&st);
         let resumen = &guardado.panes.iter().find(|p| p.id == 2).unwrap().inbox[0].summary;
         assert_eq!(resumen.chars().count(), MAX_SUMMARY);
+    }
+
+    /// Un epoch sale siempre en 1..=EPOCH_MAX, aunque falte el estado o esté corrupto (no es una constante).
+    #[test]
+    fn epoch_en_rango_y_distinto_del_anterior() {
+        let e = epoch_for(None);
+        assert!(e >= 1 && e <= EPOCH_MAX);
+        // Un estado anterior con el mismo epoch que la hora de ahora: el nuevo es otro.
+        let now = unix_now() % EPOCH_MAX + 1;
+        let mut viejo = saved_with_inbox();
+        viejo.epoch = now;
+        assert_ne!(epoch_for(Some(&viejo)), now);
+        // Un estado de otro formato (epoch enorme) no se toma como base.
+        viejo.epoch = 7_000_000_000;
+        let e2 = epoch_for(Some(&viejo));
+        assert!(e2 >= 1 && e2 <= EPOCH_MAX);
+    }
+
+    /// Un mensaje de un formato anterior (id ≥ 2^53) recibe un id nuevo al cargar; los demás se conservan.
+    #[test]
+    fn renumera_ids_grandes_al_cargar() {
+        let mut saved = saved_with_inbox();
+        saved.panes[1].inbox[0].id = 7_710_670_798_423_326_721; // formato anterior: > 2^53
+        let mut st = State { epoch: 5, ..State::default() };
+        restore(&mut st, saved);
+        let ids: Vec<u64> = st.panes[&2].inbox.iter().map(|m| m.id).collect();
+        assert!(ids.iter().all(|&i| i < ID_LIMIT), "{ids:?}");
+        assert_eq!(st.panes[&2].inbox[0].summary, "hecho");
     }
 }

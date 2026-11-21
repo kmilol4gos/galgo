@@ -1516,4 +1516,15 @@ mod tests_fantasmas {
         assert!(st.panes.contains_key(&2), "el fantasma sigue");
         assert_eq!(st.panes[&2].inbox[0].summary, "importante");
     }
+
+    /// Id máximo con el epoch más alto y el contador a punto de desbordar: nunca llega a 2^53.
+    #[test]
+    fn ids_de_mensaje_caben_en_javascript() {
+        let mut st = State { epoch: persist::EPOCH_MAX, next_msg: 0xFFFF_FFFE, ..State::default() };
+        let a = st.next_msg_id();
+        let b = st.next_msg_id();
+        assert!(a < persist::ID_LIMIT && b < persist::ID_LIMIT, "{a} {b}");
+        assert_eq!(a >> 32, persist::EPOCH_MAX, "el epoch va en la parte alta");
+        assert_eq!(a as f64 as u64, a, "el id es exacto como número de JavaScript");
+    }
 }
