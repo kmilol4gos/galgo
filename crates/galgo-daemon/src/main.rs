@@ -130,7 +130,7 @@ impl Pane {
             manager,
             inject: false,
             screen: Arc::new(Mutex::new(vt100::Parser::new(std::num::NonZeroU16::new(24).unwrap(), std::num::NonZeroU16::new(80).unwrap(), 0))),
-            gen: Arc::new(AtomicU64::new(0)),
+            gen: Arc::new(AtomicU64::new(fresh_gen())),
             input,
             killer: Box::new(GhostKiller),
             pid: None,
@@ -288,6 +288,44 @@ fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Variables que identifican la sesión o el panel que lanzó el daemon. Se quitan del entorno de cada
+/// panel: no son configuración del usuario. Lo que no está aquí (proveedor, tokens, límites, esfuerzo…)
+/// se conserva. `CLAUDE_EFFORT` se conserva a propósito: es una preferencia, no una identidad.
+/// Generación inicial de un panel: de la hora de arranque, no de 0. Así una generación vieja de otro
+/// panel o de otro daemon no coincide por casualidad con la de uno nuevo (un `unchanged` falso).
+/// Ocupa 40 bits para que el token (`generación << 16 | offset`) quepa en 56.
+fn fresh_gen() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    (nanos >> 20) & ((1 << 40) - 1)
+}
+
+/// Token que el cliente guarda y devuelve en `since`: la generación y el desplazamiento. Así un
+/// `unchanged` solo vale para la misma vista (mismo offset) y no para cualquier otra.
+fn token(gen: u64, offset: u16) -> u64 {
+    (gen << 16) | offset as u64
+}
+
+fn is_session_marker(key: &str) -> bool {
+    const EXACT: [&str; 11] = [
+        "CLAUDECODE",
+        "CLAUDE_PID",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_CHILD_NOTES_DIR",
+        "CLAUDE_CODE_SSE_PORT",
+    ];
+    // Todas las variables de herdr describen el panel de herdr donde nació el daemon.
+    EXACT.contains(&key) || key.starts_with("HERDR_")
+}
+
 fn to_response(res: Result<Value>) -> Response {
     match res {
         Ok(v) => Response::ok(v),
@@ -344,11 +382,10 @@ impl Daemon {
         if let Some(dir) = cwd {
             builder.cwd(dir);
         }
-        // El daemon puede haberse arrancado desde una sesión de Claude Code, que deja marcadores
-        // (CLAUDE_CODE_*, CLAUDECODE). Un agente en el panel los vería y se creería sub-sesión.
+        // El daemon puede haberse arrancado desde una sesión de Claude Code o de herdr, que dejan
+        // marcadores de identidad de sesión. Un agente en el panel los vería y se creería otra sesión.
         for (key, _) in std::env::vars_os() {
-            let k = key.to_string_lossy();
-            if k.starts_with("CLAUDE_CODE_") || k == "CLAUDECODE" {
+            if is_session_marker(&key.to_string_lossy()) {
                 builder.env_remove(&key);
             }
         }
@@ -370,7 +407,7 @@ impl Daemon {
             std::num::NonZeroU16::new(cols).context("cols debe ser mayor que 0")?,
         );
         let screen = Arc::new(Mutex::new(vt100::Parser::new(v_rows, v_cols, 2000)));
-        let gen = Arc::new(AtomicU64::new(0));
+        let gen = Arc::new(AtomicU64::new(fresh_gen()));
 
         let (input, input_rx) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
         std::thread::spawn(move || {
@@ -713,7 +750,7 @@ impl Daemon {
                     (Arc::clone(&p.screen), Arc::clone(&p.gen))
                 };
                 let mut parser = screen.lock().unwrap();
-                let current = gen.load(Ordering::SeqCst);
+                let current = token(gen.load(Ordering::SeqCst), offset);
                 // Sin cambios desde la generación que pidió el cliente: no se serializa nada.
                 if since == Some(current) {
                     return Ok(json!({ "unchanged": true, "gen": current }));
@@ -1181,5 +1218,37 @@ mod tests {
         assert!(check_size(24, 0).is_err());
         assert!(check_size(MAX_ROWS + 1, 80).is_err());
         assert!(check_size(24, MAX_COLS + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_sesion {
+    use super::*;
+
+    /// M2/M3: solo se quitan marcadores de sesión; la configuración del usuario se conserva.
+    #[test]
+    fn marcadores_de_sesion_si_configuracion_no() {
+        for k in ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_TOKEN", "HERDR_PANE_ID", "HERDR_ENV"] {
+            assert!(is_session_marker(k), "{k} debe quitarse");
+        }
+        for k in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_EFFORT", "HOME", "PATH", "GALGO_DEBUG"] {
+            assert!(!is_session_marker(k), "{k} debe conservarse");
+        }
+    }
+
+    /// B3: el token une generación y offset; el mismo gen con otro offset es otra vista.
+    #[test]
+    fn token_distingue_offset() {
+        assert_ne!(token(7, 0), token(7, 30));
+        assert_eq!(token(7, 30) >> 16, 7);
+        assert_eq!(token(7, 30) & 0xFFFF, 30);
+    }
+
+    /// B1: una generación nueva no empieza en un número pequeño; cabe en el token.
+    #[test]
+    fn generacion_inicial_no_es_pequena_y_cabe_en_el_token() {
+        let g = fresh_gen();
+        assert!(g > 1_000_000, "la generación inicial viene de la hora de arranque");
+        assert!(g < (1 << 40));
     }
 }

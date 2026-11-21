@@ -765,6 +765,9 @@ HOME="$HOME97" galgo hooks uninstall pi --yes >/dev/null
 [ "$(cat "$HOME97/.pi/agent/extensions/galgo.ts")" = 'extensión anterior' ] && [ ! -e "$HOME97/.pi/agent/extensions/galgo.ts.galgo-bak" ]; check "uninstall restaura extensión previa" $?
 
 echo "98. hooks Codex: instalación reversible y eventos reales"
+mkdir -p "$TMP/codex-empty-home98" "$TMP/codex-cwd98"
+(cd "$TMP/codex-cwd98" && CODEX_HOME= HOME="$TMP/codex-empty-home98" galgo hooks install codex --yes >/dev/null) && [ -f "$TMP/codex-empty-home98/.codex/hooks.json" ] && [ ! -e "$TMP/codex-cwd98/hooks.json" ]; check "CODEX_HOME vacío usa HOME, no cwd" $?
+(cd "$TMP/codex-cwd98" && ! CODEX_HOME=rel HOME="$TMP/codex-empty-home98" galgo hooks install codex --yes >/dev/null 2>&1 && [ ! -e rel/hooks.json ]); check "CODEX_HOME relativo se rechaza" $?
 HOME98="$TMP/home98"
 mkdir -p "$HOME98/.codex"
 printf '%s\n' '{"description":"preservar","hooks":{"Stop":[{"hooks":[{"type":"command","command":"true","timeout":2}]}]}}' > "$HOME98/.codex/hooks.json"
@@ -775,6 +778,8 @@ galgo spawn m98 -- bash --norc >/dev/null
 galgo spawn w98 --manager m98 -- bash --norc >/dev/null
 printf '%s\n' '{"hook_event_name":"UserPromptSubmit"}' | GALGO_PANE=w98 galgo hook codex
 galgo ls | grep w98 | grep -q working; check "Codex informa prompt_submitted" $?
+printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact"}' | GALGO_PANE=w98 galgo hook codex
+galgo ls | grep w98 | grep -q working; check "Codex compact no cambia working a idle" $?
 printf '%s\n' '{"hook_event_name":"Stop","last_assistant_message":"resultado Codex"}' | GALGO_PANE=w98 galgo hook codex
 galgo inbox --pane m98 | grep -q 'resultado Codex'; check "Codex entrega resultado al manager" $?
 out=$(printf '%s\n' '{"hook_event_name":"SessionStart"}' | env -u GALGO_PANE GALGO_SOCKET="$TMP/no-codex.sock" galgo hook codex 2>&1); rc=$?
@@ -920,6 +925,32 @@ galgo inbox --pane m111 | grep -q "viejo111"; [ $? -ne 0 ]; check "el mensaje an
 FOREIGN=$(( (7 << 32) + 5 ))
 galgo ack "$FOREIGN" --pane m111 2>&1 | grep -q "otra ejecución"; check "un id de otra ejecución se rechaza sin confirmar" $?
 galgo inbox --pane m111 | grep -q "nuevo111"; check "tras el rechazo el mensaje nuevo sigue pendiente" $?
+
+echo "112. entorno de paneles: sin marcadores de sesión, con la configuración del usuario (M2, M3); tokens de vista (B1, B3)"
+mkdir -p "$TMP/env112"
+CLAUDE_CODE_USE_BEDROCK=1 CLAUDE_PID=99 HERDR_PANE_ID=5 HERDR_ENV=1 CLAUDE_CODE_CHILD_SESSION=1 GALGO_SOCKET="$TMP/env112/g.sock" galgo ls >/dev/null 2>&1
+GALGO_SOCKET="$TMP/env112/g.sock" galgo spawn e112 -- sh -c "env > $TMP/env112.out; sleep 30" >/dev/null
+sleep 0.7
+grep -qx 'CLAUDE_CODE_USE_BEDROCK=1' "$TMP/env112.out"; check "el panel conserva la configuración del usuario (proveedor)" $?
+! grep -q '^CLAUDE_PID=\|^HERDR_\|^CLAUDE_CODE_CHILD_SESSION=' "$TMP/env112.out"; check "el panel no hereda marcadores de sesión ni de herdr" $?
+python3 -I - "$TMP/env112/g.sock" <<'PY112'
+import json, socket, sys
+def rq(m):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sys.argv[1])
+    s.sendall((json.dumps(m) + "\n").encode())
+    line = s.makefile("rb").readline()
+    s.close()
+    return json.loads(line)["data"]
+first = rq({"op": "snapshot", "pane": "e112"})
+token = first["gen"]
+ok = token >> 16 > 1000000
+ok = ok and "rows" in rq({"op": "snapshot", "pane": "e112", "offset": 30, "since": token})
+ok = ok and rq({"op": "snapshot", "pane": "e112", "since": token}) == {"unchanged": True, "gen": token}
+sys.exit(0 if ok else 1)
+PY112
+check "el token de vista sale de la hora de arranque y un offset distinto no devuelve unchanged" $?
+GALGO_SOCKET="$TMP/env112/g.sock" galgo stop >/dev/null 2>&1
 
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

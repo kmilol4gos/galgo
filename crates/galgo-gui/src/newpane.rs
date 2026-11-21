@@ -48,6 +48,65 @@ impl Default for NewPane {
     }
 }
 
+/// Separa un comando en argumentos como lo haría una shell, sin ejecutar nada: respeta comillas simples,
+/// comillas dobles y `\` fuera de comillas simples. `bash -c 'echo hola'` son tres argumentos, no cuatro.
+pub fn split_command(text: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(x) => cur.push(x),
+                        None => return Err("comillas sin cerrar".into()),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(x @ ('"' | '\\' | '$' | '`')) => cur.push(x),
+                            Some(x) => { cur.push('\\'); cur.push(x); }
+                            None => return Err("comillas sin cerrar".into()),
+                        },
+                        Some(x) => cur.push(x),
+                        None => return Err("comillas sin cerrar".into()),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                match chars.next() {
+                    Some(x) => cur.push(x),
+                    None => return Err("la barra invertida final no tiene carácter".into()),
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
 /// Entorno del que depende el armado: directorio de inicio y shell del usuario.
 pub struct Env<'a> {
     pub home: &'a str,
@@ -68,7 +127,7 @@ pub fn spawn_request(form: &NewPane, rows: u16, cols: u16, env: &Env) -> Result<
         Preset::Pi => vec!["pi".into()],
         Preset::OpenCode => vec!["opencode".into()],
         Preset::Shell => vec![env.shell.into()],
-        Preset::Custom => form.custom.split_whitespace().map(String::from).collect(),
+        Preset::Custom => split_command(&form.custom)?,
     };
     if cmd.is_empty() {
         return Err("falta el comando".into());
@@ -77,7 +136,9 @@ pub fn spawn_request(form: &NewPane, rows: u16, cols: u16, env: &Env) -> Result<
         "" => env.home.to_string(),
         d if d == "~" => env.home.to_string(),
         d if d.starts_with("~/") => format!("{}/{}", env.home.trim_end_matches('/'), &d[2..]),
-        d => d.to_string(),
+        // Una ruta relativa dependería del directorio del daemon, que no es el del usuario.
+        d if d.starts_with('/') => d.to_string(),
+        _ => return Err("el directorio debe ser absoluto o empezar por ~/".into()),
     };
     Ok(Request::Spawn {
         name: name.to_string(),
@@ -171,5 +232,24 @@ mod tests {
             assert_eq!(Preset::from_label(p.label()), Some(p));
         }
         assert_eq!(Preset::from_label("otro"), None);
+    }
+
+    /// B4: las comillas se respetan y una ruta relativa se rechaza en lugar de resolverse contra el daemon.
+    #[test]
+    fn comando_con_comillas_y_directorio_relativo() {
+        assert_eq!(split_command("bash -c 'echo hola'").unwrap(), vec!["bash", "-c", "echo hola"]);
+        assert_eq!(split_command(r#""/Applications/Mi App/bin" --x"#).unwrap(), vec!["/Applications/Mi App/bin", "--x"]);
+        assert_eq!(split_command("  a   b  ").unwrap(), vec!["a", "b"]);
+        assert_eq!(split_command("''").unwrap(), vec![""]);
+        assert!(split_command("bash -c 'eco").unwrap_err().contains("sin cerrar"));
+        let mut f = form("w", Preset::Custom);
+        f.custom = "bash -c 'echo hola'".into();
+        let (_, cmd, _, _, _, _) = parts(spawn_request(&f, 40, 140, &ENV).unwrap());
+        assert_eq!(cmd, vec!["bash", "-c", "echo hola"]);
+        let mut f = form("w", Preset::Claude);
+        f.cwd = "proyecto/x".into();
+        assert!(spawn_request(&f, 40, 140, &ENV).unwrap_err().contains("absoluto"));
+        f.cwd = "~otro/x".into();
+        assert!(spawn_request(&f, 40, 140, &ENV).is_err());
     }
 }

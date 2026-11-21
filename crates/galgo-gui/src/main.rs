@@ -16,7 +16,7 @@ mod term;
 
 use attention::{Alert, Attention, Badge};
 use galgo_proto::{Run, Snapshot};
-use iced::keyboard::{self, Key};
+use iced::keyboard::{self, key::Named, Key};
 use iced::mouse;
 use iced::widget::text::Span;
 use iced::widget::{rich_text, span};
@@ -149,6 +149,8 @@ struct App {
     paste_pending: bool,
     /// Teclas que llegaron mientras tanto; se envían después del pegado.
     key_queue: Vec<String>,
+    /// Tamaño con el que se pidió el último `Spawn`: es el tamaño del panel que nace.
+    spawn_size: Option<(u16, u16)>,
     attention: Attention,
     /// Formulario de "Nuevo panel", abierto mientras existe.
     form: Option<NewPane>,
@@ -164,7 +166,8 @@ enum Message {
     TickScreen,
     TickList,
     Panes(Result<Vec<PaneInfo>, String>),
-    Screen(u32, u16, Result<ScreenReply, String>),
+    /// Respuesta de una petición de pantalla: id, offset pedido, `since` enviado y el resultado.
+    Screen(u32, u16, Option<u64>, Result<ScreenReply, String>),
     Select(u32),
     Event(Event),
     Paste(Option<String>),
@@ -254,7 +257,7 @@ fn parse_snapshot_reply(reply: &str) -> Result<ScreenReply, String> {
 fn load_screen(id: u32, offset: u16, since: Option<u64>) -> Task<Message> {
     Task::perform(async move {
         tokio::task::spawn_blocking(move || snapshot_request(id, offset, since)).await.map_err(|e| e.to_string())?
-    }, move |r| Message::Screen(id, offset, r))
+    }, move |r| Message::Screen(id, offset, since, r))
 }
 
 /// Envía una petición que no es de teclado (crear, cerrar) fuera del hilo de la interfaz.
@@ -474,18 +477,25 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     let alerts = app.attention.observe(&app.panes, app.selected);
                     notify(&alerts, app.focused);
                 }
-                Err(e) => app.error = Some(e),
+                Err(e) => {
+                    app.error = Some(e);
+                    // Tras un fallo de conexión (quizá un daemon nuevo) no se confía en la generación guardada.
+                    app.snap_gen = None;
+                }
             }
             Task::none()
         }
-        Message::Screen(id, offset, result) => {
+        Message::Screen(id, offset, sent_since, result) => {
             app.loading = false;
             if app.selected == Some(id) {
                 match result {
-                    // Sin cambios: el estado de la pantalla ya es el correcto, no se toca nada.
+                    // Sin cambios. Solo vale si esta respuesta corresponde a la vista que se muestra
+                    // ahora: una respuesta en vuelo de antes de seleccionar otro panel no la puede
+                    // confirmar (dejaría la pantalla vacía para siempre).
                     Ok(ScreenReply::Unchanged(gen)) => {
                         app.error = None;
-                        app.snap_gen = Some(gen);
+                        let same_view = app.snap.is_some() && sent_since.is_some() && sent_since == app.snap_gen && offset == app.snap_offset;
+                        app.snap_gen = if same_view { Some(gen) } else { None };
                     }
                     Ok(ScreenReply::Full(snap)) => {
                         app.error = None;
@@ -495,7 +505,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.snap_offset = offset;
                         app.snap = Some(snap);
                     }
-                    Err(e) => app.error = Some(e),
+                    Err(e) => {
+                        app.error = Some(e);
+                        // Sin una vista válida, la siguiente petición debe ser completa.
+                        app.snap_gen = None;
+                    }
                 }
             }
             Task::none()
@@ -522,6 +536,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Event(Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })) => {
             // Con el formulario abierto, el teclado es del formulario, no del panel.
             if app.form.is_some() {
+                return Task::none();
+            }
+            // Con la vista congelada, Esc la libera (no se envía al panel).
+            if app.sel_snap.is_some() && matches!(&key, Key::Named(Named::Escape)) {
+                clear_selection(app);
                 return Task::none();
             }
             if modifiers.command() && matches!(&key, Key::Character(c) if c.as_str() == "v") {
@@ -653,6 +672,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             match newpane::spawn_request(&form, rows, cols, &newpane::Env { home: &home, shell: &shell }) {
                 Ok(req) => {
                     app.form_error = None;
+                    app.spawn_size = Some((rows, cols));
                     send_request(req, Message::Spawned)
                 }
                 Err(e) => {
@@ -667,7 +687,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             match serde_json::from_value::<PaneInfo>(data) {
                 Ok(p) => {
                     // El panel nace con el tamaño de la ventana: no hace falta otro Resize.
-                    app.size_sent = Some((p.id, grid_for(app.window).0, grid_for(app.window).1));
+                    let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
+                    app.size_sent = Some((p.id, rows, cols));
                     app.panes.push(p.clone());
                     let task = select(app, p.id);
                     Task::batch([task, load_panes()])
@@ -873,6 +894,9 @@ fn view(app: &App) -> Element<'_, Message> {
         } else {
             header = header.push(button(text("Cerrar panel").size(12)).on_press(Message::AskClose));
         }
+    }
+    if app.sel_snap.is_some() {
+        header = header.push(text("vista congelada · Esc para volver").size(11).color(MUTED));
     }
     header = header.push(text("GALGO").size(11).color(MUTED));
     let mut body = column![header, body_content].spacing(10).padding(12).width(Length::Fill).height(Length::Fill);
@@ -1137,5 +1161,66 @@ mod tests {
             other => panic!("esperaba snapshot completo: {other:?}"),
         }
         assert_eq!(parse_snapshot_reply(r#"{"ok":false,"error":"panel no encontrado: x","data":null}"#).unwrap_err(), "panel no encontrado: x");
+    }
+
+    fn key_press(key: Key, text: Option<&str>) -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: text.map(Into::into),
+        })
+    }
+
+    /// M1: una respuesta `unchanged` que llega después de cambiar de panel no puede dejar la pantalla vacía.
+    #[test]
+    fn unchanged_en_vuelo_no_deja_la_pantalla_vacia() {
+        let mut app = App { selected: Some(1), ..Default::default() };
+        // Se pidió con since=5 y la vista se perdió (seleccionar otro panel y volver deja snap=None).
+        let _ = update(&mut app, Message::Screen(1, 0, Some(5), Ok(ScreenReply::Unchanged(5))));
+        assert!(app.snap.is_none());
+        assert_eq!(app.snap_gen, None, "la siguiente petición debe ser completa");
+    }
+
+    /// M1, caso válido: con la misma vista, `unchanged` conserva la generación.
+    #[test]
+    fn unchanged_con_la_misma_vista_conserva_la_generacion() {
+        let mut app = App { selected: Some(1), snap: Some(snap(&["a"], 1)), snap_gen: Some(5), ..Default::default() };
+        let _ = update(&mut app, Message::Screen(1, 0, Some(5), Ok(ScreenReply::Unchanged(5))));
+        assert_eq!(app.snap_gen, Some(5));
+    }
+
+    /// B2: con la vista congelada, Esc la libera y no llega al panel.
+    #[test]
+    fn escape_libera_la_vista_congelada() {
+        let mut app = App { selected: Some(1), snap: Some(snap(&["a"], 1)), ..Default::default() };
+        app.sel_snap = app.snap.clone();
+        app.sel = Some(Selection { anchor: (0, 0), head: (0, 0) });
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Escape), None)));
+        assert!(app.sel_snap.is_none());
+        assert!(app.sel.is_none());
+    }
+
+    /// B7: el panel nace con el tamaño con el que se pidió, aunque la ventana haya cambiado después.
+    #[test]
+    fn el_panel_nace_con_el_tamano_de_la_peticion() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        app.form = Some(NewPane { name: "w".into(), preset: Preset::Shell, ..Default::default() });
+        let _ = update(&mut app, Message::SubmitForm);
+        let pedido = grid_for(app.window);
+        app.window = (1600.0, 1000.0);
+        let data = serde_json::to_value(pane_info(7, "w", Status::Idle)).unwrap();
+        let _ = update(&mut app, Message::Spawned(Ok(data)));
+        assert_eq!(app.size_sent, Some((7, pedido.0, pedido.1)));
+    }
+
+    /// B1: tras un fallo de conexión no se confía en la generación guardada.
+    #[test]
+    fn fallo_de_paneles_invalida_la_generacion() {
+        let mut app = App { selected: Some(1), snap: Some(snap(&["a"], 1)), snap_gen: Some(3), ..Default::default() };
+        let _ = update(&mut app, Message::Panes(Err("no hay daemon".into())));
+        assert_eq!(app.snap_gen, None);
     }
 }

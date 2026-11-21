@@ -10,7 +10,11 @@ const MARKER: &str = " # galgo-hook-codex";
 
 pub fn map_event(payload: &Value) -> Option<(HookEvent, Option<String>)> {
     match payload.get("hook_event_name")?.as_str()? {
-        "SessionStart" => Some((HookEvent::Idle, None)),
+        "SessionStart" => match payload.get("source").and_then(Value::as_str) {
+            Some("startup" | "resume" | "clear") => Some((HookEvent::Idle, None)),
+            // Compact puede ocurrir en pleno turno; fuentes desconocidas tampoco prueban idle.
+            _ => None,
+        },
         "UserPromptSubmit" => Some((HookEvent::PromptSubmitted, None)),
         "Stop" => {
             let summary = payload.get("last_assistant_message").and_then(Value::as_str)
@@ -23,13 +27,22 @@ pub fn map_event(payload: &Value) -> Option<(HookEvent, Option<String>)> {
     }
 }
 
-fn path(scope: Scope) -> Result<PathBuf> {
+fn path_from(scope: Scope, codex_home: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
     if !matches!(scope, Scope::User) { bail!("Codex solo admite --scope user"); }
-    let base = match std::env::var_os("CODEX_HOME") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME no está definido")?).join(".codex"),
+    let base = match codex_home.filter(|dir| !dir.is_empty()) {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if !dir.is_absolute() { bail!("CODEX_HOME debe ser una ruta absoluta"); }
+            dir
+        }
+        None => PathBuf::from(home.context("HOME no está definido")?).join(".codex"),
     };
     Ok(base.join("hooks.json"))
+}
+fn path(scope: Scope) -> Result<PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME");
+    let home = std::env::var_os("HOME");
+    path_from(scope, codex_home.as_deref(), home.as_deref())
 }
 
 // La shell recibe únicamente la ruta del ejecutable, no texto del agente. El JSON
@@ -189,11 +202,28 @@ mod tests {
     use super::*;
     #[test]
     fn event_mapping() {
-        assert_eq!(map_event(&json!({"hook_event_name":"SessionStart"})), Some((HookEvent::Idle, None)));
+        for source in ["startup", "resume", "clear"] {
+            assert_eq!(map_event(&json!({"hook_event_name":"SessionStart", "source":source})), Some((HookEvent::Idle, None)));
+        }
+        for source in ["compact", "desconocida"] {
+            assert_eq!(map_event(&json!({"hook_event_name":"SessionStart", "source":source})), None);
+        }
+        assert_eq!(map_event(&json!({"hook_event_name":"SessionStart"})), None);
         assert_eq!(map_event(&json!({"hook_event_name":"UserPromptSubmit"})), Some((HookEvent::PromptSubmitted, None)));
         assert_eq!(map_event(&json!({"hook_event_name":"Stop","last_assistant_message":"  listo  "})), Some((HookEvent::TurnEnded, Some("listo".into()))));
         assert_eq!(map_event(&json!({"hook_event_name":"Stop","last_assistant_message":" ".to_owned()+&"á".repeat(601)})).unwrap().1.unwrap().chars().count(), 601);
         for name in ["PermissionRequest", "PostToolUse", "SubagentStop", "StopFailure"] { assert_eq!(map_event(&json!({"hook_event_name":name})), None); }
+    }
+    #[test]
+    fn codex_home_empty_and_relative() {
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("/tmp/home"));
+        assert_eq!(path_from(Scope::User, None, home).unwrap(), PathBuf::from("/tmp/home/.codex/hooks.json"));
+        assert_eq!(path_from(Scope::User, Some(OsStr::new("")), home).unwrap(), PathBuf::from("/tmp/home/.codex/hooks.json"));
+        assert_eq!(path_from(Scope::User, Some(OsStr::new("/tmp/codex")), None).unwrap(), PathBuf::from("/tmp/codex/hooks.json"));
+        assert!(path_from(Scope::User, Some(OsStr::new("relative")), home).is_err());
+        assert!(path_from(Scope::User, Some(OsStr::new(".")), home).is_err());
+        assert!(path_from(Scope::User, Some(OsStr::new("")), None).is_err());
     }
     #[test]
     fn merge_and_remove_preserve_other_hooks() {

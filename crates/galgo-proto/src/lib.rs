@@ -120,8 +120,9 @@ pub enum Request {
         /// Líneas hacia atrás en el historial (0 = pantalla en vivo).
         #[serde(default)]
         offset: u16,
-        /// Generación que el cliente ya tiene. Si la pantalla no ha cambiado desde entonces, el daemon
-        /// responde `{unchanged: true, gen}` en vez del snapshot. Solo es válida con el mismo `offset`.
+        /// Token de la vista que el cliente ya tiene (el `gen` de un snapshot anterior, que codifica la
+        /// generación y el `offset`). Si la vista no ha cambiado, el daemon responde
+        /// `{unchanged: true, gen}`; con otro `offset` el token no coincide y responde el snapshot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<u64>,
     },
@@ -209,7 +210,8 @@ impl Color {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
-    /// Generación de la pantalla: cambia con cada escritura del panel y con cada `Resize`.
+    /// Token de la vista: `generación << 16 | offset`. La generación cambia con cada escritura del panel y
+    /// con cada `Resize`; el cliente lo devuelve tal cual en `since`.
     #[serde(default)]
     pub gen: u64,
     pub rows: u16,
