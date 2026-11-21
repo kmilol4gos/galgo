@@ -1157,6 +1157,7 @@ name = "galgo-gui"
 version = "0.1.0"
 dependencies = [
  "galgo-proto",
+ "galgo-usage",
  "iced",
  "serde",
  "serde_json",
@@ -1168,7 +1169,16 @@ name = "galgo-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "galgo-usage",
  "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "galgo-usage"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

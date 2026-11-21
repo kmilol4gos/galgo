@@ -1,5 +1,5 @@
 use galgo_proto::{client, PaneInfo, Request, Status};
-use iced::{widget::{button, column, container, lazy, pick_list, row, scrollable, text, text_input, Space}, Color, Element, Font, Length, Task, Theme};
+use iced::{widget::{button, column, container, lazy, pick_list, progress_bar, row, scrollable, text, text_input, Space}, Color, Element, Font, Length, Task, Theme};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Mutex;
@@ -13,9 +13,11 @@ const MUTED: Color = Color::from_rgb(0.60, 0.64, 0.70);
 mod attention;
 mod newpane;
 mod term;
+mod usage;
 
 use attention::{Alert, Attention, Badge};
 use galgo_proto::{Run, Snapshot};
+use galgo_usage::Limits;
 use iced::keyboard::{self, key::Named, Key};
 use iced::mouse;
 use iced::widget::text::Span;
@@ -159,6 +161,9 @@ struct App {
     form_error: Option<String>,
     /// Pide confirmación antes de cerrar el panel seleccionado.
     confirm_close: bool,
+    /// Cuotas por agente del daemon, y el último error si no se pudieron leer.
+    limits: Vec<Limits>,
+    limits_error: Option<String>,
     /// La ventana tiene el foco: si no, las alertas van a notificación de macOS.
     focused: bool,
 }
@@ -168,6 +173,7 @@ enum Message {
     TickScreen,
     TickList,
     Panes(Result<Vec<PaneInfo>, String>),
+    Limits(Result<Vec<Limits>, String>),
     /// Respuesta de una petición de pantalla: id, offset pedido, `since` enviado y el resultado.
     Screen(u32, u16, Option<u64>, Result<ScreenReply, String>),
     Select(u32),
@@ -201,6 +207,21 @@ fn load_panes() -> Task<Message> {
         tokio::task::spawn_blocking(|| serde_json::from_value(request(Request::List)?).map_err(|e| e.to_string()))
             .await.map_err(|e| e.to_string())?
     }, Message::Panes)
+}
+
+/// Cuotas por agente (`Usage`). Va junto a la lista: es una lectura barata, sin tocar los PTY.
+fn load_limits() -> Task<Message> {
+    Task::perform(async {
+        tokio::task::spawn_blocking(|| {
+            let data = request(Request::Usage { group_by: None })?;
+            serde_json::from_value::<Vec<Limits>>(data["limits"].clone()).map_err(|e| e.to_string())
+        })
+        .await.map_err(|e| e.to_string())?
+    }, Message::Limits)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Respuesta de `snapshot` leída en una sola pasada: `data` queda crudo hasta saber qué es.
@@ -458,8 +479,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 _ => Task::none(),
             }
         }
-        Message::TickList if !app.listing => { app.listing = true; load_panes() }
+        Message::TickList if !app.listing => { app.listing = true; Task::batch([load_panes(), load_limits()]) }
         Message::TickList => Task::none(),
+        Message::Limits(Ok(limits)) => {
+            app.limits = limits;
+            app.limits_error = None;
+            Task::none()
+        }
+        Message::Limits(Err(e)) => {
+            app.limits_error = Some(e);
+            Task::none()
+        }
         Message::Panes(result) => {
             app.listing = false;
             match result {
@@ -649,7 +679,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::OpenForm => {
-            app.form = Some(NewPane { workspace: selected_workspace(app), ..NewPane::default() });
+            // B4: el workspace empieza vacío. Heredar el del panel seleccionado agrupaba en silencio un panel nuevo
+            // de otro repo bajo el workspace equivocado (un workspace explícito anula la deducción por git).
+            app.form = Some(NewPane::default());
             app.form_error = None;
             Task::none()
         }
@@ -860,6 +892,9 @@ fn pane_button<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
     if let Some(manager) = &pane.manager { notes.push(format!("reporta a {manager}")); }
     if let Some(waiting) = &pane.waiting_on { notes.push(format!("espera a {waiting}")); }
     let mut info = column![text(&pane.name).size(15), text(pane.status.as_str().to_uppercase()).size(11).color(status_color(pane.status))].spacing(5);
+    if let Some((line, color)) = pane.usage.as_ref().and_then(usage::pane_line) {
+        info = info.push(text(line).size(11).color(color.unwrap_or(MUTED)));
+    }
     if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
         let (label, color) = badge_look(b);
         info = info.push(row![text("●").size(11).color(color), text(label).size(11).color(color)].spacing(6));
@@ -872,12 +907,31 @@ fn pane_button<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
     }).into()
 }
 
-/// Workspace del panel seleccionado: el que hereda un panel nuevo.
-fn selected_workspace(app: &App) -> String {
-    app.selected
-        .and_then(|id| app.panes.iter().find(|p| p.id == id))
-        .and_then(|p| p.workspace.clone())
-        .unwrap_or_default()
+/// Pie de la barra lateral: cuotas por agente, con barras de 5 h y 7 d, reinicio y edad del dato.
+fn limits_footer(app: &App) -> Element<'_, Message> {
+    let now = now_secs();
+    let mut col = column![text("CUOTAS").size(12).color(MUTED)].spacing(6);
+    if app.limits.is_empty() {
+        let msg = match &app.limits_error {
+            Some(e) => format!("cuotas no disponibles: {e}"),
+            None => "sin cuotas observadas".to_string(),
+        };
+        col = col.push(text(msg).size(11).color(MUTED));
+    }
+    for l in &app.limits {
+        col = col.push(text(l.agent.clone()).size(12));
+        for r in usage::limit_rows(l, now) {
+            let bar = row![
+                text(r.label).size(11).width(40),
+                progress_bar(0.0..=100.0, r.pct).height(6),
+                text(format!("{:.0} %", r.pct)).size(11).width(44),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            col = col.push(bar).push(text(r.detail).size(10).color(MUTED));
+        }
+    }
+    col.into()
 }
 
 fn view(app: &App) -> Element<'_, Message> {
@@ -892,7 +946,10 @@ fn view(app: &App) -> Element<'_, Message> {
         let label = ws.clone().unwrap_or_else(|| "sin workspace".into());
         let summary = attention::group_summary(&group, &app.attention);
         let arrow = if folded { "▸" } else { "▾" };
-        let detail = if summary.is_empty() { format!("{} panel(es)", group.len()) } else { format!("{} panel(es) · {summary}", group.len()) };
+        let mut detail = if summary.is_empty() { format!("{} panel(es)", group.len()) } else { format!("{} panel(es) · {summary}", group.len()) };
+        if let Some(total) = usage::group_total(&group) {
+            detail = format!("{detail} · {total}");
+        }
         let head = column![text(format!("{arrow} {label}")).size(13), text(detail).size(11).color(MUTED)].spacing(2);
         list = list.push(button(container(head).width(Length::Fill).padding([6, 8])).width(Length::Fill).on_press(Message::ToggleGroup(key)).style(|_, _| button::Style { background: None, text_color: TEXT, ..Default::default() }));
         if !folded {
@@ -901,7 +958,7 @@ fn view(app: &App) -> Element<'_, Message> {
             }
         }
     }
-    let sidebar = container(scrollable(list).height(Length::Fill)).width(260).height(Length::Fill).padding(16).style(|_| container::Style { background: Some(SURFACE.into()), ..Default::default() });
+    let sidebar = container(column![scrollable(list).height(Length::Fill), limits_footer(app)].spacing(12)).width(260).height(Length::Fill).padding(16).style(|_| container::Style { background: Some(SURFACE.into()), ..Default::default() });
     let selected_pane = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id));
     let title = selected_pane.map(|p| p.name.as_str()).unwrap_or("Sin paneles");
     let state = selected_pane.map(|p| p.status.as_str().to_uppercase()).unwrap_or_default();
@@ -940,7 +997,11 @@ fn view(app: &App) -> Element<'_, Message> {
         header = header.push(text("vista congelada · Esc para volver").size(11).color(MUTED));
     }
     header = header.push(text("GALGO").size(11).color(MUTED));
-    let mut body = column![header, body_content].spacing(10).padding(12).width(Length::Fill).height(Length::Fill);
+    let mut body = column![header].spacing(10).padding(12).width(Length::Fill).height(Length::Fill);
+    if let Some(u) = selected_pane.and_then(|p| p.usage.as_ref()) {
+        body = body.push(text(usage::detail_line(u)).size(11).color(MUTED));
+    }
+    body = body.push(body_content);
     if let Some(error) = &app.error { body = body.push(text(format!("Error: {error}")).size(12).color(status_color(Status::Failed))); }
     container(row![sidebar, body]).width(Length::Fill).height(Length::Fill).style(|_| container::Style { background: Some(BG.into()), text_color: Some(TEXT), ..Default::default() }).into()
 }
@@ -968,7 +1029,7 @@ fn main() -> iced::Result {
             }),
         ]))
         .window_size(iced::Size::new(1100.0, 700.0))
-        .run_with(|| (App { window: (1100.0, 700.0), focused: true, ..Default::default() }, load_panes()))
+        .run_with(|| (App { window: (1100.0, 700.0), focused: true, ..Default::default() }, Task::batch([load_panes(), load_limits()])))
 }
 
 #[cfg(test)]
@@ -1150,6 +1211,7 @@ mod tests {
             waiting_secs: None,
             workspace: None,
             cwd: None,
+            usage: None,
         }
     }
 
@@ -1269,12 +1331,12 @@ mod tests {
 
     /// Workspace: el formulario de un panel nuevo hereda el workspace del seleccionado.
     #[test]
-    fn el_formulario_hereda_el_workspace_del_seleccionado() {
+    fn el_formulario_no_hereda_el_workspace_del_seleccionado() {
         let mut p = pane_info(1, "w", Status::Idle);
         p.workspace = Some("inventia/cotizacion".into());
         let mut app = App { panes: vec![p], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::OpenForm);
-        assert_eq!(app.form.as_ref().unwrap().workspace, "inventia/cotizacion");
+        assert_eq!(app.form.as_ref().unwrap().workspace, "", "B4: el campo empieza vacío");
         let _ = update(&mut app, Message::FormWorkspace("galgo/main".into()));
         assert_eq!(app.form.as_ref().unwrap().workspace, "galgo/main");
     }
@@ -1287,5 +1349,17 @@ mod tests {
         assert!(app.collapsed.contains("inventia/cotizacion"));
         let _ = update(&mut app, Message::ToggleGroup("inventia/cotizacion".into()));
         assert!(!app.collapsed.contains("inventia/cotizacion"));
+    }
+
+    /// Las cuotas llegan al estado; un error de lectura se guarda aparte y no borra las últimas cuotas.
+    #[test]
+    fn cuotas_llegan_y_un_error_no_las_borra() {
+        let mut app = App::default();
+        let limits = vec![Limits { agent: "claude".into(), plan: None, windows: vec![], observed_at: 1 }];
+        let _ = update(&mut app, Message::Limits(Ok(limits)));
+        assert_eq!(app.limits.len(), 1);
+        let _ = update(&mut app, Message::Limits(Err("sin daemon".into())));
+        assert_eq!(app.limits.len(), 1, "las últimas cuotas se conservan");
+        assert_eq!(app.limits_error.as_deref(), Some("sin daemon"));
     }
 }

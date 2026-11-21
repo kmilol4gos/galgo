@@ -1,9 +1,11 @@
 //! galgod: daemon que posee los PTYs, el estado de pantalla y la entrega de mensajes entre agentes.
 
 mod persist;
+mod usage;
 
 use anyhow::{anyhow, bail, Context, Result};
 use galgo_proto::{HookEvent, Message, PaneInfo, Request, Response, Status};
+use galgo_usage::PaneUsage;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use std::{
@@ -58,6 +60,8 @@ struct InboxMsg {
     /// Con `client_ack`: la reserva vence si el cliente no confirma a tiempo.
     hold_until: Option<Instant>,
     last_inject: Option<Instant>,
+    /// Llegó con un fantasma reutilizado del mismo manager. Se lee con `galgo inbox`, nunca se inyecta.
+    inherited: bool,
 }
 
 impl InboxMsg {
@@ -93,6 +97,9 @@ struct Pane {
     /// Workspace del panel ("<proyecto>/<rama>" o un nombre libre) y su directorio de trabajo.
     workspace: Option<String>,
     cwd: Option<String>,
+    /// Uso del transcript (lo rellena el hilo de sondeo) y último informe del agente. Solo en memoria.
+    usage: Option<PaneUsage>,
+    usage_report: Option<usage::ReportData>,
     inbox: Vec<InboxMsg>,
     last_summary: Option<String>,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
@@ -151,6 +158,8 @@ impl Pane {
             ghost: true,
             workspace,
             cwd,
+            usage: None,
+            usage_report: None,
             inbox,
             last_summary: None,
             last_blocked: None,
@@ -203,6 +212,55 @@ impl State {
             .ok_or_else(|| anyhow!("panel no encontrado: {r}"))
     }
 
+    /// Si `name` es el de un fantasma: `Some((su id, heredar))`. Hereda su inbox solo si el manager es el mismo
+    /// (mismo rol). Con otro manager, sus pendientes van a su antiguo manager (B3); si ese no existe, se rechaza
+    /// sin tocar nada: nunca se descarta un resultado.
+    fn ghost_plan(&self, name: &str, manager: Option<u32>) -> Result<Option<(u32, bool)>> {
+        let Some(g) = self.panes.values().find(|g| g.ghost && g.name == name) else { return Ok(None) };
+        if manager == Some(g.id) {
+            bail!("un panel no puede ser su propio manager");
+        }
+        let inherit = g.manager == manager;
+        let pending = g.inbox.iter().filter(|m| !m.acked).count();
+        let manager_alive = g.manager.is_some_and(|x| self.panes.contains_key(&x));
+        if !inherit && pending > 0 && !manager_alive {
+            bail!(
+                "el fantasma {name} tiene {pending} mensaje(s) sin confirmar y no tiene manager vivo al que pasarlos; confírmalos con galgo ack, quítalo con galgo kill {name} o reusalo con su mismo manager"
+            );
+        }
+        Ok(Some((g.id, inherit)))
+    }
+
+    /// Quita el fantasma `gid` y lo sustituye por `new_id`: hereda su inbox (marcado) o entrega sus pendientes a
+    /// su antiguo manager. Todo lo que apuntaba a `gid` pasa a apuntar a `new_id`. Devuelve cuántos heredó.
+    fn absorb_ghost(&mut self, gid: u32, new_id: u32, inherit: bool, pane: &mut Pane) -> usize {
+        let Some(g) = self.panes.remove(&gid) else { return 0 };
+        let mut inherited = 0;
+        if inherit {
+            let mut inbox = g.inbox;
+            for m in inbox.iter_mut().filter(|m| !m.acked) {
+                m.inherited = true;
+                inherited += 1;
+            }
+            pane.inbox = inbox;
+        } else if let Some(t) = g.manager.filter(|t| self.panes.contains_key(t)) {
+            if let Some(target) = self.panes.get_mut(&t) {
+                target.inbox.extend(g.inbox.into_iter().filter(|m| !m.acked));
+            }
+        }
+        for p in self.panes.values_mut() {
+            if p.manager == Some(gid) {
+                p.manager = Some(new_id);
+            }
+            if let Some((t, _)) = p.waiting_on.as_mut() {
+                if *t == gid {
+                    *t = new_id;
+                }
+            }
+        }
+        inherited
+    }
+
     fn push(&mut self, to: u32, from: u32, kind: &'static str, summary: String) {
         let id = self.next_msg_id();
         self.touch();
@@ -219,6 +277,7 @@ impl State {
                 claimed: false,
                 hold_until: None,
                 last_inject: None,
+                inherited: false,
             });
         }
     }
@@ -243,6 +302,7 @@ impl State {
             waiting_secs: p.waiting_on.map(|(_, at)| at.elapsed().as_secs()),
             workspace: p.workspace.clone(),
             cwd: p.cwd.clone(),
+            usage: usage::merged(p.usage.as_ref(), p.usage_report.as_ref()),
         }
     }
 }
@@ -254,6 +314,8 @@ struct Daemon {
     persist_lock: Mutex<()>,
     /// Avisa al hilo de guardado de que hubo cambios. Enviar no bloquea.
     persist_tx: std::sync::mpsc::Sender<()>,
+    /// Uso vivo por panel y cuotas: en memoria, fuera de `state` y de `state.json`.
+    usage: usage::UsageLive,
     notify: Notify,
     socket: PathBuf,
     orphan_secs: u64,
@@ -298,6 +360,30 @@ fn verb(kind: &str) -> &'static str {
         "blocked" => "necesita una decisión",
         _ => "salió sin reportar resultado",
     }
+}
+
+/// Un mensaje se escribe en el terminal solo si es nuevo para este panel: no confirmado, sin reserva y no
+/// heredado de una ejecución de un fantasma (B3).
+fn is_injectable(m: &InboxMsg) -> bool {
+    !m.acked && !m.is_held() && !m.inherited
+}
+
+/// Límite de longitud para nombres y workspaces, y texto sin caracteres de control (B2).
+const MAX_LABEL: usize = 128;
+
+fn check_text(what: &str, text: &str, max: usize) -> Result<()> {
+    if text.chars().any(char::is_control) {
+        bail!("{what} no puede tener caracteres de control");
+    }
+    if text.chars().count() > max {
+        bail!("{what} tiene más de {max} caracteres");
+    }
+    Ok(())
+}
+
+/// Quita los caracteres de control y acota la longitud: para lo que deduce git, que no se valida.
+fn clean_label(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(MAX_LABEL).collect()
 }
 
 /// Texto seguro para escribir en la terminal de otro panel: sin caracteres de control.
@@ -356,21 +442,69 @@ fn workspace_for(cwd: Option<&str>) -> Option<String> {
     let dir = cwd?;
     let top = git_out(dir, &["rev-parse", "--show-toplevel"])?;
     let branch = git_out(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
-    Some(workspace_name(&top, &branch))
+    let name = clean_label(&workspace_name(&top, &branch));
+    (!name.is_empty()).then_some(name)
 }
 
+/// Variables de git que cambian a qué repositorio apunta un comando. Se quitan del entorno del daemon: un
+/// `GIT_DIR` heredado daría a todos los paneles la rama de otro repo (B1).
+const GIT_ENV_REMOVE: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// Tiempo máximo de una consulta a git. Un volumen que no responde no puede retener el spawn (M3).
+const GIT_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn git_out(dir: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
+    git_program("git", dir, args)
+}
+
+/// Ejecuta `program -C dir args` con tiempo límite. Si vence, el proceso se mata y no hay resultado.
+fn git_program(program: &str, dir: &str, args: &[&str]) -> Option<String> {
+    git_program_with(program, dir, args, &[])
+}
+
+/// Como `git_program`, con variables extra que el entorno del proceso hereda antes de limpiar las de git.
+fn git_program_with(program: &str, dir: &str, args: &[&str], inherited: &[(&str, &str)]) -> Option<String> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    for (k, v) in inherited {
+        cmd.env(k, v);
+    }
+    for var in GIT_ENV_REMOVE {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let mut out = child.stdout.take()?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut out, &mut text).ok()?;
+    let text = text.trim().to_string();
     (!text.is_empty()).then_some(text)
 }
 
@@ -417,10 +551,14 @@ impl Daemon {
         rows: u16,
         cols: u16,
         workspace: Option<String>,
-    ) -> Result<u32> {
+    ) -> Result<(u32, usize)> {
         check_size(rows, cols)?;
-        // Sin workspace explícito, se deduce del repo git del directorio ("<repo>/<rama>"), si lo hay.
-        let workspace = workspace.filter(|w| !w.trim().is_empty()).or_else(|| workspace_for(cwd.as_deref()));
+        // El workspace llega ya resuelto: el explícito, o el que deduce git fuera de este hilo (`handle`).
+        let workspace = workspace.filter(|w| !w.trim().is_empty());
+        if let Some(w) = &workspace {
+            check_text("el workspace", w, MAX_LABEL)?;
+        }
+        check_text("el nombre", &name, MAX_LABEL)?;
         let cwd_saved = cwd.clone();
         if name.trim().is_empty() || name.parse::<u32>().is_ok() {
             bail!("nombre inválido: no puede estar vacío ni ser solo un número");
@@ -435,7 +573,7 @@ impl Daemon {
         }
         // La comprobación del nombre y su reserva van en la misma sección crítica:
         // dos spawns concurrentes con el mismo nombre no pueden pasar los dos.
-        let (id, manager_id, mut reservation) = {
+        let (id, manager_id, ghost_plan, mut reservation) = {
             let mut st = self.state.lock().unwrap();
             if st.panes.values().any(|p| !p.ghost && p.name == name) || st.reserved.contains(&name) {
                 bail!("ya existe un panel llamado {name}");
@@ -444,10 +582,12 @@ impl Daemon {
                 Some(r) => Some(st.resolve(&r)?),
                 None => None,
             };
+            // Antes de tocar nada: si el nombre es de un fantasma con pendientes que no se pueden entregar, se rechaza.
+            let ghost_plan = st.ghost_plan(&name, m)?;
             st.next_pane += 1;
             st.reserved.insert(name.clone());
             let reservation = NameReservation { d: Arc::clone(self), name: Some(name.clone()) };
-            (st.next_pane, m, reservation)
+            (st.next_pane, m, ghost_plan, reservation)
         };
 
         let pair = native_pty_system()
@@ -512,6 +652,8 @@ impl Daemon {
             ghost: false,
             workspace,
             cwd: cwd_saved,
+            usage: None,
+            usage_report: None,
             inbox: Vec::new(),
             last_summary: None,
             last_blocked: None,
@@ -519,15 +661,14 @@ impl Daemon {
             waiting_on: None,
             reported: false,
         };
+        let mut inherited = 0usize;
         {
             let mut st = self.state.lock().unwrap();
             st.reserved.remove(&name);
             let mut pane = pane;
-            let ghost = st.panes.values().find(|g| g.ghost && g.name == name).map(|g| g.id);
-            if let Some(gid) = ghost {
-                if let Some(g) = st.panes.remove(&gid) {
-                    pane.inbox = g.inbox;
-                }
+            if let Some((gid, inherit)) = ghost_plan {
+                inherited = st.absorb_ghost(gid, id, inherit, &mut pane);
+                self.untrack_usage(gid);
             }
             st.panes.insert(id, pane);
             st.touch();
@@ -554,7 +695,7 @@ impl Daemon {
             let code = child.wait().ok().map(|s| s.exit_code());
             d.on_exit(id, code);
         });
-        Ok(id)
+        Ok((id, inherited))
     }
 
     fn mark_closed(&self, id: u32) {
@@ -616,7 +757,7 @@ impl Daemon {
         }
         let mut lines = Vec::new();
         let mut ids = Vec::new();
-        for m in p.inbox.iter_mut().filter(|m| !m.acked && !m.is_held()) {
+        for m in p.inbox.iter_mut().filter(|m| is_injectable(m)) {
             if m.last_inject.is_none_or(|t| t.elapsed() >= retry) {
                 m.last_inject = Some(Instant::now());
                 lines.push(sanitize(&format!(
@@ -699,6 +840,10 @@ impl Daemon {
                         m.acked = true;
                     }
                 }
+            }
+            // M1: una confirmación es un cambio persistente; sin esto no llega al disco hasta el siguiente.
+            if confirmed {
+                st.touch();
             }
         }
         self.notify.notify_waiters();
@@ -796,9 +941,19 @@ impl Daemon {
     async fn handle(self: &Arc<Self>, req: Request) -> Result<Value> {
         match req {
             Request::Spawn { name, cmd, cwd, manager, inject, rows, cols, workspace } => {
-                let id = self.spawn_pane(name, cmd, cwd, manager, inject, rows, cols, workspace)?;
+                // git puede tardar (red, disco lento): la consulta va fuera del hilo de peticiones y con tiempo límite.
+                let workspace = match workspace.filter(|w| !w.trim().is_empty()) {
+                    Some(w) => Some(w),
+                    None => {
+                        let dir = cwd.clone();
+                        tokio::task::spawn_blocking(move || workspace_for(dir.as_deref())).await?
+                    }
+                };
+                let (id, inherited) = self.spawn_pane(name, cmd, cwd, manager, inject, rows, cols, workspace)?;
                 let st = self.state.lock().unwrap();
-                Ok(serde_json::to_value(st.info(&st.panes[&id], self.orphan_secs))?)
+                let mut v = serde_json::to_value(st.info(&st.panes[&id], self.orphan_secs))?;
+                v["inherited"] = json!(inherited);
+                Ok(v)
             }
             Request::List => {
                 let st = self.state.lock().unwrap();
@@ -910,6 +1065,12 @@ impl Daemon {
                 let manager = {
                     let mut st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
+                    // M4: un manager que ya no existe no debe tragarse el resultado en silencio.
+                    if let Some(m) = st.panes[&id].manager {
+                        if !st.panes.contains_key(&m) {
+                            bail!("el manager ya no existe: el resultado no se entregó");
+                        }
+                    }
                     let kind = if failed { "failed" } else { "done" };
                     let p = st.panes.get_mut(&id).unwrap();
                     p.status = if failed { Status::Failed } else { Status::Done };
@@ -922,13 +1083,17 @@ impl Daemon {
                     }
                     manager
                 };
+                // M2: el resultado queda en disco antes de responder "ok"; un SIGTERM después no lo pierde.
+                let d = Arc::clone(self);
+                tokio::task::spawn_blocking(move || d.persist_now()).await?;
                 self.notify.notify_waiters();
                 if let Some(m) = manager {
                     self.try_inject(m);
                 }
                 Ok(json!({ "delivered_to": manager }))
             }
-            Request::Hook { pane, event, summary } => {
+            Request::Hook { pane, event, summary, source } => {
+                let urgent = matches!(event, HookEvent::TurnEnded | HookEvent::Failed | HookEvent::Blocked);
                 let target = {
                     let mut st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
@@ -994,6 +1159,11 @@ impl Daemon {
                     }
                     manager
                 };
+                // M2: un resultado o un bloqueo entregado se guarda antes de responder.
+                if urgent && target.is_some() {
+                    let d = Arc::clone(self);
+                    tokio::task::spawn_blocking(move || d.persist_now()).await?;
+                }
                 self.notify.notify_waiters();
                 if let Some(m) = target {
                     self.try_inject(m);
@@ -1003,9 +1173,18 @@ impl Daemon {
                 let own = self.state.lock().unwrap().resolve(&pane).ok();
                 if let Some(id) = own {
                     self.try_inject(id);
+                    // Un hook con fuente: se sigue el transcript de este panel desde ahora.
+                    if let Some(src) = &source {
+                        self.track_hook(id, src);
+                    }
                 }
                 Ok(json!({}))
             }
+            Request::UsageReport { pane, agent, model, context_tokens, context_window, cost_usd, limits } => {
+                self.usage_report(&pane, agent, model, context_tokens, context_window, cost_usd, &limits)?;
+                Ok(json!({}))
+            }
+            Request::Usage { group_by } => self.usage_view(group_by.as_deref()),
             Request::Wait { .. } => unreachable!("se atiende en dispatch"),
             Request::Inbox { pane } => {
                 let st = self.state.lock().unwrap();
@@ -1040,6 +1219,7 @@ impl Daemon {
                         }
                     })?;
                     m.acked = true;
+                    st.touch();
                 }
                 self.notify.notify_waiters();
                 Ok(json!({}))
@@ -1131,8 +1311,17 @@ impl Daemon {
             st.panes.get_mut(&manager.unwrap()).unwrap().inbox.push(m);
             moved += 1;
         }
+        // Lo que apuntaba a este fantasma pasa a su manager (o queda sin manager): ningún resultado se queda colgado.
+        for p in st.panes.values_mut() {
+            if p.manager == Some(id) {
+                p.manager = manager;
+            }
+        }
         st.touch();
-        Ok(Some(json!({ "removed": ghost.name, "moved": moved })))
+        let out = json!({ "removed": ghost.name, "moved": moved });
+        drop(st);
+        self.untrack_usage(id);
+        Ok(Some(out))
     }
 
     /// Reintenta cada cierto tiempo los mensajes que nadie ha confirmado.
@@ -1229,6 +1418,16 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
     }
 }
 
+/// Espera una señal de cierre, escribe el estado pendiente y sale.
+async fn on_signal(d: Arc<Daemon>, kind: tokio::signal::unix::SignalKind) {
+    let Ok(mut sig) = tokio::signal::unix::signal(kind) else { return };
+    sig.recv().await;
+    let socket = d.socket.clone();
+    let _ = tokio::task::spawn_blocking(move || d.persist_now()).await;
+    let _ = std::fs::remove_file(socket);
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let socket = galgo_proto::socket_path();
@@ -1245,12 +1444,15 @@ async fn main() -> Result<()> {
     // Estado del arranque anterior, antes de aceptar conexiones: inbox sin confirmar y paneles (que vuelven
     // sin proceso). Un archivo que no sirve se aparta con aviso. El epoch no depende del archivo.
     let state_path = persist::state_path(&socket);
-    let saved = persist::load(&state_path);
+    let legacy = persist::legacy_path(&socket);
+    let (saved, migrated) = persist::load_with_migration(&state_path, legacy.as_deref());
     let mut state = State { epoch: persist::epoch_for(saved.as_ref()), ..State::default() };
     if let Some(s) = saved {
         persist::restore(&mut state, s);
     }
     let (persist_tx, persist_rx) = std::sync::mpsc::channel::<()>();
+    let (usage_tx, usage_rx) = std::sync::mpsc::channel::<()>();
+    let migration = migrated.map(|old| (old, state_path.clone()));
     let listener = UnixListener::bind(&socket)?;
     // Quien alcance el socket puede escribir en todos los paneles: solo el dueño.
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
@@ -1260,6 +1462,7 @@ async fn main() -> Result<()> {
         state_path,
         persist_lock: Mutex::new(()),
         persist_tx,
+        usage: usage::UsageLive::new(usage_tx),
         notify: Notify::new(),
         socket: socket.clone(),
         orphan_secs: env_u64("GALGO_ORPHAN_SECS", 30),
@@ -1270,9 +1473,28 @@ async fn main() -> Result<()> {
     // El epoch nuevo queda guardado antes de aceptar la primera conexión; luego el hilo de guardado
     // escribe lo que cambie, agrupado y fuera del hilo de las peticiones.
     daemon.persist_now();
+    if let Some((old, new)) = migration {
+        match persist::finish_migration(&old, &new) {
+            Ok(Some(to)) => eprintln!("galgod: estado de la versión anterior migrado; el original queda en {}", to.display()),
+            Ok(None) => {}
+            Err(e) => eprintln!("galgod: {e:#}"),
+        }
+    }
     {
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || persist_loop(d, persist_rx));
+    }
+    // M2: cierre de sesión, `kill` o Ctrl-C: lo pendiente se escribe antes de salir.
+    for kind in [
+        tokio::signal::unix::SignalKind::terminate(),
+        tokio::signal::unix::SignalKind::interrupt(),
+        tokio::signal::unix::SignalKind::hangup(),
+    ] {
+        tokio::spawn(on_signal(Arc::clone(&daemon), kind));
+    }
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || usage::poll_loop(d, usage_rx));
     }
     eprintln!("galgod escuchando en {}", socket.display());
 
@@ -1442,12 +1664,17 @@ mod tests_fantasmas {
     use super::*;
 
     fn daemon_con(state: State) -> Arc<Daemon> {
+        daemon_con_en(state, std::env::temp_dir().join("galgo-no-se-usa.json"))
+    }
+
+    fn daemon_con_en(state: State, state_path: PathBuf) -> Arc<Daemon> {
         let (tx, _rx) = std::sync::mpsc::channel();
         Arc::new(Daemon {
             state: Mutex::new(state),
-            state_path: std::env::temp_dir().join("galgo-no-se-usa.json"),
+            state_path,
             persist_lock: Mutex::new(()),
             persist_tx: tx,
+            usage: usage::UsageLive::new(std::sync::mpsc::channel().0),
             notify: Notify::new(),
             socket: PathBuf::from("/dev/null"),
             orphan_secs: 30,
@@ -1473,6 +1700,7 @@ mod tests_fantasmas {
             claimed: false,
             hold_until: None,
             last_inject: None,
+            inherited: false,
         }
     }
 
@@ -1526,5 +1754,172 @@ mod tests_fantasmas {
         assert!(a < persist::ID_LIMIT && b < persist::ID_LIMIT, "{a} {b}");
         assert_eq!(a >> 32, persist::EPOCH_MAX, "el epoch va en la parte alta");
         assert_eq!(a as f64 as u64, a, "el id es exacto como número de JavaScript");
+    }
+
+    /// G1: el id se escribe como texto JSON y se lee como double (JavaScript): vuelve igual.
+    #[test]
+    fn id_maximo_sobrevive_a_leerlo_como_double() {
+        let mut st = State { epoch: persist::EPOCH_MAX, next_msg: 0xFFFF_FFFE, ..State::default() };
+        for _ in 0..2 {
+            let id = st.next_msg_id();
+            let json = serde_json::to_string(&json!({ "msg": id })).unwrap();
+            let leido = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+            let as_double = leido["msg"].as_f64().unwrap();
+            assert_eq!(as_double as u64, id, "{json}");
+            assert_eq!(id.to_string().parse::<f64>().unwrap() as u64, id);
+        }
+    }
+
+    /// M1: confirmar un mensaje (wait o ack) cambia el estado persistente.
+    #[test]
+    fn confirmar_cambia_el_estado_persistente() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(1, fantasma(1, "mgr", None));
+        st.panes.get_mut(&1).unwrap().inbox.push(msg(10, 2, "x"));
+        let d = daemon_con(st);
+        let antes = d.state.lock().unwrap().version;
+        d.confirm(1, 10);
+        assert!(d.state.lock().unwrap().version > antes);
+    }
+
+    #[test]
+    fn ack_cambia_el_estado_persistente() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(1, fantasma(1, "mgr", None));
+        st.panes.get_mut(&1).unwrap().inbox.push(msg(10, 2, "x"));
+        let d = daemon_con(st);
+        let antes = d.state.lock().unwrap().version;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(d.handle(Request::Ack { pane: "1".into(), msg: 10 })).unwrap();
+        assert!(d.state.lock().unwrap().version > antes);
+    }
+
+    /// M2: un resultado respondido con éxito ya está en disco cuando llega la respuesta.
+    #[test]
+    fn done_queda_en_disco_antes_de_responder() {
+        let dir = std::env::temp_dir().join(format!("galgo-m2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let path = dir.join("g.state.json");
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(1, fantasma(1, "mgr", None));
+        let mut w = fantasma(2, "w", Some(1));
+        w.ghost = false;
+        st.panes.insert(2, w);
+        let d = daemon_con_en(st, path.clone());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(d.handle(Request::Done { pane: "w".into(), summary: "resultadoB".into(), failed: false })).unwrap();
+        // Sin esperar al hilo de guardado: el archivo ya lo tiene.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("resultadoB"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M3: una consulta a git que no responde se corta al límite; no retiene el spawn.
+    #[test]
+    fn git_colgado_se_corta_al_limite() {
+        let dir = std::env::temp_dir().join(format!("galgo-m3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("git-colgado");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let t = Instant::now();
+        assert_eq!(git_program(script.to_str().unwrap(), "/", &["rev-parse"]), None);
+        assert!(t.elapsed() < Duration::from_secs(5), "tardó {:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B1: un GIT_DIR heredado no llega a git: el comando ve su propio repo, no el del entorno.
+    #[test]
+    fn git_no_hereda_git_dir() {
+        let dir = std::env::temp_dir().join(format!("galgo-b1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("git-eco");
+        std::fs::write(&script, "#!/bin/sh\nif [ -z \"${GIT_DIR+x}\" ]; then echo limpio; else echo heredado; fi\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // Se pasa al hijo sin tocar el entorno del proceso de pruebas (las demás pruebas usan git en paralelo).
+        let out = git_program_with(script.to_str().unwrap(), "/", &["x"], &[("GIT_DIR", "/ruta/que/no/existe")]);
+        assert_eq!(out.as_deref(), Some("limpio"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B2: nombres y workspaces sin caracteres de control y con longitud acotada; lo que deduce git se limpia.
+    #[test]
+    fn nombres_y_workspaces_sin_caracteres_de_control() {
+        assert!(check_text("el nombre", "ok", MAX_LABEL).is_ok());
+        assert!(check_text("el nombre", "a\u{1b}[31mb", MAX_LABEL).is_err());
+        assert!(check_text("el nombre", "a\nb", MAX_LABEL).is_err());
+        assert!(check_text("el workspace", &"x".repeat(MAX_LABEL + 1), MAX_LABEL).is_err());
+        assert_eq!(clean_label("ws\u{1b}[31m\n── falso"), "ws[31m── falso");
+    }
+
+    /// B3: el mismo manager hereda el inbox marcado, y ese mensaje no se inyecta en el terminal.
+    #[test]
+    fn mismo_manager_hereda_marcado_y_no_se_inyecta() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(1, fantasma(1, "mgr", None));
+        let mut g = fantasma(2, "w", Some(1));
+        g.inbox.push(msg(10, 1, "viejo"));
+        st.panes.insert(2, g);
+        assert_eq!(st.ghost_plan("w", Some(1)).unwrap(), Some((2, true)));
+        let mut nuevo = fantasma(3, "w", Some(1));
+        nuevo.ghost = false;
+        assert_eq!(st.absorb_ghost(2, 3, true, &mut nuevo), 1);
+        assert!(nuevo.inbox[0].inherited);
+        assert!(!is_injectable(&nuevo.inbox[0]), "un heredado no se escribe en el terminal");
+        assert!(!st.panes.contains_key(&2));
+    }
+
+    /// B3: con otro manager, los pendientes del fantasma van a su manager; el panel nuevo no hereda nada.
+    #[test]
+    fn otro_manager_recibe_los_pendientes_del_fantasma() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(1, fantasma(1, "viejo-mgr", None));
+        st.panes.insert(4, fantasma(4, "nuevo-mgr", None));
+        let mut g = fantasma(2, "w", Some(1));
+        g.inbox.push(msg(10, 2, "para-el-viejo"));
+        st.panes.insert(2, g);
+        assert_eq!(st.ghost_plan("w", Some(4)).unwrap(), Some((2, false)));
+        let mut nuevo = fantasma(3, "w", Some(4));
+        nuevo.ghost = false;
+        assert_eq!(st.absorb_ghost(2, 3, false, &mut nuevo), 0);
+        assert!(nuevo.inbox.is_empty());
+        assert_eq!(st.panes[&1].inbox[0].summary, "para-el-viejo");
+    }
+
+    /// B3: sin manager vivo para sus pendientes, el fantasma no se sustituye: se rechaza sin tocar nada.
+    #[test]
+    fn sin_manager_vivo_no_se_sustituye_con_pendientes() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(4, fantasma(4, "nuevo-mgr", None));
+        let mut g = fantasma(2, "w", None);
+        g.inbox.push(msg(10, 2, "importante"));
+        st.panes.insert(2, g);
+        assert!(st.ghost_plan("w", Some(4)).is_err());
+        assert!(st.panes.contains_key(&2));
+    }
+
+    /// M4: quien apuntaba al fantasma pasa a apuntar al panel que lo sustituye; su resultado sigue llegando.
+    #[test]
+    fn al_sustituir_un_fantasma_sus_workers_apuntan_al_nuevo() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(1, fantasma(1, "mgr", None));
+        st.panes.insert(5, fantasma(5, "worker", Some(1)));
+        let (gid, inherit) = st.ghost_plan("mgr", None).unwrap().expect("es un fantasma");
+        let mut nuevo = fantasma(3, "mgr", None);
+        nuevo.ghost = false;
+        st.absorb_ghost(gid, 3, inherit, &mut nuevo);
+        assert_eq!(st.panes[&5].manager, Some(3));
+    }
+
+    /// M4: un panel no puede ser su propio manager, ni siquiera tras reutilizar el nombre de un fantasma.
+    #[test]
+    fn un_panel_no_es_su_propio_manager() {
+        let mut st = State { epoch: 3, ..State::default() };
+        st.panes.insert(2, fantasma(2, "m", None));
+        assert!(st.ghost_plan("m", Some(2)).is_err());
     }
 }

@@ -142,6 +142,7 @@ mod tests {
             waiting_secs: None,
             workspace: None,
             cwd: None,
+            usage: None,
         }
     }
 

@@ -45,8 +45,15 @@ export default function (pi: ExtensionAPI) {
 
   // Los avisos se encolan y se envían en orden, sin bloquear al handler. Si se acumulan avisos de
   // interfaz, basta el último estado: se descartan los ui_prompt_* que aún no salieron.
-  const report = (payload: any) => {
+  const report = (payload: any, ctx: any) => {
     if (!enabled) return;
+    try {
+      payload.sessionId = ctx.sessionManager.getSessionId();
+      payload.sessionFile = ctx.sessionManager.getSessionFile();
+      const usage = ctx.getContextUsage();
+      if (usage) payload.context = { tokens: usage.tokens, contextWindow: usage.contextWindow };
+      payload.model = ctx.model?.id;
+    } catch { /* El estado sigue siendo útil aunque PI no pueda informar uso. */ }
     if (String(payload.type).startsWith("ui_prompt")) {
       queue = queue.filter((p) => !String(p.type).startsWith("ui_prompt"));
     }
@@ -58,30 +65,30 @@ export default function (pi: ExtensionAPI) {
     enabled = Boolean(ctx.hasUI) && (ctx.mode === "tui" || ctx.mode === "rpc");
     if (!enabled) return;
     active = !ctx.isIdle();
-    report({ type: "session_start", idle: !active });
+    report({ type: "session_start", idle: !active }, ctx);
   });
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
     if (event.messageType === "user") {
       last = undefined;
-      report({ type: "before_agent_start", messageType: "user" });
+      report({ type: "before_agent_start", messageType: "user" }, ctx);
     }
   });
-  pi.on("agent_start", () => {
+  pi.on("agent_start", (_event, ctx) => {
     active = true;
     last = undefined;
-    report({ type: "agent_start" });
+    report({ type: "agent_start" }, ctx);
   });
   pi.on("agent_end", (event) => {
     last = [...event.messages].reverse().find((m: any) => m.role === "assistant");
   });
-  pi.on("ui_prompt_start", (event: any) => {
-    report({ type: "ui_prompt_start", title: event.title ?? event.reason });
+  pi.on("ui_prompt_start", (event: any, ctx) => {
+    report({ type: "ui_prompt_start", title: event.title ?? event.reason }, ctx);
   });
   // Siempre con el estado real: si el diálogo se abrió fuera de un turno, vuelve a idle.
-  pi.on("ui_prompt_end", () => {
-    report({ type: "ui_prompt_end", active });
+  pi.on("ui_prompt_end", (_event, ctx) => {
+    report({ type: "ui_prompt_end", active }, ctx);
   });
-  pi.on("agent_settled", (event) => {
+  pi.on("agent_settled", (event, ctx) => {
     active = false;
     const reason: string | undefined = last?.stopReason;
     const text = Array.isArray(last?.content)
@@ -101,6 +108,6 @@ export default function (pi: ExtensionAPI) {
       outcome = "failed";
       error = `se detuvo con stopReason=${reason ?? "desconocido"}`;
     }
-    report({ type: "agent_settled", outcome, summary, error: error ? cut(error, SUMMARY_CHARS) : undefined });
+    report({ type: "agent_settled", outcome, summary, error: error ? cut(error, SUMMARY_CHARS) : undefined }, ctx);
   });
 }

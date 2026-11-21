@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+galgo-usage = { version = "0.1.0", path = "../galgo-usage" }
 anyhow = "1.0.104"
 libc = "0.2.191"
 serde ={ version = "1.0.229", features = ["derive"] }

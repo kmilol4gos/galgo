@@ -8,6 +8,8 @@ Investigación: 21-11-2026. Localmente se consultaron `--help`, versiones y arch
 
 **Implementados: `galgo hook claude`, `galgo hook pi` y `galgo hook codex`.** El instalador de Claude modifica settings de Claude; PI instala una extensión separada y Codex fusiona entradas en su `hooks.json`. Los tres leen JSON por stdin, buscan `GALGO_PANE`, conectan al socket sin arrancar el daemon, recortan resúmenes, no imprimen stdout y retornan 0. `galgo hook opencode` sigue **sin implementar**.
 
+Los hooks de Claude y Codex envían además `session_id` y `transcript_path` como fuente de uso. PI envía el archivo y el ID de sesión, y los tokens/ventana que expone `getContextUsage()`. El daemon mantiene esas rutas en memoria y lee el uso localmente; no se envían mensajes del transcript en los informes numéricos.
+
 Fuentes: [PI: extensiones](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md), también leída en la instalación 1.5.2; [OpenCode: plugins](https://opencode.ai/docs/plugins/), [construcción](https://opencode.ai/docs/build/plugins/) y [server](https://opencode.ai/docs/build/plugins/server/); [Codex: hooks](https://developers.openai.com/codex/hooks/) y [referencia de configuración](https://developers.openai.com/codex/config-reference/). La validez de cada integración en una sesión interactiva real queda **no verificada**.
 
 ## PI
@@ -24,7 +26,7 @@ Fuentes: [PI: extensiones](https://github.com/earendil-works/pi/blob/main/packag
 | `agent_settled` | `turn_ended` o `failed` | Es la frontera final; `agent_end` y `turn_end` pueden preceder reintentos, compactación o continuaciones. `agent_settled` expone `aborted`, pero clasificación exacta de fallo y extracción del último mensaje: **no verificadas**. No declarar éxito ante error/abort sin resolverlo. |
 | estado inicial sin ejecución | `idle` | Obtener `ctx.isIdle()` en `session_start`; no convertir automáticamente cada `agent_end` en idle. |
 
-**Implementación:** `galgo hooks install pi --yes` escribe `$HOME/.pi/agent/extensions/galgo.ts`, sin tocar settings ni extensiones ajenas; `--dry-run`, `status` y `uninstall` están disponibles. Un archivo ajeno existente se respalda como `galgo.ts.galgo-bak` y se restaura al desinstalar; un respaldo previo impide reemplazar un archivo ajeno. Se rechazan symlinks. Solo se admite `--scope user`. Para aplicar cambios en PI usar `/reload` o reiniciar.
+**Implementación:** `galgo hooks install pi --yes` escribe `$HOME/.pi/agent/extensions/galgo.ts`, sin tocar settings ni extensiones ajenas; `--dry-run`, `status` y `uninstall` están disponibles. Un archivo ajeno existente se respalda como `galgo.ts.galgo-bak` y se restaura al desinstalar; un respaldo previo impide reemplazar un archivo ajeno. Se rechazan symlinks. Se admiten `--scope user` y `--scope project`. Para aplicar cambios en PI usar `/reload` o reiniciar.
 
 PI 1.5.2 documenta `pi.exec` con timeout pero no una opción para enviar stdin; la extensión usa `node:child_process.spawn` directamente, sin shell, con stdin canalizado, stdout/stderr descartados, timeout de 1 s y envíos ordenados. La ruta del ejecutable se fija al instalar; reinstalar si cambia. Payload JSON de `galgo hook pi`:
 

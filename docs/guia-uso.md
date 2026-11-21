@@ -101,6 +101,20 @@ Claude modifica sus settings conservando las demás entradas; PI instala una ext
 
 La skill de Claude enseña al manager a coordinar workers; no instala ni configura MCP. Para quitar lo instalado, usa `galgo hooks uninstall` con el agente correspondiente o `galgo skill uninstall claude`. Consulta [skill-claude.md](skill-claude.md) antes de reemplazar una skill editada.
 
+### Uso, contexto y cuotas
+
+Los hooks de Claude y Codex informan al daemon de la sesión y la ruta local del transcript; la extensión PI informa su archivo de sesión y el contexto disponible. El daemon lee esas fuentes localmente. Para ver métricas disponibles:
+
+```sh
+galgo usage
+galgo usage --pane worker
+galgo usage --limits
+```
+
+Opcionalmente, `galgo hooks install claude --statusline` encadena el statusline previo de Claude para informar su coste estimado, contexto y cuotas de 5 h/7 días. Guarda el objeto previo en un archivo auxiliar junto a los settings y lo ejecuta con el mismo stdin, conservando su stdout. `galgo hooks uninstall claude` lo restaura si el statusline instalado no fue modificado; si cambió, conserva el respaldo y no pisa los cambios. Con `--scope project` o `local` se usan los settings y respaldo de ese ámbito. Sin statusline, Claude no informa cuotas a galgo.
+
+Los importes de lista y los del agente son estimaciones, no necesariamente tu factura; puede no haber datos o tarifa conocida. Las cuotas pertenecen a la cuenta del agente, no a cada panel. Las rutas de transcript viven en memoria del daemon; los informes no incluyen texto de conversación.
+
 ## 5. Variables y bloqueos
 
 Si un worker aparece **blocked** o «necesita una decisión», revisa el inbox del manager y, si hace falta, la pantalla del worker. Para una pregunta o permiso, consulta al humano y transmite solo la decisión; no aceptes acciones sensibles por defecto. Para una variable faltante, desde el mismo directorio del proyecto el worker puede pedirla así:

@@ -41,6 +41,10 @@ galgo env request API_KEY --reason 'necesaria para la prueba' --dir .
 
 El comando avisa al manager y espera a que exista la variable en el archivo `.env`; si vence el timeout, el worker puede repetir la solicitud. Pide al humano que, en su propio terminal, introduzca el valor sin eco mediante `galgo env set API_KEY --dir .`. Para otro archivo usa la misma opción `--file` en ambos comandos. `galgo env list --dir .` muestra nombres, no valores; verifica los avisos de `.gitignore`. No solicites ni leas el valor en el chat, logs o pantalla. Nunca lo pongas en argv, `galgo send`, resúmenes, comandos con valores literales, código ni commits; no lo muestres. No existe una herramienta MCP `galgo_env`: usa la CLI para estas operaciones.
 
+## Consultar uso
+
+`galgo usage --pane worker-a` muestra métricas disponibles del panel; `galgo usage --limits` muestra cuotas observadas por agente. Los datos pueden ser parciales o estar ausentes: no inventes porcentajes ni afirmes que un coste de lista sea la factura. El statusline opcional de Claude se instala con `galgo hooks install claude --statusline`; conserva y encadena el statusline anterior. Las cuotas se comparten por cuenta, no son una cuota privada de cada worker. No expongas rutas de transcripts ni contenido de conversaciones al resumir estas métricas.
+
 ## Cerrar el turno
 
 Indica al worker que, cuando termine, reporte un resumen sin secretos con `galgo done --summary 'resultado y pruebas'`; usa `--failed` si no pudo completar la tarea. Desde MCP puede usar `galgo_done` con `summary` y opcionalmente `failed`. El panel actual debe tener `GALGO_PANE` o especificarse con `--pane` en la CLI. Si tú también reportas a un manager, aplica la misma regla. Revisa resultados y comunica claramente fallos y trabajo pendiente.

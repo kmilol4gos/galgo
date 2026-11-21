@@ -8,7 +8,7 @@ const SKILL: &str = include_str!("skill-claude.md");
 // Instantáneas exactas de las versiones publicadas. No modificar: agregar una copia nueva
 // antes de cambiar el texto de la skill para reconocer instalaciones antiguas sin confiar
 // solo en un marcador que también podría tener una edición del usuario.
-const RELEASED_SKILLS: &[&str] = &[include_str!("skill-claude-v1.md")];
+const RELEASED_SKILLS: &[&str] = &[include_str!("skill-claude-v1.md"), include_str!("skill-claude-v2.md")];
 const BACKUP_FLAG: &str = "\n<!-- galgo-created-backup: 1 -->\n";
 const MARKER: &str = "<!-- galgo-managed-skill: v1 -->";
 

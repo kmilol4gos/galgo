@@ -12,5 +12,6 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 clap = { version = "4.6.9", features = ["derive", "env"] }
 galgo-proto = { version = "0.1.0", path = "../galgo-proto" }
+galgo-usage = { version = "0.1.0", path = "../galgo-usage" }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 libc = "0.2.191"

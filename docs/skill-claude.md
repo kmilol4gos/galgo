@@ -1,6 +1,6 @@
 # Skill de galgo para Claude Code
 
-La skill embebida en `crates/galgo-cli/src/skill-claude.md` orienta al manager para delegar workers, esperar sin sondear, procesar entregas, atender bloqueos y gestionar variables sin exponer valores. No instala ni configura el servidor MCP o los hooks: las herramientas MCP solo están disponibles si el servidor ya está configurado y el cliente las ofrece. Para confirmar los comandos disponibles, consultar `galgo --help`.
+La skill embebida en `crates/galgo-cli/src/skill-claude.md` orienta al manager para delegar workers, esperar sin sondear, procesar entregas, atender bloqueos, gestionar variables sin exponer valores y consultar uso y cuotas sin confundir estimaciones con facturas. No instala ni configura el servidor MCP o los hooks: las herramientas MCP solo están disponibles si el servidor ya está configurado y el cliente las ofrece. Para confirmar los comandos disponibles, consultar `galgo --help`.
 
 ```sh
 galgo skill install claude --yes

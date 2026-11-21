@@ -16,8 +16,16 @@ check() { # descripción, código de salida
   elif [ "$2" = "77" ]; then echo "  omitido $1 (falta el programa)"; skipped=$((skipped + 1));
   else echo "  FALLA $1"; fail=$((fail + 1)); fi
 }
-cleanup() { galgo stop >/dev/null 2>&1; rm -rf "$TMP"; }
+# B6: cada daemon que el script arranca (uno por socket de $TMP) se detiene antes de borrar $TMP. Un
+# `galgo ls` posterior vuelve a arrancar uno, así que se para cada socket que exista, no solo el de la sección actual.
+cleanup() {
+  for sock in $(find "$TMP" -name '*.sock' 2>/dev/null) "$GALGO_SOCKET"; do
+    GALGO_SOCKET="$sock" galgo stop >/dev/null 2>&1
+  done
+  rm -rf "$TMP"
+}
 trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 
 echo "1. wait recibe el resultado del worker apenas termina"
 galgo spawn mgr -- bash --norc >/dev/null
@@ -1049,5 +1057,250 @@ kill -0 "$LS124" 2>/dev/null; [ $? -ne 0 ]; check "galgo ls responde con un FIFO
 kill "$LS124" 2>/dev/null; wait "$LS124" 2>/dev/null
 GALGO_SOCKET="$TMP/c124/g.sock" galgo stop >/dev/null 2>&1
 
+echo "125. uso vivo: un informe del agente (statusline) llega a ls y a galgo usage; sin rutas en la salida"
+mkdir -p "$TMP/c125" && chmod 700 "$TMP/c125"
+export GALGO_SOCKET="$TMP/c125/g.sock"
+rpc() { python3 -c 'import json,socket,sys,os
+s=socket.socket(socket.AF_UNIX); s.connect(os.environ["GALGO_SOCKET"]); s.sendall((sys.argv[1]+"\n").encode()); buf=b""
+while not buf.endswith(b"\n"):
+    d=s.recv(65536)
+    if not d: break
+    buf+=d
+print(buf.decode().strip())' "$1"; }
+galgo spawn u125 -- bash --norc >/dev/null
+RESET=$(( $(date +%s) + 8040 ))
+rpc "{\"op\":\"usage_report\",\"pane\":\"u125\",\"agent\":\"claude\",\"model\":\"opus-5.5\",\"context_tokens\":598000,\"context_window\":1000000,\"cost_usd\":7.07,\"limits\":[{\"name\":\"five_hour\",\"used_pct\":15.0,\"resets_at\":$RESET},{\"name\":\"seven_day\",\"used_pct\":14.0,\"resets_at\":null}]}" | grep -q '"ok":true'; check "el informe del agente se acepta" $?
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="u125"][0]["usage"]
+assert abs(p["context_pct"]-59.8)<0.01 and p["cost_source"]=="statusline" and p["cost_usd"]==7.07 and p["model"]=="opus-5.5"'
+check "ls trae contexto, coste y origen del informe" $?
+OUT=$(galgo usage)
+echo "$OUT" | grep -qF "60% 598k" && echo "$OUT" | grep -qF "7.07 \$ (statusline)"; check "galgo usage muestra contexto y coste con origen" $?
+LIM=$(galgo usage --limits)
+echo "$LIM" | grep -qF "5h 15%" && echo "$LIM" | grep -qF "7d 14%" && echo "$LIM" | grep -qF "reinicia en"; check "galgo usage --limits muestra cuotas con reinicio" $?
+galgo usage --by agent | grep -q claude; check "galgo usage --by agent agrupa por agente" $?
+galgo usage --by model | grep -qF "opus-5.5"; check "galgo usage --by model agrupa por modelo" $?
+ALL=$(galgo usage; galgo --json usage; galgo usage --limits; galgo usage --by agent)
+! echo "$ALL" | grep -qF "$TMP" && ! echo "$ALL" | grep -qF "cwd" && ! echo "$ALL" | grep -qF "/Users"; check "las salidas de galgo usage no contienen rutas" $?
+
+echo "126. uso desde el transcript: un Hook con fuente se sigue y el sondeo recoge líneas nuevas; state.json no guarda uso"
+mkdir -p "$TMP/c126" && chmod 700 "$TMP/c126"
+export GALGO_SOCKET="$TMP/c126/g.sock"
+TR="$TMP/c126/claude.jsonl"
+printf '%s\n' '{"type":"assistant","isSidechain":false,"requestId":"r1","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}}' > "$TR"
+galgo spawn t126 -- bash --norc >/dev/null
+rpc "{\"op\":\"hook\",\"pane\":\"t126\",\"event\":\"working\",\"summary\":null,\"source\":{\"agent\":\"claude\",\"session_id\":\"s1\",\"transcript\":\"$TR\"}}" | grep -q '"ok":true'; check "el hook con fuente se acepta" $?
+sleep 2.5
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="t126"][0]["usage"]
+assert p["input"]==1000 and p["output"]==200 and p["cache_read"]==500'
+check "el transcript alimenta el uso del panel" $?
+printf '%s\n' '{"type":"assistant","isSidechain":false,"requestId":"r2","message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":300,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' >> "$TR"
+sleep 2.5
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="t126"][0]["usage"]
+assert p["input"]==1300'
+check "el sondeo recoge líneas nuevas sin un hook nuevo" $?
+rpc '{"op":"usage_report","pane":"t126","agent":"claude","cost_usd":9.99}' | grep -q '"ok":true'
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="t126"][0]["usage"]
+assert p["cost_usd"]==9.99 and p["cost_source"]=="statusline"'
+check "un informe del agente pisa el coste del transcript" $?
+! grep -q "claude.jsonl" "$TMP/c126/g.state.json" && ! grep -q '"usage"' "$TMP/c126/g.state.json" && ! grep -q '"input"' "$TMP/c126/g.state.json"; check "state.json no guarda uso ni la ruta del transcript" $?
+
+echo "127. galgo usage: errores claros; el uso vive solo en memoria y no vuelve tras reiniciar"
+galgo usage --pane nope >/dev/null 2>&1; [ $? -ne 0 ]; check "--pane con un panel que no existe falla" $?
+galgo usage --by agent --pane t126 >/dev/null 2>&1; [ $? -ne 0 ]; check "--by y --pane no se combinan" $?
+galgo usage --by quien >/dev/null 2>&1; [ $? -ne 0 ]; check "--by solo acepta workspace, agent o model" $?
+galgo stop >/dev/null 2>&1; sleep 0.5
+galgo ls >/dev/null
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="t126"][0]
+assert p["usage"] is None'
+check "tras reiniciar el daemon, el uso no vuelve del disco" $?
+galgo stop >/dev/null 2>&1
+export GALGO_SOCKET="$TMP/galgo.sock"
+
+# PID del daemon que escucha en un socket (lsof lista también a los clientes; se filtra por nombre).
+daemon_pid() {
+  for p in $(lsof -t "$1" 2>/dev/null); do
+    if ps -o comm= -p "$p" 2>/dev/null | grep -q galgod; then echo "$p"; return; fi
+  done
+}
+
+echo "130. M1: una confirmación (ack o wait) queda en disco; un SIGKILL después no la hace reaparecer"
+mkdir -p "$TMP/c130" && chmod 700 "$TMP/c130"
+export GALGO_SOCKET="$TMP/c130/g.sock"
+galgo spawn m130 -- bash --norc >/dev/null
+galgo spawn w130 --manager m130 -- bash --norc >/dev/null
+galgo spawn w130b --manager m130 -- bash --norc >/dev/null
+galgo done --pane w130 --summary "ackeado130" >/dev/null
+galgo done --pane w130b --summary "waitres130" >/dev/null
+( galgo wait w130b --pane m130 --timeout 10 > "$TMP/c130/wait" 2>&1 ) &
+sleep 0.5
+galgo ack "$(galgo --json inbox --pane m130 | python3 -c 'import json,sys; print([m["id"] for m in json.load(sys.stdin) if "ackeado130" in m["summary"]][0])')" --pane m130 >/dev/null
+wait
+grep -q "waitres130" "$TMP/c130/wait"; check "wait entrega el resultado" $?
+sleep 0.5
+kill -9 "$(daemon_pid "$GALGO_SOCKET")" 2>/dev/null; sleep 0.5
+galgo ls >/dev/null
+! galgo inbox --pane m130 | grep -q "ackeado130\|waitres130"; check "lo confirmado no reaparece tras SIGKILL" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+
+echo "131. M2: un done respondido con éxito sobrevive a un SIGTERM inmediato"
+mkdir -p "$TMP/c131" && chmod 700 "$TMP/c131"
+export GALGO_SOCKET="$TMP/c131/g.sock"
+galgo spawn m131 -- bash --norc >/dev/null
+galgo spawn w131 --manager m131 -- bash --norc >/dev/null
+galgo done --pane w131 --summary "resultadoB131" >/dev/null
+kill -TERM "$(daemon_pid "$GALGO_SOCKET")" 2>/dev/null; sleep 0.8
+galgo ls >/dev/null
+galgo inbox --pane m131 | grep -q "resultadoB131"; check "el resultado sigue tras SIGTERM justo después del done" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+
+echo "132. M3: un git que no responde no detiene al daemon: ls responde mientras el spawn espera"
+mkdir -p "$TMP/c132/bin" && chmod 700 "$TMP/c132" && printf '#!/bin/sh\nexec sleep 30\n' > "$TMP/c132/bin/git" && chmod +x "$TMP/c132/bin/git"
+export GALGO_SOCKET="$TMP/c132/g.sock"
+PATH="$TMP/c132/bin:$PATH" galgo spawn s132 -- bash --norc > "$TMP/c132/spawn" 2>&1 &
+SPAWN132=$!
+sleep 0.5
+MS=$(python3 -c 'import subprocess,time; t=time.time(); subprocess.run(["galgo","ls"],capture_output=True); print(int((time.time()-t)*1000))')
+[ "$MS" -lt 1000 ]; check "ls responde en menos de 1 s con un git colgado ($MS ms)" $?
+wait $SPAWN132; check "el spawn termina sin workspace tras el tiempo límite" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+
+echo "133. B2: un workspace con caracteres de control se rechaza"
+mkdir -p "$TMP/c133" && chmod 700 "$TMP/c133"
+export GALGO_SOCKET="$TMP/c133/g.sock"
+galgo spawn x133 --workspace $'ws\e[31mROJO' -- bash --norc >/dev/null 2>"$TMP/c133/err"; [ $? -ne 0 ]; check "un workspace con ESC no se crea" $?
+grep -q "caracteres de control" "$TMP/c133/err"; check "el error dice por qué" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+
+echo "134. B3: un fantasma reutilizado con el mismo manager hereda sin inyectar; con otro manager, sus pendientes van al suyo"
+mkdir -p "$TMP/c134" && chmod 700 "$TMP/c134"
+export GALGO_SOCKET="$TMP/c134/g.sock"
+galgo spawn m134 -- bash --norc >/dev/null
+galgo spawn w134 --manager m134 -- bash --norc >/dev/null
+galgo spawn c134 --manager w134 -- bash --norc >/dev/null
+galgo done --pane c134 --summary "resultado134" >/dev/null
+galgo spawn w134b --manager m134 -- bash --norc >/dev/null
+galgo spawn c134b --manager w134b -- bash --norc >/dev/null
+galgo done --pane c134b --summary "resultado134b" >/dev/null
+sleep 0.8
+galgo stop >/dev/null 2>&1; sleep 0.5
+galgo ls >/dev/null
+galgo spawn w134 --manager m134 --inject -- bash --norc >"$TMP/c134/same" 2>&1
+grep -q "mensaje(s) de la ejecución anterior de w134" "$TMP/c134/same"; check "el panel reutilizado avisa de lo heredado" $?
+galgo inbox --pane w134 | grep -q "resultado134"; check "hereda el mensaje del mismo manager" $?
+sleep 3
+! galgo read w134 | grep -q "resultado134"; check "lo heredado no se escribe en el terminal" $?
+galgo spawn m134x -- bash --norc >/dev/null
+galgo spawn w134b --manager m134x -- bash --norc >/dev/null 2>&1
+galgo inbox --pane m134 | grep -q "resultado134b"; check "con otro manager, el pendiente va a su manager anterior" $?
+! galgo inbox --pane w134b | grep -q "resultado134b"; check "el panel nuevo no hereda lo de otro rol" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+
+echo "135. M4: un worker apuntado a un fantasma sigue entregando cuando el manager se recrea"
+mkdir -p "$TMP/c135" && chmod 700 "$TMP/c135"
+export GALGO_SOCKET="$TMP/c135/g.sock"
+galgo spawn m135 -- bash --norc >/dev/null
+galgo spawn w135 --manager m135 -- bash --norc >/dev/null
+galgo stop >/dev/null 2>&1; sleep 0.5
+galgo ls >/dev/null
+galgo spawn w135b --manager m135 -- bash --norc >/dev/null 2>&1
+galgo spawn m135 -- bash --norc >/dev/null 2>&1; check "el manager se recrea con su nombre" $?
+galgo done --pane w135 --summary "resultado135" >/dev/null 2>"$TMP/c135/done"; [ $? -eq 0 ]; check "el done del worker se acepta" $?
+galgo inbox --pane m135 | grep -q "resultado135"; check "el resultado llega al manager recreado" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+
+echo "136. M5: el estado de la versión anterior (state.json junto al socket) se migra sin perder pendientes"
+mkdir -p "$TMP/c136" && chmod 700 "$TMP/c136"
+export GALGO_SOCKET="$TMP/c136/g.sock"
+galgo spawn m136 -- bash --norc >/dev/null
+galgo spawn w136 --manager m136 -- bash --norc >/dev/null
+galgo done --pane w136 --summary "pendiente136" >/dev/null
+galgo stop >/dev/null 2>&1; sleep 0.5
+mv "$TMP/c136/g.state.json" "$TMP/c136/state.json"
+galgo ls >/dev/null
+galgo inbox --pane m136 | grep -q "pendiente136"; check "el pendiente de la versión anterior se conserva" $?
+ls "$TMP/c136" | grep -q "^state.json.migrated-"; check "el archivo anterior queda renombrado, no se vuelve a cargar" $?
+[ ! -e "$TMP/c136/state.json" ]; check "state.json ya no está en su sitio" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+export GALGO_SOCKET="$TMP/galgo.sock"
+
+echo "140. statusline Claude: encadenamiento, privacidad y restauración"
+HOME130="$TMP/home130"; mkdir -p "$HOME130/.claude"
+printf '%s\n' '{"statusLine":{"type":"command","command":"cat","padding":3},"model":"conservar"}' > "$HOME130/.claude/settings.json"
+env -u CLAUDE_CONFIG_DIR HOME="$HOME130" galgo hooks install claude --statusline --yes >/dev/null
+cp "$HOME130/.claude/settings.json" "$TMP/statusline130-installed"
+env -u CLAUDE_CONFIG_DIR HOME="$HOME130" galgo hooks install claude --statusline --yes >/dev/null
+cmp -s "$HOME130/.claude/settings.json" "$TMP/statusline130-installed"; check "statusline instalador idempotente" $?
+printf '%s\n' '{"model":{"id":"claude-opus-5-5"},"cost":{"total_cost_usd":2.75},"context_window":{"context_window_size":1000,"current_usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":3}},"rate_limits":{"five_hour":{"used_percentage":20,"resets_at":2000000000}},"private":"SECRETO"}' > "$TMP/statusline130-input"
+env -u GALGO_PANE HOME="$HOME130" galgo statusline claude --backup "$HOME130/.claude/settings.json.galgo-statusline" < "$TMP/statusline130-input" > "$TMP/statusline130-output"
+cmp -s "$TMP/statusline130-input" "$TMP/statusline130-output"; check "statusline previo recibe stdin y devuelve stdout exacto sin panel" $?
+GALGO_SOCKET="$TMP/no-statusline.sock" GALGO_PANE=status130 HOME="$HOME130" galgo statusline claude --backup "$HOME130/.claude/settings.json.galgo-statusline" < "$TMP/statusline130-input" > "$TMP/statusline130-output"
+cmp -s "$TMP/statusline130-input" "$TMP/statusline130-output" && [ ! -S "$TMP/no-statusline.sock" ]; check "statusline previo funciona sin arrancar daemon ausente" $?
+galgo spawn status130 -- bash --norc >/dev/null
+GALGO_PANE=status130 HOME="$HOME130" galgo statusline claude --backup "$HOME130/.claude/settings.json.galgo-statusline" < "$TMP/statusline130-input" > "$TMP/statusline130-output"
+sleep 1
+galgo --json usage --pane status130 > "$TMP/usage130.json"
+python3 -I - "$TMP/usage130.json" <<'PY130'
+import json,sys
+u=json.load(open(sys.argv[1]))['panes'][0]['usage']
+assert u['context_tokens']==33 and u['context_window']==1000 and u['cost_usd']==2.75
+assert 'SECRETO' not in json.dumps(u)
+PY130
+check "statusline informa solo métricas al daemon" $?
+galgo --json usage --limits > "$TMP/limits130.json"
+python3 -I - "$TMP/limits130.json" <<'PY130B'
+import json,sys
+l=json.load(open(sys.argv[1]))['limits']; assert any(x['agent']=='claude' and any(w['minutes']==300 and w['used_pct']==20 for w in x['windows']) for x in l)
+PY130B
+check "statusline informa cuota cinco horas" $?
+env -u CLAUDE_CONFIG_DIR HOME="$HOME130" galgo hooks uninstall claude --yes >/dev/null
+python3 -I - "$HOME130/.claude/settings.json" <<'PY130C'
+import json,sys
+v=json.load(open(sys.argv[1])); assert v['statusLine']=={'type':'command','command':'cat','padding':3} and v['model']=='conservar'
+PY130C
+check "uninstall restaura statusline previo y configuración ajena" $?
+[ ! -e "$HOME130/.claude/settings.json.galgo-statusline" ]; check "uninstall retira respaldo auxiliar restaurado" $?
+
+echo "141. hooks de Claude, Codex y PI asocian fuentes de uso"
+for agent in claude codex pi; do galgo spawn "source131-$agent" -- bash --norc >/dev/null; done
+printf '%s\n' '{"type":"assistant","isSidechain":false,"message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":123,"output_tokens":5}}}' > "$TMP/source131-claude.jsonl"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"s1","transcript_path":"%s"}\n' "$TMP/source131-claude.jsonl" | GALGO_PANE=source131-claude galgo hook claude
+printf '%s\n' '{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}' '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":456,"output_tokens":7},"last_token_usage":{"input_tokens":456,"output_tokens":7},"model_context_window":10000}}}' > "$TMP/source131-codex.jsonl"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"s2","transcript_path":"%s"}\n' "$TMP/source131-codex.jsonl" | GALGO_PANE=source131-codex galgo hook codex
+printf '%s\n' '{"type":"message","message":{"role":"assistant","usage":{"input":12,"output":3,"cost":{"total":0.1}}}}' > "$TMP/source131-pi.jsonl"
+printf '{"type":"agent_start","sessionId":"s3","sessionFile":"%s","context":{"tokens":42,"contextWindow":1000}}\n' "$TMP/source131-pi.jsonl" | GALGO_PANE=source131-pi galgo hook pi
+sleep 3
+for agent in claude codex pi; do galgo --json usage --pane "source131-$agent" > "$TMP/usage131-$agent.json"; done
+python3 -I - "$TMP" <<'PY131'
+import json,os,sys
+p=sys.argv[1]
+def u(agent): return json.load(open(os.path.join(p,'usage131-'+agent+'.json')))['panes'][0]['usage']
+assert u('claude')['input']==123
+assert u('codex')['input']==456
+assert u('pi')['input']==12 and u('pi')['context_tokens']==42 and u('pi')['context_window']==1000
+assert p not in json.dumps([u('claude'),u('codex'),u('pi')])
+PY131
+check "fuentes llegan al tracker y contexto PI al daemon sin rutas en salida" $?
+
+echo "142. statusline modificado por usuario no se sobrescribe"
+HOME132="$TMP/home132"; mkdir -p "$HOME132/.claude"
+printf '%s\n' '{"statusLine":{"type":"command","command":"cat"}}' > "$HOME132/.claude/settings.json"
+env -u CLAUDE_CONFIG_DIR HOME="$HOME132" galgo hooks install claude --statusline --yes >/dev/null
+python3 -I - "$HOME132/.claude/settings.json" <<'PY132'
+import json,sys
+p=sys.argv[1]; v=json.load(open(p)); v['statusLine']['command']='printf usuario'; open(p,'w').write(json.dumps(v))
+PY132
+env -u CLAUDE_CONFIG_DIR HOME="$HOME132" galgo hooks uninstall claude --yes >/dev/null
+python3 -I - "$HOME132/.claude/settings.json" "$HOME132/.claude/settings.json.galgo-statusline" <<'PY132B'
+import json,sys
+assert json.load(open(sys.argv[1]))['statusLine']['command']=='printf usuario'
+assert json.load(open(sys.argv[2]))['previous']['command']=='cat'
+PY132B
+check "uninstall conserva edición y respaldo previo" $?
+env -u GALGO_PANE galgo statusline claude < "$TMP/statusline130-input" | grep -qx galgo; check "sin comando previo ofrece línea propia" $?
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

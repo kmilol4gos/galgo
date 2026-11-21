@@ -6,7 +6,7 @@ mod prices;
 mod tests;
 pub use prices::PRICES_TOML;
 use parser::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, fs::File, hash::{Hash, Hasher}, collections::hash_map::DefaultHasher, io::{self, BufRead, BufReader, Read, Seek, SeekFrom}, os::unix::fs::MetadataExt, path::{Path, PathBuf}, process::{Command, Stdio}, time::{Instant, SystemTime, UNIX_EPOCH}};
 
 const INITIAL_TAIL: u64 = 100 * 1024 * 1024;
@@ -15,10 +15,10 @@ const MAX_LINE: usize = 8 * 1024 * 1024;
 #[serde(rename_all="lowercase")]
 pub enum Agent { Claude, Codex, Pi, Opencode }
 impl Agent { fn name(self) -> &'static str { match self { Self::Claude => "claude", Self::Codex => "codex", Self::Pi => "pi", Self::Opencode => "opencode" } } }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all="snake_case")]
 pub enum CostSource { Agent, Statusline, ListPrice, Unknown }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaneUsage {
     pub agent: String, pub model: Option<String>, pub input: u64, pub cache_read: u64,
     pub cache_write: u64, pub cache_write_5m: u64, pub cache_write_1h: u64,
@@ -28,9 +28,9 @@ pub struct PaneUsage {
     /// Los totales no incluyen todo el archivo (cola inicial o línea demasiado grande/inválida).
     pub partial: bool,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimitWindow { pub minutes: u64, pub used_pct: f32, pub resets_at: Option<u64> }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits { pub agent: String, pub plan: Option<String>, pub windows: Vec<LimitWindow>, pub observed_at: u64 }
 #[derive(Clone)]
 struct Accum {

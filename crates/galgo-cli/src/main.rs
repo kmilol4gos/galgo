@@ -5,6 +5,8 @@ mod codex;
 mod env;
 mod pi;
 mod skill;
+mod statusline;
+mod usage_cmd;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -96,6 +98,12 @@ enum Cmd {
     Stop,
     /// Lo invoca el agente en cada evento (lee el JSON del evento por stdin). No imprime nada.
     Hook { agent: claude::Agent },
+    /// Statusline de Claude con métricas y comando previo encadenado.
+    Statusline {
+        agent: claude::Agent,
+        #[arg(long)]
+        backup: Option<std::path::PathBuf>,
+    },
     /// Variables de entorno (.env) sin abrir un IDE; los valores no pasan por el daemon.
     Env {
         #[command(subcommand)]
@@ -111,6 +119,8 @@ enum Cmd {
         #[command(subcommand)]
         action: claude::HooksCmd,
     },
+    /// Uso vivo de los paneles (tokens, contexto, coste) y cuotas por agente.
+    Usage(usage_cmd::UsageArgs),
 }
 
 fn main() {
@@ -124,9 +134,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
         Cmd::Hook { agent } => std::process::exit(claude::run_hook(*agent)),
+        Cmd::Statusline { agent: claude::Agent::Claude, backup } => std::process::exit(statusline::run(backup.as_deref())),
+        Cmd::Statusline { .. } => bail!("statusline solo está disponible para Claude"),
         Cmd::Hooks { action } => return claude::hooks_command(action),
         Cmd::Skill { action } => return skill::run(action),
         Cmd::Env { action } => return env::run(action),
+        Cmd::Usage(args) => return usage_cmd::run(args, cli.json),
         _ => {}
     }
     let req = match &cli.cmd {
@@ -163,7 +176,7 @@ fn run() -> Result<()> {
         Cmd::Ack { msg, pane } => Request::Ack { pane: pane.clone(), msg: *msg },
         Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
         Cmd::Stop => Request::Shutdown,
-        Cmd::Hook { .. } | Cmd::Hooks { .. } | Cmd::Env { .. } | Cmd::Skill { .. } => unreachable!("se atienden antes"),
+        Cmd::Hook { .. } | Cmd::Statusline { .. } | Cmd::Hooks { .. } | Cmd::Env { .. } | Cmd::Skill { .. } | Cmd::Usage(_) => unreachable!("se atienden antes"),
     };
 
     // `stop` no necesita arrancar un daemon que no existe.
@@ -214,10 +227,16 @@ fn filter_workspace(data: Value, workspace: &str) -> Value {
 }
 
 /// Encabezado de un grupo: nombre del workspace y resumen de atención de sus paneles.
+/// Texto seguro para la terminal: los caracteres de control se muestran como «?» (B2). Un nombre o un
+/// workspace no puede cambiar colores ni fabricar líneas en la salida.
+fn visible(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
 fn workspace_header(workspace: Option<&str>, group: &[&PaneInfo]) -> String {
     let blocked = group.iter().filter(|p| p.status == Status::Blocked).count();
     let pending = group.iter().filter(|p| p.unacked > 0 || p.orphan).count();
-    let name = workspace.unwrap_or("sin workspace");
+    let name = visible(workspace.unwrap_or("sin workspace"));
     let mut notes = Vec::new();
     if blocked > 0 {
         notes.push(format!("{blocked} bloqueado(s)"));
@@ -235,10 +254,10 @@ fn workspace_header(workspace: Option<&str>, group: &[&PaneInfo]) -> String {
 fn print_pane(p: &PaneInfo) {
     let mut notes = Vec::new();
     if let Some(m) = &p.manager {
-        notes.push(format!("reporta a {m}"));
+        notes.push(format!("reporta a {}", visible(m)));
     }
     if let (Some(t), Some(s)) = (&p.waiting_on, p.waiting_secs) {
-        notes.push(format!("espera a {t} hace {s}s"));
+        notes.push(format!("espera a {} hace {s}s", visible(t)));
     }
     if p.orphan {
         notes.push(format!(
@@ -249,16 +268,24 @@ fn print_pane(p: &PaneInfo) {
     } else if p.unacked > 0 {
         notes.push(format!("{} mensaje(s) pendiente(s)", p.unacked));
     }
-    println!("{:>3}  {:<20} {:<8} {}", p.id, p.name, p.status, notes.join(" · "));
+    println!("{:>3}  {:<20} {:<8} {}", p.id, visible(&p.name), p.status, notes.join(" · "));
 }
 
 fn print_human(cmd: &Cmd, data: Value) -> Result<()> {
     match cmd {
         Cmd::Spawn { .. } => {
+            let heredados = data["inherited"].as_u64().unwrap_or(0);
             let p: PaneInfo = serde_json::from_value(data)?;
             match &p.workspace {
-                Some(w) => println!("panel {} ({}) creado en {w}", p.id, p.name),
-                None => println!("panel {} ({}) creado", p.id, p.name),
+                Some(w) => println!("panel {} ({}) creado en {}", p.id, visible(&p.name), visible(w)),
+                None => println!("panel {} ({}) creado", p.id, visible(&p.name)),
+            }
+            if heredados > 0 {
+                println!(
+                    "  {heredados} mensaje(s) de la ejecución anterior de {} llegaron a su inbox; no se escriben en el terminal (galgo inbox --pane {})",
+                    visible(&p.name),
+                    visible(&p.name)
+                );
             }
         }
         Cmd::Ls { .. } => {
@@ -329,5 +356,13 @@ mod tests_workspace {
         let c = pane(3, Status::Idle, Some("w"), 0);
         assert_eq!(workspace_header(Some("w"), &[&a, &b, &c]), "── w (3) · 1 bloqueado(s) · 1 con entregas pendientes");
         assert_eq!(workspace_header(None, &[&c]), "── sin workspace (1)");
+    }
+
+    /// B2: un nombre o workspace con secuencias de terminal no llega a la salida como control.
+    #[test]
+    fn la_salida_no_tiene_caracteres_de_control() {
+        let v = visible("ws\u{1b}[31mROJO\n── falso (9)");
+        assert!(!v.chars().any(char::is_control), "{v:?}");
+        assert_eq!(v, "ws?[31mROJO?── falso (9)");
     }
 }

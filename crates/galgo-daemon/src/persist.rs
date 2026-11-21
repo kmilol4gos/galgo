@@ -76,6 +76,40 @@ pub fn state_path(socket: &Path) -> PathBuf {
 /// Carga el estado. Nunca falla ni se cuelga: si el archivo no es un archivo regular de tamaño razonable,
 /// o no se puede leer, o está corrupto o es de otra versión, se ignora con aviso. Los que no sirven se
 /// ponen a un lado (`.corrupt-<tiempo>`) en lugar de sobrescribirlos.
+/// Estado de la versión anterior (4a1e6ee): `state.json` en el mismo directorio que el socket. Sin
+/// `GALGO_STATE`, el archivo nuevo es `galgo.state.json`; el anterior no se buscaba por el nombre del socket.
+pub fn legacy_path(socket: &Path) -> Option<PathBuf> {
+    if std::env::var_os("GALGO_STATE").is_some() {
+        return None;
+    }
+    Some(socket.parent()?.join("state.json"))
+}
+
+/// Carga el estado actual o, si no existe, el de la versión anterior. Si se carga de ahí, devuelve esa
+/// ruta: hay que retirarla con `finish_migration` cuando el estado nuevo ya está escrito.
+pub fn load_with_migration(state_path: &Path, legacy: Option<&Path>) -> (Option<Saved>, Option<PathBuf>) {
+    if state_path.symlink_metadata().is_ok() {
+        return (load(state_path), None);
+    }
+    match legacy {
+        Some(old) if old.symlink_metadata().map(|m| m.file_type().is_file()).unwrap_or(false) => {
+            (load(old), Some(old.to_path_buf()))
+        }
+        _ => (None, None),
+    }
+}
+
+/// Renombra el estado anterior a `state.json.migrated-<segundos>` para que no se vuelva a cargar. Solo
+/// si el estado nuevo ya existe. Devuelve la nueva ruta del archivo renombrado.
+pub fn finish_migration(old: &Path, state_path: &Path) -> Result<Option<PathBuf>> {
+    if !state_path.is_file() || old.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    let to = old.with_file_name(format!("state.json.migrated-{}", unix_now()));
+    std::fs::rename(old, &to).with_context(|| format!("no pude renombrar {}", old.display()))?;
+    Ok(Some(to))
+}
+
 pub fn load(path: &Path) -> Option<Saved> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -241,6 +275,7 @@ pub fn restore(st: &mut State, saved: Saved) {
                 claimed: false,
                 hold_until: None,
                 last_inject: None,
+                inherited: false,
             });
         }
         let pane = Pane::ghost(sp.id, sp.name, sp.cmd, sp.manager, inbox, sp.workspace, sp.cwd);
@@ -465,5 +500,33 @@ mod tests {
         let ids: Vec<u64> = st.panes[&2].inbox.iter().map(|m| m.id).collect();
         assert!(ids.iter().all(|&i| i < ID_LIMIT), "{ids:?}");
         assert_eq!(st.panes[&2].inbox[0].summary, "hecho");
+    }
+
+    /// M5: un estado de la versión anterior se carga, sus pendientes llegan al inbox y el archivo se retira
+    /// solo después de escribir el nuevo.
+    #[test]
+    fn migra_el_estado_de_la_version_anterior_sin_perder_pendientes() {
+        let dir = tmp("migracion");
+        let legacy = dir.with_file_name("state.json");
+        let mut saved = saved_with_inbox();
+        saved.panes[1].inbox[0].summary = "pendiente-antiguo".into();
+        write(&legacy, &saved).unwrap();
+        let socket = dir.with_file_name("galgo.sock");
+        let state_path = socket.with_extension("state.json");
+        assert!(!state_path.exists());
+        let (loaded, from) = load_with_migration(&state_path, legacy_path(&socket).as_deref());
+        assert_eq!(from.as_deref(), Some(legacy.as_path()));
+        let mut st = State { epoch: 9, ..State::default() };
+        restore(&mut st, loaded.expect("el estado anterior se carga"));
+        assert!(st.panes.values().any(|p| p.inbox.iter().any(|m| m.summary == "pendiente-antiguo")));
+        // Sin el estado nuevo escrito, no se retira nada.
+        assert!(finish_migration(&legacy, &state_path).unwrap().is_none());
+        assert!(legacy.exists());
+        write(&state_path, &snapshot(&st)).unwrap();
+        let moved = finish_migration(&legacy, &state_path).unwrap().expect("se retira");
+        assert!(!legacy.exists() && moved.exists());
+        // Ya con el estado nuevo, la carga usa ese y no el anterior.
+        let (again, from) = load_with_migration(&state_path, legacy_path(&socket).as_deref());
+        assert!(again.is_some() && from.is_none());
     }
 }

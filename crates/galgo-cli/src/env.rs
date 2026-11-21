@@ -140,13 +140,13 @@ pub fn run(cmd: &EnvCmd) -> Result<()> {
                 "necesita la variable {key}{why}. Ponla con: galgo env set {key} --dir {}",
                 dir.canonicalize().unwrap_or_else(|_| dir.clone()).display()
             );
-            let resp = request(&Request::Hook { pane: pane.clone(), event: HookEvent::Blocked, summary: Some(summary) })?;
+            let resp = request(&Request::Hook { pane: pane.clone(), event: HookEvent::Blocked, summary: Some(summary), source: None })?;
             if !resp.ok {
                 bail!("{}", resp.error.unwrap_or_else(|| "el daemon rechazó el aviso".into()));
             }
             let end = Instant::now() + Duration::from_secs(*timeout);
             let resume = || {
-                let _ = request(&Request::Hook { pane: pane.clone(), event: HookEvent::Working, summary: None });
+                let _ = request(&Request::Hook { pane: pane.clone(), event: HookEvent::Working, summary: None, source: None });
             };
             while Instant::now() < end {
                 if has(&path) {

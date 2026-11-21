@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Subcommand, ValueEnum};
-use galgo_proto::{socket_path, HookEvent, Request};
+use galgo_proto::{socket_path, HookEvent, HookSource, Request};
 use serde_json::{json, Map, Value};
 use std::{
     io::{BufRead, BufReader, IsTerminal, Read, Write},
@@ -62,6 +62,9 @@ pub enum HooksCmd {
         /// Solo muestra qué cambiaría.
         #[arg(long)]
         dry_run: bool,
+        /// Encadena el statusline de Claude para informar uso y cuotas.
+        #[arg(long)]
+        statusline: bool,
     },
     /// Quita únicamente los hooks de galgo.
     Uninstall {
@@ -119,11 +122,24 @@ pub fn map_event(p: &Value) -> Option<(HookEvent, Option<String>)> {
     }
 }
 
-fn notify_daemon(pane: String, event: HookEvent, summary: Option<String>) -> Result<()> {
+fn hook_source(agent: Agent, payload: &Value) -> Option<HookSource> {
+    let (name, session_key, path_key) = match agent {
+        Agent::Claude => ("claude", "session_id", "transcript_path"),
+        Agent::Codex => ("codex", "session_id", "transcript_path"),
+        Agent::Pi => ("pi", "sessionId", "sessionFile"),
+    };
+    let text = |key: &str| payload.get(key).and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 4096).map(str::to_owned);
+    let session_id = text(session_key);
+    let transcript = text(path_key);
+    if session_id.is_none() && transcript.is_none() { return None; }
+    Some(HookSource { agent: name.into(), session_id, transcript })
+}
+fn notify_daemon(pane: String, event: HookEvent, summary: Option<String>, source: Option<HookSource>, timeout: Duration) -> Result<()> {
     // Si no hay daemon, no se arranca uno: un hook nunca debe hacer ruido ni demorar a Claude.
     let mut stream = UnixStream::connect(socket_path())?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    let mut line = serde_json::to_string(&Request::Hook { pane, event, summary })?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut line = serde_json::to_string(&Request::Hook { pane, event, summary, source })?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     let mut reply = String::new();
@@ -146,10 +162,16 @@ pub fn run_hook(agent: Agent) -> i32 {
         Agent::Codex => crate::codex::map_event(&payload),
     };
     let Some((event, summary)) = mapped else { return 0 };
-    if let Err(e) = notify_daemon(pane, event, summary) {
+    let source = hook_source(agent, &payload);
+    // PI cancela su proceso hook a los 300 ms; reservar tiempo para el informe de contexto.
+    let timeout = if matches!(agent, Agent::Pi) { Duration::from_millis(75) } else { Duration::from_secs(3) };
+    if let Err(e) = notify_daemon(pane.clone(), event, summary, source, timeout) {
         if std::env::var_os("GALGO_DEBUG").is_some() {
             eprintln!("galgo hook: {e:#}");
         }
+    }
+    if matches!(agent, Agent::Pi) {
+        if let Some(report) = crate::statusline::pi_report(pane, &payload) { crate::statusline::send_best_effort(report); }
     }
     0
 }
@@ -348,22 +370,24 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
 
 pub fn hooks_command(cmd: &HooksCmd) -> Result<()> {
     match cmd {
-        HooksCmd::Install { agent: Agent::Codex, scope, yes, dry_run } => crate::codex::install_command(*scope, *yes, *dry_run)?,
+        HooksCmd::Install { agent: Agent::Codex, scope, yes, dry_run, statusline } => { if *statusline { bail!("--statusline solo se admite para Claude"); } crate::codex::install_command(*scope, *yes, *dry_run)? },
         HooksCmd::Uninstall { agent: Agent::Codex, scope, yes } => crate::codex::uninstall_command(*scope, *yes)?,
         HooksCmd::Status { agent: Agent::Codex, scope } => crate::codex::status_command(*scope)?,
-        HooksCmd::Install { agent: Agent::Pi, scope, yes, dry_run } => crate::pi::install_command(*scope, *yes, *dry_run)?,
+        HooksCmd::Install { agent: Agent::Pi, scope, yes, dry_run, statusline } => { if *statusline { bail!("--statusline solo se admite para Claude"); } crate::pi::install_command(*scope, *yes, *dry_run)? },
         HooksCmd::Uninstall { agent: Agent::Pi, scope, yes } => crate::pi::uninstall_command(*scope, *yes)?,
         HooksCmd::Status { agent: Agent::Pi, scope } => crate::pi::status_command(*scope)?,
-        HooksCmd::Install { agent: Agent::Claude, scope, yes, dry_run } => {
+        HooksCmd::Install { agent: Agent::Claude, scope, yes, dry_run, statusline } => {
             let path = settings_path(*scope)?;
             let mut settings = read_settings(&path)?;
             let exe = std::env::current_exe()?.canonicalize()?;
             let changes = merge(&mut settings, &hook_command(&exe))?;
+            let statusline_backup = if *statusline { crate::statusline::prepare(&mut settings, &path, &exe)? } else { None };
             println!("Claude Code · {}", path.display());
+            if statusline_backup.is_some() { println!("  encadena el statusline existente y envía métricas al daemon dentro de galgo"); }
             for c in &changes {
                 println!("  {c}");
             }
-            if changes.iter().all(|c| c.starts_with("sin cambios")) {
+            if changes.iter().all(|c| c.starts_with("sin cambios")) && statusline_backup.is_none() {
                 println!("Ya está instalado.");
                 return Ok(());
             }
@@ -376,14 +400,19 @@ pub fn hooks_command(cmd: &HooksCmd) -> Result<()> {
                 println!("Cancelado.");
                 return Ok(());
             }
-            write_settings(&path, &settings)?;
+            if let Some((backup, value)) = &statusline_backup { crate::statusline::save_sidecar(backup, value)?; }
+            if let Err(e) = write_settings(&path, &settings) {
+                if let Some((backup, _)) = &statusline_backup { let _ = std::fs::remove_file(backup); }
+                return Err(e);
+            }
             println!("Listo. Si Claude Code pide confiar en la carpeta, acéptalo para que los hooks corran.");
         }
         HooksCmd::Uninstall { agent: Agent::Claude, scope, yes } => {
             let path = settings_path(*scope)?;
             let mut settings = read_settings(&path)?;
             let n = remove(&mut settings);
-            if n == 0 {
+            let restored = crate::statusline::restore(&mut settings, &path)?;
+            if n == 0 && restored.is_none() {
                 println!("No hay hooks de galgo en {}", path.display());
                 return Ok(());
             }
@@ -393,7 +422,8 @@ pub fn hooks_command(cmd: &HooksCmd) -> Result<()> {
                 return Ok(());
             }
             write_settings(&path, &settings)?;
-            println!("Listo.");
+            if let Some(backup) = restored { std::fs::remove_file(backup)?; }
+            println!("Listo. Si modificaste el statusline instalado, su respaldo se conserva sin restaurar.");
         }
         HooksCmd::Status { agent: Agent::Claude, scope } => {
             let path = settings_path(*scope)?;
@@ -438,6 +468,19 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn source_contains_only_expected_agent_session_and_transcript() {
+        let payload = json!({"session_id":"sid", "transcript_path":"/tmp/transcript", "prompt":"SECRET"});
+        for agent in [Agent::Claude, Agent::Codex] {
+            let source = hook_source(agent, &payload).unwrap();
+            assert_eq!(source.session_id.as_deref(), Some("sid"));
+            assert_eq!(source.transcript.as_deref(), Some("/tmp/transcript"));
+            assert!(!serde_json::to_string(&source).unwrap().contains("SECRET"));
+        }
+        let pi = hook_source(Agent::Pi, &json!({"sessionId":"pi-id", "sessionFile":"/tmp/pi.jsonl"})).unwrap();
+        assert_eq!(pi.agent,"pi"); assert_eq!(pi.transcript.as_deref(),Some("/tmp/pi.jsonl"));
+        assert!(hook_source(Agent::Pi,&json!({})).is_none());
+    }
     #[test]
     fn maps_claude_events() {
         let stop = json!({"hook_event_name": "Stop", "last_assistant_message": "  listo  "});

@@ -157,10 +157,29 @@ pub enum Request {
         client_ack: bool,
     },
     /// Evento de un hook de agente. `summary` es el último mensaje del agente o el motivo del bloqueo.
+    /// `source` dice de dónde leer el uso (agente, sesión, transcript); ausente en clientes anteriores.
     Hook {
         pane: String,
         event: HookEvent,
         summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<HookSource>,
+    },
+    /// Uso que el agente informa directamente (statusline de Claude, extensiones): contexto, coste y cuotas.
+    UsageReport {
+        pane: String,
+        agent: String,
+        model: Option<String>,
+        context_tokens: Option<u64>,
+        context_window: Option<u64>,
+        cost_usd: Option<f64>,
+        #[serde(default)]
+        limits: Vec<LimitReport>,
+    },
+    /// Uso vivo agregado de los paneles y cuotas por agente. `group_by`: workspace, agent o model.
+    Usage {
+        #[serde(default)]
+        group_by: Option<String>,
     },
     Inbox {
         pane: String,
@@ -256,6 +275,24 @@ impl Response {
     }
 }
 
+/// De dónde sacar el uso de un panel: agente, sesión y ruta del transcript (solo en memoria del daemon).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookSource {
+    pub agent: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub transcript: Option<String>,
+}
+
+/// Una cuota informada por el agente. `name` es `five_hour` o `seven_day`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitReport {
+    pub name: String,
+    pub used_pct: f32,
+    pub resets_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub id: u32,
@@ -276,6 +313,9 @@ pub struct PaneInfo {
     /// Directorio de trabajo del panel. Ausente en daemons anteriores.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Uso vivo del panel (tokens, contexto, coste). Ausente si el panel no tiene fuente de uso.
+    #[serde(default)]
+    pub usage: Option<galgo_usage::PaneUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +403,7 @@ mod tests_grupos {
             waiting_secs: None,
             workspace: ws.map(String::from),
             cwd: None,
+            usage: None,
         }
     }
 
