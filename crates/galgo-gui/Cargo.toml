@@ -1,0 +1,13 @@
+[package]
+name = "galgo-gui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio"] }
+galgo-proto = { path = "../galgo-proto" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }

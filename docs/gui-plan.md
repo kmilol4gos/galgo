@@ -13,6 +13,12 @@
 
 **Recomendación provisional: GPUI**, por UI de escritorio y render GPU integrados; encapsular el widget terminal y el transporte para poder migrar. Lo descartaría si el corte vertical no cumple latencia, IME/accesibilidad indispensables o compilación reproducible en macOS y Linux; alternativa: iced, y wgpu+winit solo si se justifica mantener la infraestructura propia. Ninguna opción garantiza apariencia nativa sin trabajo adicional.
 
+### Spike macOS (21-11-2026)
+
+Se probó **iced 0.13.1** primero y compiló con Xcode instalado: se elige para este spike, no como decisión definitiva frente a GPUI. Compilación `dev` con `CARGO_TARGET_DIR=/tmp/galgo-gui-target`: primera compilación **26,27 s reales**; incremental posterior **2,28 s**. Incluye dependencias y depende de la caché del equipo; no es un benchmark comparativo. egui y GPUI no se compilaron en este spike. La compilación advierte de incompatibilidad futura en `block 0.1.6`.
+
+`crates/galgo-gui` es un workspace aislado. Arranque: iniciar `galgod` y luego `CARGO_TARGET_DIR=/tmp/galgo-gui-target cargo run --manifest-path crates/galgo-gui/Cargo.toml`, compartiendo `GALGO_SOCKET`. Se observó una ventana macOS llamada `galgo` y, con un daemon real y un panel creado, solicitudes `list` periódicas de la GUI al socket. No se verificaron visualmente los contenidos ni la interacción de selección/envío. La GUI consulta `List` y `Read` cada segundo y usa `Send`; no es un emulador de terminal, no tiene colores ANSI, entrada cruda, diffs ni splits. El `request` compartido intenta arrancar `galgod` como hermano del ejecutable: en el target aislado puede no existir; iniciar el daemon previamente. Accesibilidad, Linux y latencia quedan sin verificar.
+
 ## 2. Terminal: una sola autoridad
 
 El daemon mantiene PTY, parser, modos, pantalla y scrollback; cada GUI mantiene una réplica de celdas para dibujar, selección local y métricas de fuente. El daemon genera respuestas VT al PTY una sola vez; no reproducir bytes PTY en cada GUI como fuente autoritativa. La entrada se codifica según los modos vigentes **en el daemon**, a partir de eventos de tecla/ratón del cliente. Texto compuesto/IME llega como texto comprometido. Definir dimensiones, Unicode/ancho de celda, atributos, cursor, pantalla alternativa, modos e identificadores de enlaces en el modelo de pantalla.
