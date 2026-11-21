@@ -572,12 +572,18 @@ impl Daemon {
                 let text = screen.lock().unwrap().screen().contents();
                 Ok(json!({ "text": text.trim_end() }))
             }
-            Request::Snapshot { pane } => {
+            Request::Snapshot { pane, offset } => {
                 let screen = {
                     let st = self.state.lock().unwrap();
                     Arc::clone(&st.panes[&st.resolve(&pane)?].screen)
                 };
-                let snap = snapshot(screen.lock().unwrap().screen());
+                let mut parser = screen.lock().unwrap();
+                // Se mira hacia atrás solo para construir la respuesta; luego se vuelve a la pantalla viva.
+                parser.screen_mut().set_scrollback(offset as usize);
+                let mut snap = snapshot(parser.screen());
+                snap.scrollback = parser.screen().scrollback() as u16;
+                snap.scrollback_max = parser.screen().scrollback_len() as u16;
+                parser.screen_mut().set_scrollback(0);
                 Ok(serde_json::to_value(snap)?)
             }
             Request::Resize { pane, rows, cols } => {
@@ -988,5 +994,7 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
         cursor: screen.cursor_position(),
         cursor_hidden: screen.hide_cursor(),
         lines,
+        scrollback: 0,
+        scrollback_max: 0,
     }
 }

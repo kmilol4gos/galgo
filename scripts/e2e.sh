@@ -625,5 +625,37 @@ PY95
 check "snapshot trae color por tramo y resize cambia la pantalla" $?
 galgo kill s95 >/dev/null 2>&1
 
+echo "96. snapshot con offset: historial, fila desplazada y vuelta a la pantalla viva"
+galgo spawn sb96 -- bash --norc >/dev/null
+galgo send sb96 'for i in $(seq 1 100); do echo line$i; done'
+sleep 1.5
+python3 -I - "$GALGO_SOCKET" <<'PY96'
+import json, re, socket, sys
+def snap(offset):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sys.argv[1])
+    s.sendall((json.dumps({"op": "snapshot", "pane": "sb96", "offset": offset}) + "\n").encode())
+    data = json.loads(s.makefile().readline())
+    s.close()
+    return data["data"]
+def top(d):
+    m = re.search(r"line(\d+)", "".join(r["t"] for r in d["lines"][0]))
+    return int(m.group(1)) if m else None
+live = snap(0)
+back = snap(5)
+clamp = snap(65535)
+again = snap(0)
+ok = (live["scrollback"] == 0
+      and back["scrollback"] == 5
+      and back["scrollback_max"] >= 5
+      and clamp["scrollback"] == clamp["scrollback_max"]
+      and top(live) is not None and top(back) is not None
+      and top(live) - top(back) == 5
+      and again["scrollback"] == 0 and top(again) == top(live))
+sys.exit(0 if ok else 1)
+PY96
+check "offset 5 sube 5 líneas; un offset grande se recorta al historial; offset 0 vuelve en vivo" $?
+galgo kill sb96 >/dev/null 2>&1
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

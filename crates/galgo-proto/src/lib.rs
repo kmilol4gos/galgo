@@ -117,6 +117,9 @@ pub enum Request {
     /// Pantalla con estilos y cursor, para clientes gráficos.
     Snapshot {
         pane: String,
+        /// Líneas hacia atrás en el historial (0 = pantalla en vivo).
+        #[serde(default)]
+        offset: u16,
     },
     /// Cambia el tamaño del PTY y de la pantalla.
     Resize {
@@ -190,6 +193,12 @@ pub struct Snapshot {
     pub cursor: (u16, u16),
     pub cursor_hidden: bool,
     pub lines: Vec<Vec<Run>>,
+    /// Desplazamiento efectivo en el historial (puede ser menor que el pedido).
+    #[serde(default)]
+    pub scrollback: u16,
+    /// Líneas de historial disponibles.
+    #[serde(default)]
+    pub scrollback_max: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
