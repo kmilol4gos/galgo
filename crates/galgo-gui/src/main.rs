@@ -285,7 +285,7 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 9] = [
+    let commands: [(&str, &str, Message); 15] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
         ("Lanzar agente…", "Cmd+Shift+L", Message::OpenLauncher),
@@ -295,6 +295,12 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         ("Lanzar Codex aquí", "", Message::Launch(launch::Agent::Codex)),
         ("Lanzar PI aquí", "", Message::Launch(launch::Agent::Pi)),
         ("Nuevo panel con formulario", "", Message::OpenForm),
+        ("Dividir a la derecha", "Cmd+D", Message::SplitFocused(true)),
+        ("Dividir hacia abajo", "Cmd+Shift+D", Message::SplitFocused(false)),
+        ("Pestaña siguiente", "Cmd+]", Message::NextTab(1)),
+        ("Pestaña anterior", "Cmd+[", Message::NextTab(-1)),
+        ("Lanzar opencode aquí", "", Message::Launch(launch::Agent::OpenCode)),
+        ("Lanzar shell aquí", "", Message::Launch(launch::Agent::Shell)),
     ];
     for (label, keys, message) in commands {
         items.push(PaletteItem { label: label.into(), detail: keys.into(), message });
@@ -631,6 +637,14 @@ fn load_other(id: u32, since: Option<u64>) -> Task<Message> {
     }, move |r| Message::OtherScreen(id, r))
 }
 
+/// Identificador del buscador de «Nuevo workspace» (B3: para darle el foco).
+fn new_ws_input_id() -> iced::widget::text_input::Id {
+    iced::widget::text_input::Id::new("nuevo-workspace")
+}
+
+/// Resultados de la paleta que se dibujan (y, por tanto, a los que puede llegar el resaltado).
+const PALETTE_VISIBLE: usize = 12;
+
 /// Identificador del campo de búsqueda de la paleta: para darle el foco al abrirla.
 fn palette_input_id() -> iced::widget::text_input::Id {
     iced::widget::text_input::Id::new("paleta")
@@ -692,7 +706,7 @@ fn new_workspace_view(app: &App) -> Element<'_, Message> {
     column![
         text("Nuevo workspace").size(20),
         text("Elige una carpeta. Se abre un terminal en ella; el daemon deduce el proyecto y la rama del repo git.").size(12).color(MUTED),
-        text_input("Buscar en recientes…", query).on_input(Message::NewWsQuery).on_submit(Message::NewWsSubmit).padding(8),
+        text_input("Buscar en recientes…", query).id(new_ws_input_id()).on_input(Message::NewWsQuery).on_submit(Message::NewWsSubmit).padding(8),
         scrollable(list).height(Length::Fill),
         row![
             button(text("Elegir carpeta…").size(13)).on_press(Message::PickFolder),
@@ -835,10 +849,17 @@ fn back_to_live(app: &mut App) {
 
 /// Selecciona un panel. Mirarlo no cambia su tamaño y lo deja sin marca de "sin leer".
 fn select(app: &mut App, id: u32) -> Task<Message> {
+    // B6: la última pantalla del que pierde el foco pasa a `others`, y el que lo gana se muestra desde ahí (no hay
+    // «Esperando salida…» durante un tick).
+    if let (Some(prev), Some(snap)) = (app.selected, app.snap.take()) {
+        if prev != id {
+            app.others.insert(prev, snap);
+        }
+    }
     app.selected = Some(id);
     app.layouts.focus(id);
-    app.snap = None;
-    app.snap_gen = None;
+    app.snap = app.others.get(&id).cloned();
+    app.snap_gen = app.snap.as_ref().map(|s| s.gen);
     app.snap_offset = 0;
     app.scroll = 0;
     app.confirm_close = false;
@@ -1193,7 +1214,9 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             None => Task::none(),
         },
         Message::NextAttention => {
-            let next = next_attention(&app.panes, app.selected, |id| app.attention.is_unread(id));
+            // B7: en el orden de la barra lateral, como Cmd+1..9 y la paleta.
+            let ordenados: Vec<PaneInfo> = sidebar::workspaces(&app.panes).into_iter().flat_map(|w| w.panes.into_iter().cloned()).collect();
+            let next = next_attention(&ordenados, app.selected, |id| app.attention.is_unread(id));
             match next {
                 Some(id) => select(app, id),
                 None => Task::none(),
@@ -1227,7 +1250,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::PaletteMove(delta) => {
-            let n = palette_results(app).len();
+            // B4: el resaltado no pasa de los resultados que se dibujan (12): Enter no ejecuta algo invisible.
+            let n = palette_results(app).len().min(PALETTE_VISIBLE);
             if n > 0 {
                 app.palette_cursor = (app.palette_cursor as isize + delta).rem_euclid(n as isize) as usize;
             }
@@ -1258,7 +1282,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         Message::OpenNewWorkspace => {
             app.form = None;
             app.new_ws = Some(String::new());
-            Task::none()
+            // B3: el foco va al buscador: lo que se escribe, y Enter, llegan ahí.
+            iced::widget::text_input::focus(new_ws_input_id())
         }
         Message::CloseNewWorkspace => {
             app.new_ws = None;
@@ -2371,10 +2396,10 @@ mod tests {
     #[test]
     fn paleta_flechas_dan_la_vuelta_y_busqueda_vacia() {
         let mut app = App { palette: Some(String::new()), ..Default::default() };
-        let total = palette_results(&app).len();
+        let total = palette_results(&app).len().min(PALETTE_VISIBLE);
         assert!(total >= 9, "al menos los comandos");
         let _ = update(&mut app, Message::PaletteMove(-1));
-        assert_eq!(app.palette_cursor, total - 1);
+        assert_eq!(app.palette_cursor, total - 1, "da la vuelta dentro de lo visible (B4)");
         let _ = update(&mut app, Message::PaletteQuery("zzqx".into()));
         assert!(palette_results(&app).is_empty());
         let _ = update(&mut app, Message::PaletteMove(1));
@@ -2655,5 +2680,40 @@ mod tests {
         let _ = update(&mut app, Message::NewTab);
         let _ = update(&mut app, Message::NewTab);
         assert_eq!(app.inflight, vec!["shell".to_string(), "shell-2".to_string()]);
+    }
+
+    /// r13 B6: al cambiar de panel, la pantalla del que pierde el foco se conserva y se muestra al volver.
+    #[test]
+    fn r13_cambiar_de_foco_no_deja_la_pantalla_vacia() {
+        let mut app = App { panes: vec![pane_info(1, "a", Status::Idle), pane_info(2, "b", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), snap: Some(snap(&["uno"], 8)), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        let _ = update(&mut app, Message::Select(2));
+        assert!(app.others.contains_key(&1), "la pantalla del 1 se guarda al perder el foco");
+        assert!(app.snap.is_none(), "el panel 2 no tiene pantalla todavía: no se muestra la del 1");
+        let _ = update(&mut app, Message::Select(1));
+        assert!(shown(&app).is_some(), "al volver al 1 se ve su última pantalla, no «Esperando salida…»");
+    }
+
+    /// r13 B7: Cmd+Shift+U sigue el orden de la barra lateral, no el de la lista del daemon.
+    #[test]
+    fn r13_siguiente_atencion_sigue_el_orden_de_la_barra() {
+        let mut z = pane_info(1, "z", Status::Blocked);
+        z.workspace = Some("z/main".into());
+        let mut a = pane_info(2, "a", Status::Blocked);
+        a.workspace = Some("a/main".into());
+        let mut app = App { panes: vec![z, a], window: (1100.0, 700.0), ..Default::default() };
+        let _ = update(&mut app, Message::NextAttention);
+        assert_eq!(app.selected, Some(2), "la barra pone a/main antes que z/main");
+    }
+
+    /// r13 B4: el resaltado de la paleta no pasa de los resultados que se dibujan.
+    #[test]
+    fn r13_paleta_resaltado_dentro_de_lo_visible() {
+        let mut app = App { palette: Some(String::new()), ..Default::default() };
+        for _ in 0..40 {
+            let _ = update(&mut app, Message::PaletteMove(1));
+        }
+        assert!(app.palette_cursor < PALETTE_VISIBLE, "cursor {}", app.palette_cursor);
+        assert!(palette_items(&App::default()).len() >= 15, "la paleta tiene los comandos de división, pestañas y lanzadores");
     }
 }
