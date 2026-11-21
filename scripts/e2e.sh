@@ -900,5 +900,26 @@ PY110
 check "unchanged mientras no hay cambios; escritura y resize suben la generación; tramos compactos" $?
 galgo kill gp110 >/dev/null 2>&1
 
+echo "111. el inbox sobrevive a un reinicio del daemon; un ack anterior confirma su mensaje, no uno nuevo"
+galgo spawn m111 -- bash --norc >/dev/null
+galgo spawn w111 --manager m111 -- bash --norc >/dev/null
+galgo send w111 'galgo done --summary "viejo111"'
+sleep 0.7
+OLD=$(galgo --json inbox --pane m111 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+galgo stop >/dev/null 2>&1
+sleep 0.5
+galgo ls >/dev/null
+galgo inbox --pane m111 | grep -q "viejo111"; check "el resultado sigue en el inbox tras reiniciar" $?
+galgo inbox --pane m111 | grep -q "ya no existe"; check "el manager recibe el aviso de que w111 ya no existe" $?
+galgo spawn w111b --manager m111 -- bash --norc >/dev/null
+galgo send w111b 'galgo done --summary "nuevo111"'
+sleep 0.7
+galgo ack "$OLD" --pane m111 >/dev/null 2>&1; check "el ack de antes del reinicio se acepta" $?
+galgo inbox --pane m111 | grep -q "nuevo111"; check "ese ack no confirmó el mensaje nuevo" $?
+galgo inbox --pane m111 | grep -q "viejo111"; [ $? -ne 0 ]; check "el mensaje anterior quedó confirmado" $?
+FOREIGN=$(( (7 << 32) + 5 ))
+galgo ack "$FOREIGN" --pane m111 2>&1 | grep -q "otra ejecución"; check "un id de otra ejecución se rechaza sin confirmar" $?
+galgo inbox --pane m111 | grep -q "nuevo111"; check "tras el rechazo el mensaje nuevo sigue pendiente" $?
+
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

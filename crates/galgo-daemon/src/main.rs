@@ -1,5 +1,7 @@
 //! galgod: daemon que posee los PTYs, el estado de pantalla y la entrega de mensajes entre agentes.
 
+mod persist;
+
 use anyhow::{anyhow, bail, Context, Result};
 use galgo_proto::{HookEvent, Message, PaneInfo, Request, Response, Status};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -85,7 +87,9 @@ struct Pane {
     exited: bool,
     /// Hubo entrada enviada al panel desde su último resultado entregado.
     touched_since_report: bool,
-    _master: Box<dyn MasterPty + Send>,
+    _master: Option<Box<dyn MasterPty + Send>>,
+    /// Panel restaurado tras un reinicio del daemon: existe en la lista y en el inbox, pero su proceso murió.
+    ghost: bool,
     inbox: Vec<InboxMsg>,
     last_summary: Option<String>,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
@@ -99,8 +103,59 @@ struct Pane {
     reported: bool,
 }
 
+/// Killer de un panel sin proceso: nada que matar.
+#[derive(Debug)]
+struct GhostKiller;
+
+impl ChildKiller for GhostKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(GhostKiller)
+    }
+}
+
+impl Pane {
+    /// Panel restaurado: sin PTY. Las órdenes que lo necesitan fallan con un error claro.
+    fn ghost(id: u32, name: String, cmd: Vec<String>, manager: Option<u32>, inbox: Vec<InboxMsg>) -> Pane {
+        // Entrada cerrada desde el principio: escribir en un panel sin proceso da "no acepta entrada".
+        let (input, rx) = sync_channel::<Vec<u8>>(1);
+        drop(rx);
+        Pane {
+            id,
+            name,
+            cmd,
+            status: Status::Exited,
+            manager,
+            inject: false,
+            screen: Arc::new(Mutex::new(vt100::Parser::new(std::num::NonZeroU16::new(24).unwrap(), std::num::NonZeroU16::new(80).unwrap(), 0))),
+            gen: Arc::new(AtomicU64::new(0)),
+            input,
+            killer: Box::new(GhostKiller),
+            pid: None,
+            exited: true,
+            touched_since_report: false,
+            _master: None,
+            ghost: true,
+            inbox,
+            last_summary: None,
+            last_blocked: None,
+            orphans: Vec::new(),
+            waiting_on: None,
+            reported: false,
+        }
+    }
+}
+
+fn no_proceso(name: &str) -> anyhow::Error {
+    anyhow!("el panel {name} no tiene proceso: se restauró tras reiniciar el daemon")
+}
+
 #[derive(Default)]
 struct State {
+    /// Ejecución actual del daemon. Los ids de mensaje llevan el epoch en la parte alta.
+    epoch: u64,
     next_pane: u32,
     next_msg: u64,
     panes: BTreeMap<u32, Pane>,
@@ -124,7 +179,8 @@ impl State {
 
     fn push(&mut self, to: u32, from: u32, kind: &'static str, summary: String) {
         self.next_msg += 1;
-        let id = self.next_msg;
+        // Epoch en la parte alta: un ack de otra ejecución del daemon no puede confirmar un mensaje de esta.
+        let id = (self.epoch << 32) | (self.next_msg & 0xFFFF_FFFF);
         let from_name = self.panes.get(&from).map(|p| p.name.clone()).unwrap_or_default();
         if let Some(p) = self.panes.get_mut(&to) {
             p.inbox.push(InboxMsg {
@@ -166,6 +222,9 @@ impl State {
 
 struct Daemon {
     state: Mutex<State>,
+    /// Dónde se guarda el estado entre reinicios, y un candado para escribirlo en orden.
+    state_path: PathBuf,
+    persist_lock: Mutex<()>,
     notify: Notify,
     socket: PathBuf,
     orphan_secs: u64,
@@ -336,7 +395,8 @@ impl Daemon {
             pid,
             exited: false,
             touched_since_report: false,
-            _master: pair.master,
+            _master: Some(pair.master),
+            ghost: false,
             inbox: Vec::new(),
             last_summary: None,
             last_blocked: None,
@@ -347,6 +407,13 @@ impl Daemon {
         {
             let mut st = self.state.lock().unwrap();
             st.reserved.remove(&name);
+            let mut pane = pane;
+            let ghost = st.panes.values().find(|g| g.ghost && g.name == name).map(|g| g.id);
+            if let Some(gid) = ghost {
+                if let Some(g) = st.panes.remove(&gid) {
+                    pane.inbox = g.inbox;
+                }
+            }
             st.panes.insert(id, pane);
         }
         reservation.name = None;
@@ -416,6 +483,7 @@ impl Daemon {
         if let Some(m) = manager {
             self.try_inject(m);
         }
+        self.persist();
     }
 
     /// Encola en el panel los mensajes pendientes si pidió `inject` y está `idle`.
@@ -558,11 +626,33 @@ impl Daemon {
 
     /// Atiende una solicitud. `wait` devuelve además el mensaje a confirmar tras responder.
     async fn dispatch(self: &Arc<Self>, req: Request) -> (Result<Value>, Option<(u32, u64)>) {
-        match req {
+        // Solo lo que cambia el estado persistente se guarda: las lecturas (snapshots, ls) no.
+        let mutating = matches!(
+            req,
+            Request::Spawn { .. } | Request::Send { .. } | Request::Done { .. } | Request::Hook { .. }
+                | Request::Ack { .. } | Request::Kill { .. } | Request::Wait { .. }
+        );
+        let out = match req {
             Request::Wait { waiter, target, timeout_secs, .. } => {
                 self.wait_for(waiter, target, timeout_secs).await
             }
             other => (self.handle(other).await, None),
+        };
+        if mutating {
+            self.persist();
+        }
+        out
+    }
+
+    /// Guarda el estado en disco. Un fallo se avisa en el log: el daemon sigue funcionando.
+    fn persist(&self) {
+        let _order = self.persist_lock.lock().unwrap();
+        let saved = {
+            let st = self.state.lock().unwrap();
+            persist::snapshot(&st)
+        };
+        if let Err(e) = persist::write(&self.state_path, &saved) {
+            eprintln!("galgod: no pude guardar el estado: {e:#}");
         }
     }
 
@@ -587,6 +677,9 @@ impl Daemon {
                 if enter {
                     chunk.push(b'\r');
                 }
+                if p.ghost {
+                    return Err(no_proceso(&p.name));
+                }
                 p.input.try_send(chunk).map_err(input_error)?;
                 p.touched_since_report = true;
                 if enter {
@@ -601,7 +694,11 @@ impl Daemon {
             Request::Read { pane } => {
                 let screen = {
                     let st = self.state.lock().unwrap();
-                    Arc::clone(&st.panes[&st.resolve(&pane)?].screen)
+                    let p = &st.panes[&st.resolve(&pane)?];
+                    if p.ghost {
+                        return Err(no_proceso(&p.name));
+                    }
+                    Arc::clone(&p.screen)
                 };
                 let text = screen.lock().unwrap().screen().contents();
                 Ok(json!({ "text": text.trim_end() }))
@@ -610,6 +707,9 @@ impl Daemon {
                 let (screen, gen) = {
                     let st = self.state.lock().unwrap();
                     let p = &st.panes[&st.resolve(&pane)?];
+                    if p.ghost {
+                        return Err(no_proceso(&p.name));
+                    }
                     (Arc::clone(&p.screen), Arc::clone(&p.gen))
                 };
                 let mut parser = screen.lock().unwrap();
@@ -633,6 +733,9 @@ impl Daemon {
                 let (screen, screen_gen) = {
                     let st = self.state.lock().unwrap();
                     let p = &st.panes[&st.resolve(&pane)?];
+                    if p.ghost {
+                        return Err(no_proceso(&p.name));
+                    }
                     (Arc::clone(&p.screen), Arc::clone(&p.gen))
                 };
                 // Orden fijo: primero la pantalla, luego el estado. Ningún camino toma el candado de la
@@ -644,6 +747,8 @@ impl Daemon {
                     let id = st.resolve(&pane)?;
                     st.panes[&id]
                         ._master
+                        .as_ref()
+                        .context("el panel no tiene PTY")?
                         .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
                         .context("no pude cambiar el tamaño del PTY")?;
                 }
@@ -787,13 +892,16 @@ impl Daemon {
             Request::Ack { pane, msg } => {
                 {
                     let mut st = self.state.lock().unwrap();
+                    let epoch = st.epoch;
                     let id = st.resolve(&pane)?;
                     let p = st.panes.get_mut(&id).unwrap();
-                    let m = p
-                        .inbox
-                        .iter_mut()
-                        .find(|m| m.id == msg)
-                        .ok_or_else(|| anyhow!("mensaje {msg} no encontrado"))?;
+                    let m = p.inbox.iter_mut().find(|m| m.id == msg).ok_or_else(|| {
+                        if msg >> 32 != epoch {
+                            anyhow!("el mensaje {msg} es de otra ejecución del daemon y ya no existe; no se confirmó nada")
+                        } else {
+                            anyhow!("mensaje {msg} no encontrado")
+                        }
+                    })?;
                     m.acked = true;
                 }
                 self.notify.notify_waiters();
@@ -941,6 +1049,7 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
                 d.hold(pane, msg, d.ack_secs);
             } else if written {
                 d.confirm(pane, msg);
+                d.persist();
             } else {
                 d.release(pane, msg);
             }
@@ -968,8 +1077,18 @@ async fn main() -> Result<()> {
     // Quien alcance el socket puede escribir en todos los paneles: solo el dueño.
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
+    // Estado del arranque anterior: inbox sin confirmar y paneles (que vuelven sin proceso).
+    // Un archivo ilegible se ignora con aviso; el epoch siempre sube, así los ids nuevos no chocan.
+    let state_path = persist::state_path(&socket);
+    let saved = persist::load(&state_path);
+    let mut state = State { epoch: saved.as_ref().map_or(1, |s| s.epoch + 1), ..State::default() };
+    if let Some(s) = saved {
+        persist::restore(&mut state, s);
+    }
     let daemon = Arc::new(Daemon {
-        state: Mutex::new(State::default()),
+        state: Mutex::new(state),
+        state_path,
+        persist_lock: Mutex::new(()),
         notify: Notify::new(),
         socket: socket.clone(),
         orphan_secs: env_u64("GALGO_ORPHAN_SECS", 30),
@@ -977,6 +1096,8 @@ async fn main() -> Result<()> {
         retry: Duration::from_secs(env_u64("GALGO_RETRY_SECS", 60)),
         write_timeout: Duration::from_secs(env_u64("GALGO_WRITE_TIMEOUT_SECS", 10)),
     });
+    // El epoch nuevo queda guardado antes de aceptar la primera conexión.
+    daemon.persist();
     eprintln!("galgod escuchando en {}", socket.display());
 
     let d = Arc::clone(&daemon);

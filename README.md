@@ -4,7 +4,7 @@
 
 > *Galgo* es *greyhound* en español, el perro más rápido. Y en inglés se lee «gal-go»: *go*.
 
-**Estado: alfa.** Probado en macOS. Linux todavía no se ha probado. No hay interfaz gráfica aún: hoy es un daemon, una CLI y un servidor MCP.
+**Estado: alfa.** Probado en macOS; la interfaz gráfica es experimental. Linux todavía no se ha probado.
 
 ## El problema
 
@@ -23,14 +23,35 @@ Un daemon (`galgod`) es dueño de los PTYs y de la pantalla de cada panel, y ent
 
 ## Instalación
 
-Requiere [Rust](https://rustup.rs).
+Requiere macOS y [Rust](https://rustup.rs) con Cargo. Desde el repositorio:
 
 ```sh
 git clone https://github.com/kmilol4gos/galgo
 cd galgo
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
+scripts/install.sh
+export PATH="$HOME/.galgo/bin:$PATH"
 ```
+
+El instalador compila en release `galgo`, `galgod`, `galgo-mcp` y `galgo-gui`; la GUI usa un `CARGO_TARGET_DIR` independiente. Instala los cuatro juntos en `~/.galgo/bin`, sin sudo, e imprime la línea para el PATH sin modificar tu `.zshrc`. Para elegir otro destino, `PREFIX` es **el directorio exacto de binarios**, no su padre:
+
+```sh
+PREFIX="$HOME/bin" scripts/install.sh
+export PATH="$HOME/bin:$PATH"
+scripts/install.sh --help
+```
+
+Para crear una app autónoma de macOS a partir de esos binarios:
+
+```sh
+scripts/make-app.sh                       # crea ./galgo.app
+# Si usaste PREFIX, pásalo también aquí:
+# PREFIX="$HOME/bin" scripts/make-app.sh
+open galgo.app
+```
+
+Puedes mover `galgo.app` a `~/Applications` o `/Applications` y abrirla desde Finder, Spotlight o el Dock. El bundle lleva sus propios binarios; conecta con el daemon existente o lo inicia si no corre. Por ahora usa el icono genérico de macOS y no está firmado ni notarizado; macOS puede exigir autorización para abrirlo. El script no reemplaza una app existente. Para elegir rutas, consulta `scripts/make-app.sh --help`.
+
+Los tags `v*` activan el workflow de release de macOS, que publica un `.tar.gz` con `bin/` y `galgo.app`. Los binarios del archivo son para la arquitectura del runner indicada en el nombre; no son universales.
 
 ## Uso
 
@@ -97,6 +118,17 @@ El valor nunca va por argv ni por el daemon; se escribe de forma atómica, conse
 
 Hay un skill listo para enseñar a un agente a usar galgo en [`skills/galgo`](skills/galgo/SKILL.md).
 
+### Estado entre reinicios
+
+El daemon guarda en `state.json`, junto al socket (`~/.galgo/state.json`; `GALGO_STATE` lo cambia), los mensajes del inbox que nadie ha confirmado y la lista de paneles. La escritura es atómica y el archivo queda con permisos `0600`. Se guarda al cambiar algo, no en cada lectura.
+
+Al reiniciar:
+
+- **Los mensajes sin confirmar siguen en el inbox.** Un resultado no se pierde por reiniciar el daemon.
+- **Los paneles no sobreviven.** Su proceso muere con el daemon. Cada panel que existía vuelve como panel sin proceso: aparece en `galgo ls` con estado `exited`, y su manager recibe un aviso («el daemon se reinició; el panel X ya no existe»). Un `spawn` con el mismo nombre lo reemplaza y hereda su inbox.
+- **Los ids de mensaje llevan un epoch** en la parte alta (`epoch << 32 | secuencia`). Un `ack` de un mensaje de la ejecución anterior confirma ese mensaje si sigue en el inbox. Un id de otra ejecución que ya no existe se rechaza con un aviso, sin confirmar nada.
+- **Un archivo corrupto o de otra versión se ignora** con un aviso en el log del daemon (`~/.galgo/galgod.log`). El daemon arranca con un estado vacío y lo sobrescribe en el siguiente cambio.
+
 ## Seguridad
 
 - El socket queda con permisos `0600` en un directorio `0700`: quien lo alcance puede escribir en todos los paneles.
@@ -114,7 +146,7 @@ scripts/e2e.sh     # daemon real, PTYs reales, agentes simulados
 
 ## Hoja de ruta
 
-- Interfaz gráfica nativa para macOS, cliente del daemon con varias ventanas. Plan en [`docs/gui-plan.md`](docs/gui-plan.md).
+- Completar la interfaz gráfica nativa para macOS, cliente del daemon con varias ventanas. Plan en [`docs/gui-plan.md`](docs/gui-plan.md).
 - Panel gráfico de variables de entorno (la CLI `galgo env` ya existe).
 - Estado de agentes por la secuencia OSC 7501 y hooks para más agentes además de Claude Code.
 - Persistencia del inbox entre reinicios del daemon.

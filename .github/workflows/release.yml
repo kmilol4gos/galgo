@@ -1,0 +1,39 @@
+name: release
+
+"on":
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compilar e instalar en staging
+        env:
+          PREFIX: ${{ runner.temp }}/galgo-release/bin
+        run: scripts/install.sh
+      - name: Crear bundle y tarball
+        env:
+          PREFIX: ${{ runner.temp }}/galgo-release/bin
+          STAGING: ${{ runner.temp }}/galgo-release
+        run: |
+          scripts/make-app.sh --output "$STAGING/galgo.app"
+          ARCHIVE="galgo-${GITHUB_REF_NAME}-macos-$(uname -m).tar.gz"
+          tar -C "$STAGING" -czf "$RUNNER_TEMP/$ARCHIVE" bin galgo.app
+          echo "ARCHIVE=$RUNNER_TEMP/$ARCHIVE" >> "$GITHUB_ENV"
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$ARCHIVE" --generate-notes
+          fi

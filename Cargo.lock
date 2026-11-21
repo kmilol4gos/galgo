@@ -188,6 +188,7 @@ dependencies = [
  "galgo-proto",
  "libc",
  "portable-pty",
+ "serde",
  "serde_json",
  "tokio",
  "vt100",
