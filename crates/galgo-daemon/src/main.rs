@@ -704,27 +704,44 @@ impl Daemon {
                 Ok(json!({}))
             }
             Request::Kill { pane } => {
-                let pid = {
-                    let mut st = self.state.lock().unwrap();
+                let (id, name, sid, exited) = {
+                    let st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
-                    let p = st.panes.get_mut(&id).unwrap();
-                    if p.exited {
-                        bail!("el panel {} ya terminó", p.name);
-                    }
-                    // Con el candado tomado y `exited` en falso, el hijo todavía no está recolectado.
-                    if let Err(e) = p.killer.kill() {
-                        if e.raw_os_error() == Some(ESRCH) {
-                            bail!("el panel {} ya terminó", p.name);
-                        }
-                        return Err(e.into());
-                    }
-                    p.pid
+                    let p = &st.panes[&id];
+                    (id, p.name.clone(), p.pid, p.exited)
                 };
+                let Some(sid) = sid else { bail!("el panel {name} ya terminó") };
+                let sid = sid as i32;
+                // Miembros de la sesión antes de cualquier señal: solo estos se barren (#13).
+                let before = tokio::task::spawn_blocking(move || session_pids(sid)).await?;
+                let mut exited = exited;
+                if !exited {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(p) = st.panes.get_mut(&id) {
+                        if p.exited {
+                            exited = true;
+                        } else if let Err(e) = p.killer.kill() {
+                            // ESRCH: el líder terminó justo ahora.
+                            if e.raw_os_error() == Some(ESRCH) {
+                                exited = true;
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                if exited {
+                    // El líder ya salió: solo se barre si quedan procesos de su sesión (#12).
+                    if before.is_empty() {
+                        bail!("el panel {name} ya terminó");
+                    }
+                    tokio::task::spawn_blocking(move || kill_members(sid, &before)).await?;
+                    return Ok(json!({}));
+                }
                 // SIGHUP no basta para quien lo ignora, ni para los trabajos que una shell puso en
-                // otro grupo de la misma sesión. Tras una espera breve, SIGKILL a toda la sesión.
+                // otro grupo de la misma sesión. Tras una espera breve, SIGKILL a los miembros.
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let Some(sid) = pid else { return Ok(json!({})) };
-                tokio::task::spawn_blocking(move || kill_session(sid as i32)).await?;
+                tokio::task::spawn_blocking(move || kill_members(sid, &before)).await?;
                 Ok(json!({}))
             }
             Request::Shutdown => {
@@ -758,16 +775,12 @@ fn session_pids(sid: i32) -> Vec<i32> {
         .collect()
 }
 
-/// SIGKILL a cada proceso de la sesión `sid`, salvo el propio daemon. Alcanza también a los
-/// trabajos de una shell que están en otro grupo de procesos.
-fn kill_session(sid: i32) {
+/// SIGKILL a los pids de `pids` que siguen perteneciendo a la sesión `sid`, salvo el propio daemon.
+/// Se comprueba `getsid` justo antes de cada señal: un pid que salió y se reutilizó en otra sesión se omite.
+fn kill_members(sid: i32, pids: &[i32]) {
     let me = unsafe { libc::getpid() };
-    for pid in session_pids(sid) {
-        if pid == me {
-            continue;
-        }
-        // Se comprueba de nuevo justo antes: un pid recién liberado podría ser de otra sesión.
-        if unsafe { libc::getsid(pid) } == sid {
+    for &pid in pids {
+        if pid != me && unsafe { libc::getsid(pid) } == sid {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }

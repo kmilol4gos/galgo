@@ -594,5 +594,17 @@ sleep 4
 galgo ls | grep w81 | grep -q blocked; [ $? -ne 0 ]; check "tras vencer la petición el worker no queda blocked" $?
 galgo inbox --pane m81 | grep -c "necesita la variable NOPE" | grep -q '^1$'; check "un solo aviso al manager" $?
 
+echo "90. kill barre la sesión aunque el líder ya haya salido (#12)"
+galgo spawn l90 -- bash -c "trap '' HUP; sleep 404 & echo \$! > $TMP/s90; exit 0" >/dev/null
+sleep 1
+galgo ls | grep l90 | grep -q exited; check "el líder salió" $?
+S90=$(cat "$TMP/s90")
+kill -0 "$S90" 2>/dev/null; check "el sleep de la sesión sigue vivo antes del kill" $?
+galgo kill l90 >/dev/null 2>&1; check "kill con miembros vivos responde ok" $?
+sleep 0.5
+! kill -0 "$S90" 2>/dev/null; check "kill barre la sesión del líder salido" $?
+kill -9 "$S90" 2>/dev/null
+galgo kill l90 2>&1 | grep -q "ya terminó"; check "sin miembros, mensaje 'ya terminó'" $?
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

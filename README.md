@@ -103,6 +103,7 @@ Hay un skill listo para enseñar a un agente a usar galgo en [`skills/galgo`](sk
 - `--inject` escribe texto en la terminal de otro panel. Úsalo con agentes, no con shells. Los caracteres de control se filtran.
 - Los secretos no viajan por el protocolo ni por argv. Solo `galgo env` toca archivos `.env`, y lo hace localmente.
 - Los hooks nunca imprimen por stdout ni fallan: salen siempre con código 0.
+- `galgo kill` mata la sesión del panel (incluidos los trabajos de su shell que ignoran SIGHUP). Un proceso que crea su propia sesión con `setsid()` escapa, y `galgo kill` no lo alcanza.
 
 ## Pruebas
 
