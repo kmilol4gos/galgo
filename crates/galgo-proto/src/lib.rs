@@ -199,6 +199,9 @@ pub struct Snapshot {
     /// Líneas de historial disponibles.
     #[serde(default)]
     pub scrollback_max: u16,
+    /// La aplicación del panel activó bracketed paste (modo 2004): el pegado debe envolverse.
+    #[serde(default)]
+    pub bracketed_paste: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

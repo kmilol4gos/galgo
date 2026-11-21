@@ -26,6 +26,21 @@ use tokio::{
 const INPUT_QUEUE: usize = 8;
 /// errno ESRCH: el proceso no existe (igual en Linux y macOS).
 const ESRCH: i32 = 3;
+/// Tamaño máximo de un panel. Sin tope, un cliente podría pedir una pantalla enorme que agota la memoria
+/// del daemon (y de todos los paneles con él).
+const MAX_ROWS: u16 = 500;
+const MAX_COLS: u16 = 1000;
+
+/// Valida filas y columnas de un panel (`Spawn` y `Resize`).
+fn check_size(rows: u16, cols: u16) -> Result<()> {
+    if rows == 0 || cols == 0 {
+        bail!("rows y cols deben ser mayores que 0");
+    }
+    if rows > MAX_ROWS || cols > MAX_COLS {
+        bail!("tamaño demasiado grande: como máximo {MAX_ROWS} filas y {MAX_COLS} columnas");
+    }
+    Ok(())
+}
 
 struct InboxMsg {
     id: u64,
@@ -229,6 +244,7 @@ impl Daemon {
         rows: u16,
         cols: u16,
     ) -> Result<u32> {
+        check_size(rows, cols)?;
         if name.trim().is_empty() || name.parse::<u32>().is_ok() {
             bail!("nombre inválido: no puede estar vacío ni ser solo un número");
         }
@@ -583,28 +599,31 @@ impl Daemon {
                 let mut snap = snapshot(parser.screen());
                 snap.scrollback = parser.screen().scrollback() as u16;
                 snap.scrollback_max = parser.screen().scrollback_len() as u16;
+                snap.bracketed_paste = parser.screen().bracketed_paste();
                 parser.screen_mut().set_scrollback(0);
                 Ok(serde_json::to_value(snap)?)
             }
             Request::Resize { pane, rows, cols } => {
-                if rows == 0 || cols == 0 {
-                    bail!("rows y cols deben ser mayores que 0");
-                }
-                let (screen, id) = {
+                check_size(rows, cols)?;
+                let screen = {
+                    let st = self.state.lock().unwrap();
+                    Arc::clone(&st.panes[&st.resolve(&pane)?].screen)
+                };
+                // Orden fijo: primero la pantalla, luego el estado. Ningún camino toma el candado de la
+                // pantalla con el del estado ya tomado, así que el orden no puede bloquearse. Mientras
+                // se mantienen ambos, el PTY y la pantalla cambian de tamaño juntos.
+                let mut parser = screen.lock().unwrap();
+                {
                     let st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
-                    let p = &st.panes[&id];
-                    p._master
+                    st.panes[&id]
+                        ._master
                         .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
                         .context("no pude cambiar el tamaño del PTY")?;
-                    (Arc::clone(&p.screen), id)
-                };
-                let _ = id;
-                let (nr, nc) = (
-                    std::num::NonZeroU16::new(rows).unwrap(),
-                    std::num::NonZeroU16::new(cols).unwrap(),
-                );
-                screen.lock().unwrap().screen_mut().set_size(nr, nc);
+                }
+                let nr = std::num::NonZeroU16::new(rows).context("rows debe ser mayor que 0")?;
+                let nc = std::num::NonZeroU16::new(cols).context("cols debe ser mayor que 0")?;
+                parser.screen_mut().set_size(nr, nc);
                 Ok(json!({}))
             }
             Request::SetStatus { pane, status } => {
@@ -996,5 +1015,21 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
         lines,
         scrollback: 0,
         scrollback_max: 0,
+        bracketed_paste: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tamanos_validos_y_limites() {
+        assert!(check_size(24, 80).is_ok());
+        assert!(check_size(MAX_ROWS, MAX_COLS).is_ok());
+        assert!(check_size(0, 80).is_err());
+        assert!(check_size(24, 0).is_err());
+        assert!(check_size(MAX_ROWS + 1, 80).is_err());
+        assert!(check_size(24, MAX_COLS + 1).is_err());
     }
 }

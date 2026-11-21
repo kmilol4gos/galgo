@@ -63,3 +63,13 @@ Medir en el mismo Mac: tiempo monótono desde recepción del evento de tecla en 
 La GUI (iced) ahora es un terminal usable: pide `Snapshot` al daemon cada 50 ms (tramos con color/negrita/cursiva/subrayado/inverso, cursor), pinta con `rich_text`, captura el teclado (letras, Enter, flechas, Ctrl+letra, Alt, Cmd+V pega) y lo envía en orden por un único hilo, y calcula filas×columnas de la ventana para enviar `Resize` al daemon. Verificado con captura de pantalla en macOS: colores ANSI, negrita, subrayado, inverso y cursor correctos; teclear en la GUI llega al shell; el resize cambió 40×140 a 33×94.
 
 Límites conocidos: sondeo (no suscripción por eventos), sin scrollback ni selección/copia, sin ratón, sin modo cursor de aplicación (flechas siempre `ESC [`), ancho de celda de Menlo asumido (8,43 px), caracteres anchos sin tratar, latencia sin medir, sin splits.
+
+### Revisión 7: decisiones y pendientes (22-11-2026)
+
+Cambios hechos: tope de tamaño de panel (500 filas × 1000 columnas, en `Resize` y `Spawn`); `Resize` toma primero el candado de la pantalla y luego el del estado, de modo que PTY y pantalla cambian juntos; pegado con bracketed paste cuando la aplicación lo activa (`Snapshot.bracketed_paste`); Option en macOS envía el carácter compuesto tal cual; teclas de función, Ctrl con símbolos y flechas con modificadores en formato xterm; Cmd con teclas con nombre no llega al panel; los envíos consecutivos del mismo panel se fusionan y un fallo se muestra en la GUI; las teclas pulsadas durante un pegado esperan detrás de él.
+
+**Política de tamaño (B7).** Mirar un panel no cambia su tamaño. La GUI envía `Resize` solo cuando el usuario escribe en el panel seleccionado o cuando redimensiona la ventana. Consecuencia: un panel que nadie escribe conserva su tamaño original, y uno al que se escribe desde una ventana más grande se redimensiona a ella y no vuelve atrás al cambiar de selección.
+
+**Pendientes (no abordados):**
+- **B2, ancho de caracteres:** los caracteres anchos y los combinados desalinean el cursor y las columnas, porque el snapshot omite la celda de continuación y la GUI cuenta caracteres. Solución propuesta: que `Run` lleve su ancho en columnas y emitir cada carácter ancho en un span de ancho fijo.
+- **B6, tamaño del snapshot:** con una pantalla de 74×267 y un color por celda, cada snapshot pesa unos 2,25 MB, y la GUI lo pide 20 veces por segundo aunque no cambie. Solución propuesta: un contador de generación que el lector incremente en cada escritura y un `Snapshot { since }` que responda «sin cambios»; además, `skip_serializing_if` para los valores por defecto.

@@ -2,6 +2,7 @@
 
 mod claude;
 mod env;
+mod pi;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -108,7 +109,7 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Hook { .. } => std::process::exit(claude::run_hook()),
+        Cmd::Hook { agent } => std::process::exit(claude::run_hook(*agent)),
         Cmd::Hooks { action } => return claude::hooks_command(action),
         Cmd::Env { action } => return env::run(action),
         _ => {}

@@ -6,7 +6,7 @@ Investigación: 21-11-2026. Localmente se consultaron `--help`, versiones y arch
 
 `crates/galgo-proto/src/lib.rs` define `HookEvent`: `prompt_submitted`, `working`, `idle`, `blocked`, `turn_ended` y `failed`. El daemon los interpreta según el panel: `turn_ended` puede entregar un resultado al manager; no equivale simplemente a `idle`. Es importante no producir dos resultados por un `galgo done` explícito seguido de eventos de herramientas/finalización.
 
-**Hoy solo existe `galgo hook claude`.** `Agent` en `crates/galgo-cli/src/claude.rs` solo acepta `Claude`; `galgo hook --help` confirma `[possible values: claude]`. El instalador `galgo hooks install claude` modifica settings de Claude, no los de los agentes siguientes. El hook Claude lee JSON por stdin, busca `GALGO_PANE`, conecta al socket sin arrancar el daemon, recorta resúmenes, no imprime stdout y retorna 0. Los ejemplos `galgo hook pi|opencode|codex` de abajo son **diseños propuestos, no comandos funcionales hoy**: requieren añadir los adaptadores y definir explícitamente sus payloads. Mantener el mismo comportamiento silencioso y tolerante a fallos, sin ejecutar shell con texto del usuario.
+**Implementados: `galgo hook claude` y `galgo hook pi`.** El instalador de Claude modifica settings de Claude; PI instala una extensión separada. Ambos leen JSON por stdin, buscan `GALGO_PANE`, conectan al socket sin arrancar el daemon, recortan resúmenes, no imprimen stdout y retornan 0. Los ejemplos `galgo hook opencode|codex` son **propuestas no implementadas**.
 
 Fuentes: [PI: extensiones](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md), también leída en la instalación 1.5.2; [OpenCode: plugins](https://opencode.ai/docs/plugins/), [construcción](https://opencode.ai/docs/build/plugins/) y [server](https://opencode.ai/docs/build/plugins/server/); [Codex: hooks](https://developers.openai.com/codex/hooks/) y [referencia de configuración](https://developers.openai.com/codex/config-reference/). La validez de cada integración en una sesión interactiva real queda **no verificada**.
 
@@ -24,19 +24,24 @@ Fuentes: [PI: extensiones](https://github.com/earendil-works/pi/blob/main/packag
 | `agent_settled` | `turn_ended` o `failed` | Es la frontera final; `agent_end` y `turn_end` pueden preceder reintentos, compactación o continuaciones. `agent_settled` expone `aborted`, pero clasificación exacta de fallo y extracción del último mensaje: **no verificadas**. No declarar éxito ante error/abort sin resolverlo. |
 | estado inicial sin ejecución | `idle` | Obtener `ctx.isIdle()` en `session_start`; no convertir automáticamente cada `agent_end` en idle. |
 
-Ejemplo mínimo **propuesto**, `~/.pi/agent/extensions/galgo.ts`. API `pi.on`/`pi.exec` documentada; el payload y `galgo hook pi` requieren implementación en galgo. Se usa shell solo para un literal fijo, no para contenido del agente:
+**Implementación:** `galgo hooks install pi --yes` escribe `$HOME/.pi/agent/extensions/galgo.ts`, sin tocar settings ni extensiones ajenas; `--dry-run`, `status` y `uninstall` están disponibles. Un archivo ajeno existente se respalda como `galgo.ts.galgo-bak` y se restaura al desinstalar; un respaldo previo impide reemplazar un archivo ajeno. Se rechazan symlinks. Solo se admite `--scope user`. Para aplicar cambios en PI usar `/reload` o reiniciar.
 
-```ts
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-export default function (pi: ExtensionAPI) {
-  pi.on("agent_start", async () => {
-    if (!process.env.GALGO_PANE) return;
-    await pi.exec("sh", ["-c", `printf '%s\\n' '{"type":"agent_start"}' | galgo hook pi >/dev/null 2>&1 || true`], { timeout: 1000 });
-  });
-}
+PI 1.5.2 documenta `pi.exec` con timeout pero no una opción para enviar stdin; la extensión usa `node:child_process.spawn` directamente, sin shell, con stdin canalizado, stdout/stderr descartados, timeout de 1 s y envíos ordenados. La ruta del ejecutable se fija al instalar; reinstalar si cambia. Payload JSON de `galgo hook pi`:
+
+| `type` | Campos | Mapeo |
+|---|---|---|
+| `session_start` | `idle`: boolean | `idle` o `working` |
+| `before_agent_start` | `messageType`: `user` o `custom` | solo `user` → `prompt_submitted` |
+| `agent_start` | — | `working` |
+| `ui_prompt_start` | `title`: texto opcional | `blocked` |
+| `ui_prompt_end` | — | `working`, solo si la extensión considera activo el agente |
+| `agent_settled` | `outcome`: `completed`, `failed` o `unknown`; `summary` y `error`: textos opcionales | `turn_ended`, `failed` o `idle`, respectivamente |
+
+La extensión observa `agent_end` para capturar el último mensaje assistant; solo emite resultado en `agent_settled`. `stopReason=stop` significa `completed`; `error`, `aborted` o `event.aborted` significan `failed`; otro caso es `unknown` y no entrega éxito. Esto es conservador: la semántica en retries, diálogos best-effort y sesiones reales sigue requiriendo validación. Ejemplo de payload directo (solo dentro de un panel):
+
+```sh
+printf '%s\\n' '{"type":"agent_start"}' | galgo hook pi
 ```
-
-Este ejemplo solo informa `working`; faltan los demás eventos y el tratamiento de errores/resumen. PI carga TypeScript con jiti. El callback no debe colgar el ciclo del agente; comprobar timeout, orden de envío y comportamiento con daemon ausente.
 
 ## OpenCode
 
@@ -99,4 +104,4 @@ El JSON original llega a stdin de `galgo hook codex` mediante el wrapper de shel
 2. **PI:** extensión aislada con `-e`, luego descubrimiento global/proyecto confiable; probar `agent_settled` con retries, compactación, abort y mensajes encolados; UI prompts anidados, resumen y errores, recarga y ausencia del daemon. Verificar que no se informe `turn_ended` prematuramente.
 3. **OpenCode:** primero resolver identidad de sesión/servidor por panel y escoger API/versiones; probar TUI local, `run`, `attach` y servidor compartido, sesiones hijas, permisos/preguntas simultáneos, `session.error` con retry y duplicados `idle/status`; solo después habilitar resultados automáticos.
 
-Para los tres: pruebas de mapeo con payloads capturados y anonimizados, sin stdout inesperado, timeout, resumen acotado, socket inexistente, permisos y preservación de configuración ajena. La instalación solo debe ser opt-in y explicar código ejecutable y riesgos; ninguna prueba anterior verifica todavía los nuevos adaptadores.
+Para los tres: pruebas de mapeo con payloads capturados y anonimizados, sin stdout inesperado, timeout, resumen acotado, socket inexistente, permisos y preservación de configuración ajena. La instalación solo debe ser opt-in y explicar código ejecutable y riesgos. Las pruebas automatizadas PI cubren el adaptador y el instalador; los flujos reales de agente siguen sin verificarse.

@@ -39,33 +39,60 @@ pub fn color(c: C) -> Option<Color> {
     Some(Color::from_rgb8(r, g, b))
 }
 
+/// Parámetro de modificador de las secuencias xterm: 1 + Shift(1) + Alt(2) + Ctrl(4).
+/// Sin modificadores vale 1 y la secuencia se escribe sin parámetro.
+fn xterm_mod(mods: Modifiers) -> u8 {
+    1 + u8::from(mods.shift()) + 2 * u8::from(mods.alt()) + 4 * u8::from(mods.control())
+}
+
 /// Bytes que se envían al PTY para una tecla; `None` si no produce nada.
 pub fn encode(key: &Key, mods: Modifiers, text: Option<&str>) -> Option<String> {
-    if let Key::Named(n) = key {
-        let seq = match n {
-            Named::Enter => "\r",
-            Named::Backspace => "\x7f",
-            Named::Tab if mods.shift() => "\x1b[Z",
-            Named::Tab => "\t",
-            Named::Escape => "\x1b",
-            Named::ArrowUp => "\x1b[A",
-            Named::ArrowDown => "\x1b[B",
-            Named::ArrowRight => "\x1b[C",
-            Named::ArrowLeft => "\x1b[D",
-            Named::Home => "\x1b[H",
-            Named::End => "\x1b[F",
-            Named::PageUp => "\x1b[5~",
-            Named::PageDown => "\x1b[6~",
-            Named::Delete => "\x1b[3~",
-            Named::Insert => "\x1b[2~",
-            Named::Space => " ",
-            _ => return text.filter(|t| !t.is_empty() && !mods.command()).map(String::from),
-        };
-        let seq = if mods.alt() && *n != Named::Space { format!("\x1b{seq}") } else { seq.to_string() };
-        return Some(seq);
-    }
+    // Cmd+tecla es de la aplicación (Cmd+V, Cmd+C…) o no tiene significado en un terminal:
+    // nunca llega al panel.
     if mods.command() {
-        return None; // atajos de la aplicación (Cmd+V…)
+        return None;
+    }
+    if let Key::Named(n) = key {
+        let m = xterm_mod(mods);
+        // Flechas, inicio, fin: `ESC [ X` sin modificadores, `ESC [ 1 ; m X` con ellos.
+        let letter = |c: char| if m > 1 { format!("\x1b[1;{m}{c}") } else { format!("\x1b[{c}") };
+        // Teclas `ESC [ n ~`, con el mismo parámetro de modificador cuando lo hay.
+        let tilde = |n: u8| if m > 1 { format!("\x1b[{n};{m}~") } else { format!("\x1b[{n}~") };
+        let seq: String = match n {
+            Named::Enter => "\r".into(),
+            Named::Backspace => "\x7f".into(),
+            Named::Tab if mods.shift() => "\x1b[Z".into(),
+            Named::Tab => "\t".into(),
+            Named::Escape => "\x1b".into(),
+            Named::Space if mods.control() => "\0".into(),
+            Named::Space => " ".into(),
+            Named::ArrowUp => letter('A'),
+            Named::ArrowDown => letter('B'),
+            Named::ArrowRight => letter('C'),
+            Named::ArrowLeft => letter('D'),
+            Named::Home => letter('H'),
+            Named::End => letter('F'),
+            Named::PageUp => tilde(5),
+            Named::PageDown => tilde(6),
+            Named::Delete => tilde(3),
+            Named::Insert => tilde(2),
+            Named::F1 => "\x1bOP".into(),
+            Named::F2 => "\x1bOQ".into(),
+            Named::F3 => "\x1bOR".into(),
+            Named::F4 => "\x1bOS".into(),
+            Named::F5 => tilde(15),
+            Named::F6 => tilde(17),
+            Named::F7 => tilde(18),
+            Named::F8 => tilde(19),
+            Named::F9 => tilde(20),
+            Named::F10 => tilde(21),
+            Named::F11 => tilde(23),
+            Named::F12 => tilde(24),
+            _ => return None,
+        };
+        // Alt delante de una tecla con nombre (salvo que la secuencia ya lleve el modificador).
+        let alt_prefix = mods.alt() && m == 1 && !matches!(n, Named::Space);
+        return Some(if alt_prefix { format!("\x1b{seq}") } else { seq });
     }
     if mods.control() {
         if let Key::Character(c) = key {
@@ -75,13 +102,25 @@ pub fn encode(key: &Key, mods: Modifiers, text: Option<&str>) -> Option<String> 
                 '[' => Some("\x1b".into()),
                 '\\' => Some("\x1c".into()),
                 ']' => Some("\x1d".into()),
+                // Ctrl+^ (en US, Ctrl+Shift+6) y Ctrl+_ / Ctrl+- / Ctrl+/ (Ctrl+Shift+- en US).
+                '^' | '6' => Some("\x1e".into()),
+                '_' | '-' | '/' => Some("\x1f".into()),
                 ' ' | '@' | '2' => Some("\0".into()),
                 _ => None,
             };
         }
     }
     let t = text.filter(|t| !t.is_empty())?;
-    Some(if mods.alt() { format!("\x1b{t}") } else { t.to_string() })
+    // Option en macOS: `text` ya trae el carácter compuesto (Option+2 en teclado español es "@").
+    // Ese carácter se envía tal cual. ESC solo antepuesto cuando `text` es la tecla base (Meta).
+    if mods.alt() {
+        if let Key::Character(base) = key {
+            if base.as_str() == t {
+                return Some(format!("\x1b{t}"));
+            }
+        }
+    }
+    Some(t.to_string())
 }
 
 #[cfg(test)]
@@ -91,6 +130,10 @@ mod tests {
 
     fn ch(c: &str) -> Key {
         Key::Character(c.into())
+    }
+
+    fn named(n: Named) -> Key {
+        Key::Named(n)
     }
 
     #[test]
@@ -116,5 +159,59 @@ mod tests {
         assert_eq!(encode(&ch("é"), none, Some("é")).as_deref(), Some("é"));
         assert_eq!(encode(&Key::Named(Named::Space), none, Some(" ")).as_deref(), Some(" "));
         assert_eq!(encode(&Key::Named(Named::Shift), Modifiers::SHIFT, None), None);
+    }
+
+    /// M1: en teclado español Option+2 llega como key "2" y text "@": va "@" sin ESC.
+    #[test]
+    fn option_envia_el_caracter_compuesto_sin_esc() {
+        assert_eq!(encode(&ch("2"), Modifiers::ALT, Some("@")).as_deref(), Some("@"));
+        // Option+´ en español: `text` es "[" y la tecla base no coincide: se envía "[" tal cual.
+        assert_eq!(encode(&ch("´"), Modifiers::ALT, Some("[")).as_deref(), Some("["));
+        // Option+b en US: text "∫" no es la tecla base: sin ESC.
+        assert_eq!(encode(&ch("b"), Modifiers::ALT, Some("∫")).as_deref(), Some("∫"));
+        // Alt con la tecla base (Meta): ESC delante.
+        assert_eq!(encode(&ch("2"), Modifiers::ALT, Some("2")).as_deref(), Some("\x1b2"));
+    }
+
+    /// B5: Ctrl+Espacio es NUL; Ctrl+/ y Ctrl+_ son \x1f; Ctrl+^ es \x1e.
+    #[test]
+    fn control_con_simbolos() {
+        assert_eq!(encode(&named(Named::Space), Modifiers::CTRL, Some(" ")).as_deref(), Some("\0"));
+        assert_eq!(encode(&ch("/"), Modifiers::CTRL, Some("/")).as_deref(), Some("\x1f"));
+        assert_eq!(encode(&ch("_"), Modifiers::CTRL | Modifiers::SHIFT, Some("_")).as_deref(), Some("\x1f"));
+        assert_eq!(encode(&ch("-"), Modifiers::CTRL | Modifiers::SHIFT, Some("_")).as_deref(), Some("\x1f"));
+        assert_eq!(encode(&ch("^"), Modifiers::CTRL | Modifiers::SHIFT, Some("^")).as_deref(), Some("\x1e"));
+    }
+
+    /// B5: F1-F12 con sus secuencias xterm.
+    #[test]
+    fn teclas_de_funcion() {
+        let none = Modifiers::empty();
+        let esperadas = [
+            (Named::F1, "\x1bOP"), (Named::F2, "\x1bOQ"), (Named::F3, "\x1bOR"), (Named::F4, "\x1bOS"),
+            (Named::F5, "\x1b[15~"), (Named::F6, "\x1b[17~"), (Named::F7, "\x1b[18~"), (Named::F8, "\x1b[19~"),
+            (Named::F9, "\x1b[20~"), (Named::F10, "\x1b[21~"), (Named::F11, "\x1b[23~"), (Named::F12, "\x1b[24~"),
+        ];
+        for (k, seq) in esperadas {
+            assert_eq!(encode(&named(k), none, None).as_deref(), Some(seq), "{k:?}");
+        }
+    }
+
+    /// B5: Cmd con teclas con nombre nunca llega al panel.
+    #[test]
+    fn cmd_con_tecla_con_nombre_es_none() {
+        for k in [Named::Enter, Named::Backspace, Named::ArrowUp, Named::Tab, Named::Escape] {
+            assert_eq!(encode(&named(k), Modifiers::LOGO, None), None, "{k:?}");
+        }
+    }
+
+    /// B5: flechas con modificadores en formato xterm `ESC [ 1 ; m X`.
+    #[test]
+    fn flechas_con_modificadores() {
+        assert_eq!(encode(&named(Named::ArrowUp), Modifiers::CTRL, None).as_deref(), Some("\x1b[1;5A"));
+        assert_eq!(encode(&named(Named::ArrowLeft), Modifiers::SHIFT, None).as_deref(), Some("\x1b[1;2D"));
+        assert_eq!(encode(&named(Named::ArrowRight), Modifiers::ALT, None).as_deref(), Some("\x1b[1;3C"));
+        assert_eq!(encode(&named(Named::Home), Modifiers::CTRL | Modifiers::SHIFT, None).as_deref(), Some("\x1b[1;6H"));
+        assert_eq!(encode(&named(Named::Delete), Modifiers::CTRL, None).as_deref(), Some("\x1b[3;5~"));
     }
 }

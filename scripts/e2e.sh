@@ -657,5 +657,107 @@ PY96
 check "offset 5 sube 5 líneas; un offset grande se recorta al historial; offset 0 vuelve en vivo" $?
 galgo kill sb96 >/dev/null 2>&1
 
+echo "97. tamaño de panel acotado: Resize y Spawn rechazan tamaños por encima del tope (M3)"
+galgo spawn t97 -- bash --norc >/dev/null
+python3 -I - "$GALGO_SOCKET" <<'PY97'
+import json, socket, sys
+def rq(m):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sys.argv[1])
+    s.sendall((json.dumps(m) + "\n").encode())
+    r = json.loads(s.makefile().readline())
+    s.close()
+    return r
+ok = (not rq({"op": "resize", "pane": "t97", "rows": 501, "cols": 80})["ok"]
+      and not rq({"op": "resize", "pane": "t97", "rows": 24, "cols": 1001})["ok"]
+      and rq({"op": "resize", "pane": "t97", "rows": 500, "cols": 1000})["ok"])
+sp = rq({"op": "spawn", "name": "big97", "cmd": ["bash"], "cwd": None, "manager": None,
+         "inject": False, "rows": 600, "cols": 80})
+ok = ok and not sp["ok"] and "demasiado grande" in (sp.get("error") or "")
+sys.exit(0 if ok else 1)
+PY97
+check "Resize y Spawn rechazan tamaños por encima del tope" $?
+
+echo "98. ocho Resize concurrentes: el PTY y la pantalla del daemon quedan del mismo tamaño (B1)"
+galgo spawn r98 -- bash --norc >/dev/null
+sleep 0.5
+python3 -I - "$GALGO_SOCKET" "$TMP/r98" <<'PY98'
+import json, os, socket, sys, threading, time
+path, out = sys.argv[1], sys.argv[2]
+def rq(m):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(path)
+    s.sendall((json.dumps(m) + "\n").encode())
+    r = json.loads(s.makefile().readline())
+    s.close()
+    return r
+bad = 0
+N, ROUNDS = 8, 200
+for i in range(ROUNDS):
+    gate = threading.Barrier(N)
+    def go(r, c):
+        gate.wait()
+        rq({"op": "resize", "pane": "r98", "rows": r, "cols": c})
+    ts = [threading.Thread(target=go, args=(20 + (i * 7 + k) % 9, 60 + (i * 5 + k) % 11)) for k in range(N)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    if os.path.exists(out): os.remove(out)
+    rq({"op": "send", "pane": "r98", "text": f"stty size > {out}", "enter": True})
+    for _ in range(100):
+        if os.path.exists(out) and open(out).read().strip(): break
+        time.sleep(0.02)
+    pty = tuple(int(x) for x in open(out).read().split())
+    d = rq({"op": "snapshot", "pane": "r98"})["data"]
+    if pty != (d["rows"], d["cols"]): bad += 1
+print(f"desajustes: {bad}/{ROUNDS}")
+sys.exit(0 if bad == 0 else 1)
+PY98
+check "ningún Resize concurrente deja el PTY y la pantalla desalineados" $?
+galgo kill r98 >/dev/null 2>&1
+
+echo "99. snapshot indica bracketed paste mientras la aplicación lo tiene activo (M2)"
+galgo spawn bp99 -- bash -c 'printf "\033[?2004h"; sleep 30' >/dev/null
+galgo spawn bq99 -- bash -c 'printf "\033[?2004h\033[?2004l"; sleep 30' >/dev/null
+sleep 0.7
+python3 -I - "$GALGO_SOCKET" <<'PY99'
+import json, socket, sys
+def snap(p):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sys.argv[1])
+    s.sendall((json.dumps({"op": "snapshot", "pane": p}) + "\n").encode())
+    d = json.loads(s.makefile().readline())["data"]
+    s.close()
+    return d
+sys.exit(0 if snap("bp99")["bracketed_paste"] is True and snap("bq99")["bracketed_paste"] is False else 1)
+PY99
+check "bracketed_paste true con modo 2004 activo, false tras desactivarlo" $?
+galgo kill bp99 >/dev/null 2>&1; galgo kill bq99 >/dev/null 2>&1
+
+echo "97. hooks PI: instalación reversible y eventos"
+HOME97="$TMP/home97"
+mkdir -p "$HOME97/.pi/agent/extensions"
+printf '%s\n' 'extensión anterior' > "$HOME97/.pi/agent/extensions/galgo.ts"
+printf '%s\n' 'herdr intacto' > "$HOME97/.pi/agent/extensions/herdr-agent-state.ts"
+HOME="$HOME97" galgo hooks install pi --yes >/dev/null && HOME="$HOME97" galgo hooks install pi --yes | grep -q 'Ya está instalado'; check "instala PI idempotentemente" $?
+[ "$(cat "$HOME97/.pi/agent/extensions/galgo.ts.galgo-bak")" = 'extensión anterior' ] && [ "$(cat "$HOME97/.pi/agent/extensions/herdr-agent-state.ts")" = 'herdr intacto' ]; check "backup y extensión ajena conservados" $?
+galgo spawn m97 -- bash --norc >/dev/null
+galgo spawn w97 --manager m97 -- bash --norc >/dev/null
+printf '%s\n' '{"type":"before_agent_start","messageType":"user"}' | GALGO_PANE=w97 galgo hook pi
+printf '%s\n' '{"type":"ui_prompt_start","title":"permiso"}' | GALGO_PANE=w97 galgo hook pi
+galgo ls | grep w97 | grep -q blocked; check "PI informa espera de permiso" $?
+printf '%s\n' '{"type":"ui_prompt_end"}' | GALGO_PANE=w97 galgo hook pi
+galgo ls | grep w97 | grep -q working; check "PI vuelve a working" $?
+printf '%s\n' '{"type":"agent_settled","outcome":"completed","summary":"resultado PI"}' | GALGO_PANE=w97 galgo hook pi
+galgo inbox --pane m97 | grep -q 'resultado PI'; check "PI entrega resultado al manager" $?
+out=$(printf '%s\n' '{"type":"agent_start"}' | env -u GALGO_PANE GALGO_SOCKET="$TMP/no-pi.sock" galgo hook pi 2>&1); rc=$?
+[ "$rc" = 0 ] && [ -z "$out" ] && [ ! -S "$TMP/no-pi.sock" ]; check "hook PI silencioso sin panel y daemon" $?
+out=$(printf '%s\n' '{"type":"agent_start"}' | GALGO_PANE=w97 GALGO_SOCKET="$TMP/no-pi.sock" galgo hook pi 2>&1); rc=$?
+[ "$rc" = 0 ] && [ -z "$out" ] && [ ! -S "$TMP/no-pi.sock" ]; check "hook PI silencioso con daemon ausente" $?
+galgo status blocked --pane m97
+GALGO_PANE=m97 PI_CODING_AGENT_DIR="$TMP/pi-config97" pi --mode rpc --no-session --offline --no-extensions -e "$HOME97/.pi/agent/extensions/galgo.ts" </dev/null >"$TMP/pi97.out" 2>"$TMP/pi97.err"
+[ $? = 0 ] && [ ! -s "$TMP/pi97.out" ] && [ ! -s "$TMP/pi97.err" ] && galgo ls | grep m97 | grep -q idle; check "PI real carga extensión y reporta session_start" $?
+HOME="$HOME97" galgo hooks uninstall pi --yes >/dev/null
+[ "$(cat "$HOME97/.pi/agent/extensions/galgo.ts")" = 'extensión anterior' ] && [ ! -e "$HOME97/.pi/agent/extensions/galgo.ts.galgo-bak" ]; check "uninstall restaura extensión previa" $?
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

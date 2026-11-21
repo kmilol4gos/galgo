@@ -35,6 +35,7 @@ const INSTALLED: &[(&str, Option<&str>)] = &[
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Agent {
     Claude,
+    Pi,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -131,14 +132,18 @@ fn notify_daemon(pane: String, event: HookEvent, summary: Option<String>) -> Res
 
 /// Punto de entrada de `galgo hook claude`. Siempre sale con 0 y no imprime nada por stdout:
 /// en UserPromptSubmit, el stdout de un hook se agrega al contexto de Claude.
-pub fn run_hook() -> i32 {
+pub fn run_hook(agent: Agent) -> i32 {
     let Ok(pane) = std::env::var("GALGO_PANE") else { return 0 };
     let mut input = String::new();
     if !std::io::stdin().is_terminal() {
         let _ = std::io::stdin().read_to_string(&mut input);
     }
     let payload = serde_json::from_str::<Value>(&input).unwrap_or(Value::Null);
-    let Some((event, summary)) = map_event(&payload) else { return 0 };
+    let mapped = match agent {
+        Agent::Claude => map_event(&payload),
+        Agent::Pi => crate::pi::map_event(&payload),
+    };
+    let Some((event, summary)) = mapped else { return 0 };
     if let Err(e) = notify_daemon(pane, event, summary) {
         if std::env::var_os("GALGO_DEBUG").is_some() {
             eprintln!("galgo hook: {e:#}");
@@ -290,7 +295,7 @@ fn read_settings(path: &Path) -> Result<Value> {
     }
 }
 
-fn confirm(question: &str) -> Result<bool> {
+pub(crate) fn confirm(question: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!("hace falta confirmar: ejecuta de nuevo con --yes");
     }
@@ -341,6 +346,9 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
 
 pub fn hooks_command(cmd: &HooksCmd) -> Result<()> {
     match cmd {
+        HooksCmd::Install { agent: Agent::Pi, scope, yes, dry_run } => crate::pi::install_command(*scope, *yes, *dry_run)?,
+        HooksCmd::Uninstall { agent: Agent::Pi, scope, yes } => crate::pi::uninstall_command(*scope, *yes)?,
+        HooksCmd::Status { agent: Agent::Pi, scope } => crate::pi::status_command(*scope)?,
         HooksCmd::Install { agent: Agent::Claude, scope, yes, dry_run } => {
             let path = settings_path(*scope)?;
             let mut settings = read_settings(&path)?;

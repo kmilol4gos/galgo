@@ -1,5 +1,6 @@
 use galgo_proto::{client, PaneInfo, Request, Status};
 use iced::{widget::{button, column, container, row, scrollable, text, Space}, Color, Element, Font, Length, Task, Theme};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const BG: Color = Color::from_rgb(0.059, 0.067, 0.082);
@@ -40,20 +41,77 @@ fn terminal_font() -> Font {
     Font::with_name("Menlo")
 }
 
-/// Todas las peticiones de teclado y resize pasan por un solo hilo: el orden de las teclas importa.
+/// Último error de envío que el hilo de `outbox` no pudo entregar. La GUI lo muestra.
+fn outbox_error() -> &'static Mutex<Option<String>> {
+    static ERR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    ERR.get_or_init(|| Mutex::new(None))
+}
+
+/// Fusiona los `Send` consecutivos del mismo panel mientras el anterior no lleve Enter. El orden se
+/// conserva: un Enter cierra la fusión y queda como último tramo.
+fn coalesce(batch: Vec<Request>) -> Vec<Request> {
+    let mut out: Vec<Request> = Vec::with_capacity(batch.len());
+    for req in batch {
+        let merged = match (out.last_mut(), &req) {
+            (
+                Some(Request::Send { pane: p0, text: t0, enter: e0 }),
+                Request::Send { pane: p1, text: t1, enter: e1 },
+            ) if !*e0 && *p0 == *p1 => {
+                t0.push_str(t1);
+                *e0 = *e1;
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            out.push(req);
+        }
+    }
+    out
+}
+
+/// Todas las peticiones de teclado, pegado y resize pasan por un solo hilo: el orden importa.
+/// Lo que esperaba en la cola se envía junto, fusionado cuando es posible.
 fn outbox() -> &'static mpsc::Sender<Request> {
     static TX: OnceLock<mpsc::Sender<Request>> = OnceLock::new();
     TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Request>();
         std::thread::spawn(move || {
-            for req in rx {
-                if let Err(e) = request(req) {
-                    eprintln!("galgo-gui: {e}");
+            while let Ok(first) = rx.recv() {
+                let mut batch = vec![first];
+                while let Ok(next) = rx.try_recv() {
+                    batch.push(next);
+                }
+                for req in coalesce(batch) {
+                    if let Err(e) = request(req) {
+                        *outbox_error().lock().unwrap() = Some(e);
+                    }
                 }
             }
         });
         tx
     })
+}
+
+/// Texto que se envía al pegar. Con bracketed paste activo se envuelve en `ESC[200~ … ESC[201~` y se
+/// quita del texto cualquier `ESC[201~` (cerraría el pegado antes de tiempo). Sin él, se quitan los ESC.
+fn paste_bytes(text: &str, bracketed: bool) -> String {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        format!("\x1b[200~{}\x1b[201~", text.replace("\x1b[201~", ""))
+    } else {
+        text.replace('\x1b', "")
+    }
+}
+
+/// Decide si la entrada se envía ya o se guarda tras un pegado pendiente, para no adelantarse a él.
+fn route_input(app: &mut App, bytes: String) -> Option<String> {
+    if app.paste_pending {
+        app.key_queue.push(bytes);
+        None
+    } else {
+        Some(bytes)
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +131,10 @@ struct App {
     sel: Option<Selection>,
     dragging: bool,
     pointer: Option<Point>,
+    /// Hay un pegado pedido al portapapeles que aún no ha llegado.
+    paste_pending: bool,
+    /// Teclas que llegaron mientras tanto; se envían después del pegado.
+    key_queue: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,21 +245,35 @@ fn grid_cell(app: &App, p: Point) -> Option<Cell> {
     pixel_to_cell(p.x, p.y, (snap.rows, snap.cols))
 }
 
-fn fit_size(app: &mut App) {
-    let Some(id) = app.selected else { return };
+/// Petición de `Resize` para el panel seleccionado, si la ventana cambió desde el último envío.
+/// Solo se llama al escribir en un panel o al redimensionar la ventana: mirar un panel no cambia su tamaño.
+fn size_request(app: &mut App) -> Option<Request> {
+    let id = app.selected?;
     let (rows, cols) = grid_for(app.window);
-    if app.size_sent != Some((id, rows, cols)) {
-        app.size_sent = Some((id, rows, cols));
-        let _ = outbox().send(Request::Resize { pane: id.to_string(), rows, cols });
+    if app.size_sent == Some((id, rows, cols)) {
+        return None;
+    }
+    app.size_sent = Some((id, rows, cols));
+    Some(Request::Resize { pane: id.to_string(), rows, cols })
+}
+
+fn resize_if_needed(app: &mut App) {
+    if let Some(req) = size_request(app) {
+        let _ = outbox().send(req);
     }
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
-        Message::TickScreen => match app.selected {
-            Some(id) if !app.loading => { app.loading = true; load_screen(id, app.scroll) }
-            _ => Task::none(),
-        },
+        Message::TickScreen => {
+            if let Some(e) = outbox_error().lock().unwrap().take() {
+                app.error = Some(format!("no se envió: {e}"));
+            }
+            match app.selected {
+                Some(id) if !app.loading => { app.loading = true; load_screen(id, app.scroll) }
+                _ => Task::none(),
+            }
+        }
         Message::TickList if !app.listing => { app.listing = true; load_panes() }
         Message::TickList => Task::none(),
         Message::Panes(result) => {
@@ -210,7 +286,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.selected = None; app.snap = None; app.sel = None; app.scroll = 0;
                     }
                     if app.selected.is_none() {
-                        if let Some(p) = app.panes.first() { app.selected = Some(p.id); fit_size(app); }
+                        if let Some(p) = app.panes.first() { app.selected = Some(p.id); }
                     }
                 }
                 Err(e) => app.error = Some(e),
@@ -233,14 +309,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Select(id) => {
-            app.selected = Some(id); app.snap = None; app.sel = None; app.scroll = 0; fit_size(app);
+            app.selected = Some(id); app.snap = None; app.sel = None; app.scroll = 0;
             if app.loading { Task::none() } else { app.loading = true; load_screen(id, 0) }
         }
         Message::Event(Event::Window(iced::window::Event::Resized(size))) => {
-            app.window = (size.width, size.height); fit_size(app); Task::none()
+            app.window = (size.width, size.height); resize_if_needed(app); Task::none()
         }
         Message::Event(Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })) => {
             if modifiers.command() && matches!(&key, Key::Character(c) if c.as_str() == "v") {
+                app.paste_pending = true;
                 return iced::clipboard::read().map(Message::Paste);
             }
             if modifiers.command() && matches!(&key, Key::Character(c) if c.as_str() == "c") {
@@ -252,12 +329,16 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             if let Some(bytes) = term::encode(&key, modifiers, text.as_deref()) {
                 back_to_live(app);
-                send_text(app, bytes);
+                // Escribir en un panel lo redimensiona a la ventana, si hace falta.
+                resize_if_needed(app);
+                if let Some(bytes) = route_input(app, bytes) {
+                    send_text(app, bytes);
+                }
             }
             Task::none()
         }
         Message::Event(Event::Window(iced::window::Event::Opened { size, .. })) => {
-            app.window = (size.width, size.height); fit_size(app); Task::none()
+            app.window = (size.width, size.height); resize_if_needed(app); Task::none()
         }
         Message::Event(Event::Mouse(mouse::Event::WheelScrolled { delta })) => {
             let lines = match delta {
@@ -303,12 +384,20 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Event(_) => Task::none(),
-        Message::Paste(Some(t)) => {
-            back_to_live(app);
-            send_text(app, t.replace("\r\n", "\r").replace('\n', "\r"));
+        Message::Paste(text) => {
+            app.paste_pending = false;
+            let bracketed = app.snap.as_ref().is_some_and(|s| s.bracketed_paste);
+            if let Some(t) = text.filter(|t| !t.is_empty()) {
+                back_to_live(app);
+                resize_if_needed(app);
+                send_text(app, paste_bytes(&t, bracketed));
+            }
+            // Las teclas que llegaron durante el pegado van ahora, detrás de él.
+            for bytes in std::mem::take(&mut app.key_queue) {
+                send_text(app, bytes);
+            }
             Task::none()
         }
-        Message::Paste(None) => Task::none(),
     }
 }
 
@@ -455,6 +544,7 @@ mod tests {
             lines: lines.iter().map(|l| vec![run(l)]).collect(),
             scrollback: 0,
             scrollback_max: 0,
+            bracketed_paste: false,
         }
     }
 
@@ -508,5 +598,56 @@ mod tests {
         assert_eq!(selected_cols(sel, 2, 10), Some((0, 9)));
         assert_eq!(selected_cols(sel, 3, 10), Some((0, 2)));
         assert_eq!(selected_cols(sel, 4, 10), None);
+    }
+
+    #[test]
+    fn pegado_con_y_sin_bracketed_paste() {
+        assert_eq!(paste_bytes("uno\ndos", true), "\x1b[200~uno\rdos\x1b[201~");
+        // Un ESC[201~ dentro del texto no puede cerrar el pegado antes de tiempo.
+        assert_eq!(paste_bytes("a\x1b[201~b", true), "\x1b[200~ab\x1b[201~");
+        // Sin bracketed paste no hay envoltorio, y los ESC del texto se quitan.
+        assert_eq!(paste_bytes("uno\ndos", false), "uno\rdos");
+        assert_eq!(paste_bytes("a\x1b[2Jb", false), "a[2Jb");
+    }
+
+    #[test]
+    fn fusion_de_envios_consecutivos_del_mismo_panel() {
+        let send = |p: &str, t: &str, e: bool| Request::Send { pane: p.into(), text: t.into(), enter: e };
+        let batch = vec![
+            send("1", "a", false),
+            send("1", "b", false),
+            send("2", "c", false),
+            send("2", "", true),
+            send("2", "d", false),
+        ];
+        let out = coalesce(batch);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(&out[0], Request::Send { pane, text, enter: false } if pane == "1" && text == "ab"));
+        assert!(matches!(&out[1], Request::Send { pane, text, enter: true } if pane == "2" && text == "c"));
+        assert!(matches!(&out[2], Request::Send { pane, text, enter: false } if pane == "2" && text == "d"));
+    }
+
+    #[test]
+    fn el_tamano_se_envia_al_escribir_o_redimensionar_no_al_mirar() {
+        let mut app = App { window: (1100.0, 700.0), selected: Some(1), ..Default::default() };
+        // Mirar (seleccionar) no pide nada: no hay petición hasta que se escribe o se redimensiona.
+        assert!(app.size_sent.is_none());
+        // Primera escritura en el panel 1: se redimensiona una vez.
+        assert!(matches!(size_request(&mut app), Some(Request::Resize { ref pane, .. }) if pane == "1"));
+        assert!(size_request(&mut app).is_none());
+        // Cambiar de panel sin escribir no envía nada; escribir en el 2 sí.
+        app.selected = Some(2);
+        assert!(app.size_sent.is_some());
+        assert!(matches!(size_request(&mut app), Some(Request::Resize { ref pane, .. }) if pane == "2"));
+    }
+
+    #[test]
+    fn las_teclas_esperan_detras_de_un_pegado_pendiente() {
+        let mut app = App { paste_pending: true, ..Default::default() };
+        assert_eq!(route_input(&mut app, "x".into()), None);
+        assert_eq!(route_input(&mut app, "y".into()), None);
+        assert_eq!(app.key_queue, vec!["x".to_string(), "y".to_string()]);
+        app.paste_pending = false;
+        assert_eq!(route_input(&mut app, "z".into()), Some("z".into()));
     }
 }
