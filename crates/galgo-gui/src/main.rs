@@ -149,7 +149,8 @@ struct App {
     loading: bool,
     listing: bool,
     window: (f32, f32),
-    size_sent: Option<(u32, u16, u16)>,
+    /// Último tamaño (filas, columnas) enviado o confirmado por panel (M3: cada panel del layout tiene el suyo).
+    sizes: std::collections::HashMap<u32, (u16, u16)>,
     /// Líneas hacia atrás que se piden al daemon (0 = en vivo).
     scroll: u16,
     /// Fracción de líneas de la rueda que aún no suma un paso completo.
@@ -883,6 +884,9 @@ fn focus_origin(app: &App) -> (f32, f32) {
 
 /// Panel visible bajo el puntero, si hay alguno.
 fn leaf_at(app: &App, p: Point) -> Option<u32> {
+    if body_mode(app) != Body::Screen {
+        return None;
+    }
     let key = app.selected.and_then(|id| app.layouts.key_of(id))?;
     let tab = app.layouts.active_tab(&key)?;
     tab.root.rects(terminal_area_for(app)).into_iter().find(|(_, r)| p.x >= r.x && p.y >= r.y && p.x < r.x + r.w && p.y < r.y + r.h).map(|(id, _)| id)
@@ -926,9 +930,18 @@ fn inside_grid(origin: (f32, f32), x: f32, y: f32, grid: (u16, u16)) -> bool {
     x >= ox && y >= oy && x < ox + grid.1 as f32 * CELL_W && y < oy + grid.0 as f32 * LINE_H
 }
 
+/// M4: el puntero cuenta para el terminal solo si está dentro del rectángulo del panel enfocado (y de su cuadrícula),
+/// y solo si no hay una vista superpuesta.
 fn pointer_in_grid(app: &App) -> bool {
+    if body_mode(app) != Body::Screen {
+        return false;
+    }
+    let rect = app.selected.and_then(|id| pane_rect(app, id)).unwrap_or_else(|| terminal_area_for(app));
     match (app.pointer, shown(app)) {
-        (Some(p), Some(s)) => inside_grid(focus_origin(app), p.x, p.y, (s.rows, s.cols)),
+        (Some(p), Some(s)) => {
+            p.x >= rect.x && p.y >= rect.y && p.x < rect.x + rect.w && p.y < rect.y + rect.h
+                && inside_grid(focus_origin(app), p.x, p.y, (s.rows, s.cols))
+        }
         _ => false,
     }
 }
@@ -979,18 +992,26 @@ fn selection_text(snap: &Snapshot, sel: Selection) -> String {
 
 /// Petición de `Resize` para el panel seleccionado, si la ventana cambió desde el último envío.
 /// Solo se llama al escribir en un panel o al redimensionar la ventana: mirar un panel no cambia su tamaño.
-fn size_request(app: &mut App) -> Option<Request> {
-    let id = app.selected?;
-    let (rows, cols) = pane_rect(app, id).map(grid_in).unwrap_or_else(|| grid_for(app.window));
-    if app.size_sent == Some((id, rows, cols)) {
-        return None;
+/// M3: el tamaño de cada panel de la pestaña visible es el de su rectángulo. Devuelve el `Resize` de los que
+/// cambiaron desde el último envío. Un fantasma (sin PTY) rechaza el `Resize` en el daemon y esa respuesta se descarta.
+fn layout_resizes(app: &mut App) -> Vec<Request> {
+    let Some(key) = focus_key(app) else { return Vec::new() };
+    let Some(tab) = app.layouts.active_tab(&key) else { return Vec::new() };
+    let rects = tab.root.rects(terminal_area_for(app));
+    let mut out = Vec::new();
+    for (id, rect) in rects {
+        let grid = grid_in(rect);
+        if app.sizes.get(&id) != Some(&grid) {
+            app.sizes.insert(id, grid);
+            out.push(Request::Resize { pane: id.to_string(), rows: grid.0, cols: grid.1 });
+        }
     }
-    app.size_sent = Some((id, rows, cols));
-    Some(Request::Resize { pane: id.to_string(), rows, cols })
+    out
 }
 
+/// Envía los `Resize` pendientes del layout (llamado desde el tick de pantalla y al escribir o cambiar la ventana).
 fn resize_if_needed(app: &mut App) {
-    if let Some(req) = size_request(app) {
+    for req in layout_resizes(app) {
         let _ = outbox().send(req);
     }
 }
@@ -1038,6 +1059,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             if let Some(e) = outbox_error().lock().unwrap().take() {
                 app.error = Some(format!("no se envió: {e}"));
             }
+            // M3: los paneles del layout se redimensionan a su rectángulo cuando cambia (split, cierre, ventana).
+            resize_if_needed(app);
             let focus_task = match app.selected {
                 Some(id) if !app.loading => {
                     app.loading = true;
@@ -1123,7 +1146,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             match serde_json::from_value::<PaneInfo>(data) {
                 Ok(p) => {
                     let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
-                    app.size_sent = Some((p.id, rows, cols));
+                    app.sizes.insert(p.id, (rows, cols));
                     app.panes.push(p.clone());
                     // Un split coloca el panel junto al enfocado; si no, nace en su pestaña.
                     if let Some((focus, vertical)) = app.pending_split.take() {
@@ -1249,7 +1272,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             match serde_json::from_value::<PaneInfo>(data) {
                 Ok(p) => {
                     let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
-                    app.size_sent = Some((p.id, rows, cols));
+                    app.sizes.insert(p.id, (rows, cols));
                     app.panes.push(p.clone());
                     let task = select(app, p.id);
                     Task::batch([task, load_panes()])
@@ -1448,6 +1471,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) => {
+            // M4: con una vista superpuesta (paleta, formulario, lanzador, nuevo workspace) el ratón no llega al terminal.
+            if body_mode(app) != Body::Screen {
+                return Task::none();
+            }
             // Un clic en otro panel visible le da el foco; el arrastre empieza en el siguiente clic dentro de él.
             if let Some(id) = app.pointer.and_then(|p| leaf_at(app, p)) {
                 if app.selected != Some(id) {
@@ -1566,7 +1593,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 Ok(p) => {
                     // El panel nace con el tamaño de la ventana: no hace falta otro Resize.
                     let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
-                    app.size_sent = Some((p.id, rows, cols));
+                    app.sizes.insert(p.id, (rows, cols));
                     app.panes.push(p.clone());
                     let task = select(app, p.id);
                     Task::batch([task, load_panes()])
@@ -1943,7 +1970,8 @@ mod tests {
     /// aunque lleguen líneas nuevas.
     #[test]
     fn la_seleccion_no_se_mueve_con_la_salida_nueva() {
-        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        // Con un panel seleccionado, la vista es la del terminal (M4: fuera de ella el ratón no cuenta).
+        let mut app = App { window: (1100.0, 700.0), panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
         app.snap = Some(snap(&["aaaa", "bbbb"], 4));
         app.pointer = Some(Point::new(center(0, 0).0, center(0, 0).1));
         let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))));
@@ -1998,14 +2026,14 @@ mod tests {
     fn el_tamano_se_envia_al_escribir_o_redimensionar_no_al_mirar() {
         let mut app = App { window: (1100.0, 700.0), selected: Some(1), ..Default::default() };
         // Mirar (seleccionar) no pide nada: no hay petición hasta que se escribe o se redimensiona.
-        assert!(app.size_sent.is_none());
-        // Primera escritura en el panel 1: se redimensiona una vez.
-        assert!(matches!(size_request(&mut app), Some(Request::Resize { ref pane, .. }) if pane == "1"));
-        assert!(size_request(&mut app).is_none());
-        // Cambiar de panel sin escribir no envía nada; escribir en el 2 sí.
-        app.selected = Some(2);
-        assert!(app.size_sent.is_some());
-        assert!(matches!(size_request(&mut app), Some(Request::Resize { ref pane, .. }) if pane == "2"));
+        assert!(app.sizes.is_empty());
+        // M3: el panel 1 (sin split) se redimensiona a su rectángulo una vez; luego nada cambia.
+        let mut p1 = pane_info(1, "uno", Status::Idle);
+        p1.workspace = Some("w".into());
+        app.panes = vec![p1];
+        app.layouts.sync(&pane_keys(&app));
+        assert!(matches!(layout_resizes(&mut app).as_slice(), [Request::Resize { pane, .. }] if pane == "1"));
+        assert!(layout_resizes(&mut app).is_empty());
     }
 
     #[test]
@@ -2139,7 +2167,7 @@ mod tests {
         app.window = (1600.0, 1000.0);
         let data = serde_json::to_value(pane_info(7, "w", Status::Idle)).unwrap();
         let _ = update(&mut app, Message::Spawned(Ok(data)));
-        assert_eq!(app.size_sent, Some((7, pedido.0, pedido.1)));
+        assert_eq!(app.sizes.get(&7), Some(&pedido));
     }
 
     /// B1: tras un fallo de conexión no se confía en la generación guardada.
@@ -2513,5 +2541,45 @@ mod tests {
         let mut app = App { panes: vec![pane_info(3, "viejo", Status::Done)], selected: Some(3), ..Default::default() };
         let _ = update(&mut app, Message::CloseFocused);
         assert!(!app.confirm_close, "terminado: no pregunta");
+    }
+
+    /// r13 M3: al dividir, el panel original se redimensiona a su mitad (no se queda con toda la ventana).
+    #[test]
+    fn r13_split_no_redimensiona_el_original() {
+        let mut uno = pane_info(1, "uno", Status::Idle);
+        uno.workspace = Some("r/main".into());
+        let mut app = App { panes: vec![uno], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        let _ = layout_resizes(&mut app);
+        let _ = update(&mut app, Message::SplitFocused(true));
+        let mut dos = pane_info(2, "dos", Status::Idle);
+        dos.workspace = Some("r/main".into());
+        let _ = update(&mut app, Message::PaneLaunched(Ok(serde_json::to_value(dos).unwrap())));
+        let envios = layout_resizes(&mut app);
+        let mitad = grid_in(layout::halves(terminal_area_for(&app), true).0);
+        assert_eq!(app.sizes.get(&1), Some(&mitad), "el original cabe en su mitad");
+        assert!(envios.iter().any(|r| matches!(r, Request::Resize { pane, .. } if pane == "1")), "{envios:?}");
+    }
+
+    /// r13 M4: la rueda y el clic sobre el panel vecino no actúan sobre el enfocado; con la paleta abierta, el clic no
+    /// llega al terminal.
+    #[test]
+    fn r13_rueda_y_clic_no_van_al_panel_de_al_lado() {
+        let mut uno = pane_info(1, "uno", Status::Idle);
+        uno.workspace = Some("r/main".into());
+        let mut dos = pane_info(2, "dos", Status::Idle);
+        dos.workspace = Some("r/main".into());
+        let mut app = App { panes: vec![uno, dos], selected: Some(1), window: (1100.0, 700.0), snap: Some(snap(&["x"; 40], 120)), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        app.layouts.split(1, true, 2);
+        app.layouts.sync(&pane_keys(&app));
+        let (_, derecha) = layout::halves(terminal_area_for(&app), true);
+        let punto = Point::new(derecha.x + derecha.w / 2.0, derecha.y + derecha.h / 2.0);
+        app.pointer = Some(punto);
+        assert_eq!(leaf_at(&app, punto), Some(2));
+        assert!(!pointer_in_grid(&app), "la rueda sobre el vecino no desplaza al enfocado");
+        app.palette = Some(String::new());
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))));
+        assert_eq!(app.selected, Some(1), "con la paleta abierta el clic no cambia el foco");
     }
 }
