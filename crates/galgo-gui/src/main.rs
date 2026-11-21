@@ -362,8 +362,12 @@ fn successor(app: &App, id: u32) -> Option<u32> {
 }
 
 /// Workspace n-ésimo (0 = primero) en el orden de la barra lateral; se selecciona su primer panel.
-fn workspace_at(panes: &[PaneInfo], n: usize) -> Option<u32> {
-    sidebar::workspaces(panes).get(n).and_then(|w| w.panes.first()).map(|p| p.id)
+/// M5: el panel que enfoca Cmd+n es el de la pestaña activa de ese workspace; sin layout, el primero.
+fn workspace_at(panes: &[PaneInfo], layouts: &layout::Layouts, n: usize) -> Option<u32> {
+    let ws = sidebar::workspaces(panes).into_iter().nth(n)?;
+    let key = ws.label.clone().unwrap_or_default();
+    let activo = layouts.active_tab(&key).map(|t| t.focus).filter(|f| ws.panes.iter().any(|p| p.id == *f));
+    activo.or_else(|| ws.panes.first().map(|p| p.id))
 }
 
 /// Siguiente panel, en orden de la lista y dando la vuelta, que necesita atención (insignia visible).
@@ -1165,7 +1169,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             app.error = Some(e);
             Task::none()
         }
-        Message::SelectWorkspaceAt(n) => match workspace_at(&app.panes, n) {
+        Message::SelectWorkspaceAt(n) => match workspace_at(&app.panes, &app.layouts, n) {
             Some(id) => select(app, id),
             None => Task::none(),
         },
@@ -2278,9 +2282,9 @@ mod tests {
         c.workspace = Some("repo/main".into());
         let panes = vec![a, b, c];
         // El orden es el de la barra lateral: alfabético por workspace (otro/dev antes que repo/main).
-        assert_eq!(workspace_at(&panes, 0), Some(2), "otro/dev va primero");
-        assert_eq!(workspace_at(&panes, 1), Some(1), "repo/main, con su primer panel");
-        assert_eq!(workspace_at(&panes, 2), None);
+        assert_eq!(workspace_at(&panes, &layout::Layouts::default(), 0), Some(2), "otro/dev va primero");
+        assert_eq!(workspace_at(&panes, &layout::Layouts::default(), 1), Some(1), "repo/main, con su primer panel");
+        assert_eq!(workspace_at(&panes, &layout::Layouts::default(), 2), None);
     }
 
     /// B: Cmd+Shift+U recorre los paneles que necesitan atención, dando la vuelta.
@@ -2581,5 +2585,23 @@ mod tests {
         app.palette = Some(String::new());
         let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))));
         assert_eq!(app.selected, Some(1), "con la paleta abierta el clic no cambia el foco");
+    }
+
+    /// r13 M5: Cmd+1 vuelve a la pestaña activa del workspace, no a su primer panel.
+    #[test]
+    fn r13_cmd1_vuelve_a_la_primera_pestana() {
+        let panes: Vec<PaneInfo> = (1..=3)
+            .map(|i| {
+                let mut p = pane_info(i, &format!("p{i}"), Status::Idle);
+                p.workspace = Some("w".into());
+                p
+            })
+            .collect();
+        let mut app = App { panes, window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        let _ = update(&mut app, Message::Select(3));
+        assert_eq!(app.layouts.active_tab("w").unwrap().focus, 3);
+        let _ = update(&mut app, Message::SelectWorkspaceAt(0));
+        assert_eq!(app.selected, Some(3), "se queda en la pestaña activa, no en el panel 1");
     }
 }
