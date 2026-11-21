@@ -137,6 +137,8 @@ struct Daemon {
     socket: PathBuf,
     orphan_secs: u64,
     retry: Duration,
+    /// Tiempo máximo para escribir una respuesta; un cliente que no lee no bloquea la entrega.
+    write_timeout: Duration,
 }
 
 /// Libera un nombre reservado si el spawn falla antes de crear el panel.
@@ -312,10 +314,19 @@ impl Daemon {
                 }
             }
             // El hijo se recolecta aquí, sin candados: no queda <defunct> y sabemos cómo terminó.
+            // Antes de recolectar al hijo, el panel queda marcado como terminado: un kill que llegue
+            // ahora ya no le envía señales, así que nunca actúa sobre un pid recolectado.
+            d.mark_closed(id);
             let code = child.wait().ok().map(|s| s.exit_code());
             d.on_exit(id, code);
         });
         Ok(id)
+    }
+
+    fn mark_closed(&self, id: u32) {
+        if let Some(p) = self.state.lock().unwrap().panes.get_mut(&id) {
+            p.exited = true;
+        }
     }
 
     /// El proceso del panel terminó. Siempre queda `exited` (conservando el último resumen).
@@ -664,30 +675,27 @@ impl Daemon {
                 Ok(json!({}))
             }
             Request::Kill { pane } => {
-                let (id, pid) = {
+                let pid = {
                     let mut st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
                     let p = st.panes.get_mut(&id).unwrap();
                     if p.exited {
                         bail!("el panel {} ya terminó", p.name);
                     }
+                    // Con el candado tomado y `exited` en falso, el hijo todavía no está recolectado.
                     if let Err(e) = p.killer.kill() {
                         if e.raw_os_error() == Some(ESRCH) {
                             bail!("el panel {} ya terminó", p.name);
                         }
                         return Err(e.into());
                     }
-                    (id, p.pid)
+                    p.pid
                 };
-                // SIGHUP no basta para quien lo ignora: si sigue vivo tras una espera breve,
-                // SIGKILL al grupo de procesos. Con el candado tomado, el proceso no está recolectado.
+                // SIGHUP no basta para quien lo ignora, ni para los trabajos que una shell puso en
+                // otro grupo de la misma sesión. Tras una espera breve, SIGKILL a toda la sesión.
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let st = self.state.lock().unwrap();
-                if let (Some(p), Some(pid)) = (st.panes.get(&id), pid) {
-                    if !p.exited {
-                        Command::new("kill").args(["-KILL", "--", &format!("-{pid}")]).status()?;
-                    }
-                }
+                let Some(sid) = pid else { return Ok(json!({})) };
+                tokio::task::spawn_blocking(move || kill_session(sid as i32)).await?;
                 Ok(json!({}))
             }
             Request::Shutdown => {
@@ -711,6 +719,31 @@ impl Daemon {
     }
 }
 
+/// Pids de la sesión `sid`. El PTY hace líder de sesión al hijo, así que su sid es su pid.
+fn session_pids(sid: i32) -> Vec<i32> {
+    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid="]).output() else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse::<i32>().ok())
+        .filter(|&pid| unsafe { libc::getsid(pid) } == sid)
+        .collect()
+}
+
+/// SIGKILL a cada proceso de la sesión `sid`, salvo el propio daemon. Alcanza también a los
+/// trabajos de una shell que están en otro grupo de procesos.
+fn kill_session(sid: i32) {
+    let me = unsafe { libc::getpid() };
+    for pid in session_pids(sid) {
+        if pid == me {
+            continue;
+        }
+        // Se comprueba de nuevo justo antes: un pid recién liberado podría ser de otra sesión.
+        if unsafe { libc::getsid(pid) } == sid {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
 async fn serve(d: Arc<Daemon>, stream: UnixStream) {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
@@ -727,13 +760,15 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
         let (resp, ack) = match serde_json::from_str::<Request>(&line) {
             Ok(req) if matches!(req, Request::Wait { .. }) => {
                 let mut fut = std::pin::pin!(d.dispatch(req));
+                let mut read_open = true;
                 let (res, ack) = loop {
                     tokio::select! {
                         out = &mut fut => break out,
-                        next = lines.next_line() => match next {
+                        next = lines.next_line(), if read_open => match next {
                             Ok(Some(l)) => queued.push_back(l),
-                            // Solo una espera se cancela con el EOF: el cliente ya no la espera.
-                            _ => return,
+                            // Cerrar la lectura no es irse: el cliente puede seguir esperando su
+                            // respuesta (shutdown(SHUT_WR)). Una desconexión total se nota al escribir.
+                            _ => read_open = false,
                         },
                     }
                 };
@@ -748,7 +783,11 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
         };
         let mut out = serde_json::to_string(&resp).unwrap();
         out.push('\n');
-        let written = w.write_all(out.as_bytes()).await.is_ok();
+        // Un cliente que no lee no puede bloquear la entrega para siempre.
+        let written = matches!(
+            tokio::time::timeout(d.write_timeout, w.write_all(out.as_bytes())).await,
+            Ok(Ok(()))
+        );
         if let Some((pane, msg)) = ack {
             if written {
                 d.confirm(pane, msg);
@@ -785,6 +824,7 @@ async fn main() -> Result<()> {
         socket: socket.clone(),
         orphan_secs: env_u64("GALGO_ORPHAN_SECS", 30),
         retry: Duration::from_secs(env_u64("GALGO_RETRY_SECS", 60)),
+        write_timeout: Duration::from_secs(env_u64("GALGO_WRITE_TIMEOUT_SECS", 10)),
     });
     eprintln!("galgod escuchando en {}", socket.display());
 

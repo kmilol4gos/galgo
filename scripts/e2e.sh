@@ -440,5 +440,121 @@ PY55
 grep -q '^rapidas$' "$TMP/55-result" 2>/dev/null; check "respuestas rápidas en orden y antes del wait" $?
 grep -q '^wait$' "$TMP/55-result" 2>/dev/null; check "wait responde tras completar el worker" $?
 
+echo "70. EOF cancela wait y conserva el resultado"
+galgo spawn m70 -- bash --norc >/dev/null
+galgo spawn w70 --manager m70 -- bash --norc >/dev/null
+GALGO_PANE=m70 python3 - <<'PY70'
+import json, subprocess, time
+p = subprocess.Popen(['galgo-mcp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+p.stdin.write((json.dumps({'jsonrpc':'2.0','id':70,'method':'tools/call','params':{'name':'galgo_wait','arguments':{'target':'w70','timeout_secs':15}}})+'\n').encode()); p.stdin.flush()
+time.sleep(.5); start = time.monotonic(); p.stdin.close()
+try:
+    p.wait(timeout=2)
+    assert time.monotonic()-start < 2
+    assert p.stdout.read() == b''
+    subprocess.run(['galgo','done','--pane','w70','--summary','resultado70'], check=True)
+    time.sleep(.3)
+    assert b'resultado70' in subprocess.check_output(['galgo','inbox','--pane','m70'])
+finally:
+    if p.poll() is None: p.kill(); p.wait()
+PY70
+check "EOF cancela sin confirmar" $?
+
+echo "71. id duplicado se rechaza sin cancelar el wait original"
+galgo spawn m71 -- bash --norc >/dev/null
+galgo spawn w71 --manager m71 -- bash --norc >/dev/null
+GALGO_PANE=m71 python3 - <<'PY71'
+import json, os, select, subprocess, time
+p = subprocess.Popen(['galgo-mcp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def send(x): p.stdin.write((json.dumps(x)+'\n').encode()); p.stdin.flush()
+def recv():
+    assert select.select([p.stdout],[],[],3)[0], 'sin respuesta'
+    return json.loads(p.stdout.readline())
+try:
+    send({'jsonrpc':'2.0','id':71,'method':'tools/call','params':{'name':'galgo_wait','arguments':{'target':'w71','timeout_secs':15}}})
+    time.sleep(.3)
+    send({'jsonrpc':'2.0','id':71,'method':'ping'})
+    assert recv()['error']['code'] == -32600
+    subprocess.run(['galgo','done','--pane','w71','--summary','resultado71'], check=True)
+    r = recv(); assert r['id'] == 71 and not r['result']['isError']
+finally:
+    p.kill(); p.wait()
+PY71
+check "duplicado rechazado y wait original responde" $?
+
+echo "60. wait con shutdown(SHUT_WR): el cliente recibe el resultado"
+galgo spawn m60 -- bash --norc >/dev/null
+galgo spawn w60 --manager m60 -- bash --norc >/dev/null
+( sleep 1; galgo send w60 'galgo done --summary "tarde60"' ) & P60=$!
+python3 -I - "$GALGO_SOCKET" > "$TMP/r60" 2>&1 <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"op": "wait", "waiter": "m60", "target": "w60", "timeout_secs": 10}) + "\n").encode())
+s.shutdown(socket.SHUT_WR)
+print(s.makefile().readline())
+PY
+wait $P60
+grep -q '"ok":true' "$TMP/r60" && grep -q "tarde60" "$TMP/r60"; check "el cliente recibe el resultado tardío" $?
+
+echo "61. wait y ack en la misma conexión con shutdown(SHUT_WR): ambas respondidas"
+galgo spawn m61 -- bash --norc >/dev/null
+galgo spawn w61 --manager m61 -- bash --norc >/dev/null
+galgo spawn x61 --manager m61 -- bash --norc >/dev/null
+galgo send w61 'galgo done --summary "previo61"'
+sleep 0.5
+M61=$(galgo --json inbox --pane m61 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+( sleep 1; galgo send x61 'galgo done --summary "tarde61"' ) & P61=$!
+python3 -I - "$GALGO_SOCKET" "$M61" > "$TMP/r61" 2>&1 <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"op": "wait", "waiter": "m61", "target": "x61", "timeout_secs": 10}) + "\n").encode())
+s.sendall((json.dumps({"op": "ack", "pane": "m61", "msg": int(sys.argv[2])}) + "\n").encode())
+s.shutdown(socket.SHUT_WR)
+f = s.makefile()
+print(f.readline())
+print(f.readline())
+PY
+wait $P61
+[ "$(grep -c '"ok":true' "$TMP/r61")" = "2" ]; check "ambas solicitudes respondidas" $?
+galgo inbox --pane m61 | grep -q previo61; [ $? -ne 0 ]; check "el ack se ejecutó" $?
+
+echo "62. kill mata los trabajos de la sesión que ignoran SIGHUP"
+galgo spawn j62 -- bash --norc >/dev/null
+galgo send j62 "trap '' HUP; sleep 301 & echo \$! > $TMP/sl62; wait"
+sleep 0.7
+S62=$(cat "$TMP/sl62")
+galgo kill j62 >/dev/null 2>&1
+sleep 1
+! kill -0 "$S62" 2>/dev/null; check "ningún sleep 301 queda vivo" $?
+kill -9 "$S62" 2>/dev/null
+
+echo "63. respuesta que el cliente no lee: vence y libera el mensaje"
+mkdir -p "$TMP/s63"
+G63="$TMP/s63/g.sock"
+GALGO_SOCKET=$G63 GALGO_WRITE_TIMEOUT_SECS=2 galgo spawn m63 -- bash --norc >/dev/null
+GALGO_SOCKET=$G63 galgo spawn w63 --manager m63 -- bash --norc >/dev/null
+python3 -I - "$G63" > /dev/null 2>&1 <<'PY' & P63=$!
+import json, socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"op": "wait", "waiter": "m63", "target": "w63", "timeout_secs": 20}) + "\n").encode())
+time.sleep(6)
+PY
+sleep 0.5
+python3 -I - "$G63" <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"op": "done", "pane": "w63", "summary": "x" * 1000000, "failed": False}) + "\n").encode())
+s.makefile().readline()
+PY
+sleep 3
+GALGO_SOCKET=$G63 galgo --json wait w63 --pane m63 --timeout 5 > "$TMP/o63" 2>&1
+grep -q '"delivered"' "$TMP/o63"; check "tras vencer la escritura, el mensaje vuelve a entregarse" $?
+kill "$P63" 2>/dev/null; wait "$P63" 2>/dev/null
+GALGO_SOCKET=$G63 galgo stop >/dev/null 2>&1
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

@@ -185,6 +185,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "galgo-proto",
+ "libc",
  "portable-pty",
  "serde_json",
  "tokio",
