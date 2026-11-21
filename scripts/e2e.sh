@@ -9,9 +9,12 @@ export GALGO_SOCKET="$TMP/galgo.sock"
 export GALGO_ORPHAN_SECS=1 GALGO_RETRY_SECS=2
 pass=0
 fail=0
+skipped=0
 
 check() { # descripción, código de salida
-  if [ "$2" = "0" ]; then echo "  ok    $1"; pass=$((pass + 1)); else echo "  FALLA $1"; fail=$((fail + 1)); fi
+  if [ "$2" = "0" ]; then echo "  ok    $1"; pass=$((pass + 1));
+  elif [ "$2" = "77" ]; then echo "  omitido $1 (falta el programa)"; skipped=$((skipped + 1));
+  else echo "  FALLA $1"; fail=$((fail + 1)); fi
 }
 cleanup() { galgo stop >/dev/null 2>&1; rm -rf "$TMP"; }
 trap cleanup EXIT
@@ -754,8 +757,10 @@ out=$(printf '%s\n' '{"type":"agent_start"}' | env -u GALGO_PANE GALGO_SOCKET="$
 out=$(printf '%s\n' '{"type":"agent_start"}' | GALGO_PANE=w97 GALGO_SOCKET="$TMP/no-pi.sock" galgo hook pi 2>&1); rc=$?
 [ "$rc" = 0 ] && [ -z "$out" ] && [ ! -S "$TMP/no-pi.sock" ]; check "hook PI silencioso con daemon ausente" $?
 galgo status blocked --pane m97
+if command -v pi >/dev/null 2>&1; then
 GALGO_PANE=m97 PI_CODING_AGENT_DIR="$TMP/pi-config97" pi --mode rpc --no-session --offline --no-extensions -e "$HOME97/.pi/agent/extensions/galgo.ts" </dev/null >"$TMP/pi97.out" 2>"$TMP/pi97.err"
 [ $? = 0 ] && [ ! -s "$TMP/pi97.out" ] && [ ! -s "$TMP/pi97.err" ] && galgo ls | grep m97 | grep -q idle; check "PI real carga extensión y reporta session_start" $?
+else check "PI real carga extensión y reporta session_start" 77; fi
 HOME="$HOME97" galgo hooks uninstall pi --yes >/dev/null
 [ "$(cat "$HOME97/.pi/agent/extensions/galgo.ts")" = 'extensión anterior' ] && [ ! -e "$HOME97/.pi/agent/extensions/galgo.ts.galgo-bak" ]; check "uninstall restaura extensión previa" $?
 
@@ -781,6 +786,8 @@ printf '%s\n' '{"hook_event_name":"Stop","last_assistant_message":"duplicado ine
 ! galgo inbox --pane m98 | grep -q 'duplicado inesperado'; check "Codex Stop no duplica galgo done" $?
 galgo status blocked --pane z98
 HOME98="$HOME98" python3 -I - "$GALGO_SOCKET" <<'PY98'
+import shutil, sys
+if not shutil.which('codex'): sys.exit(77)
 import http.server, json, os, pathlib, subprocess, sys, threading
 home = pathlib.Path(os.environ['HOME98'])
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -893,5 +900,5 @@ PY110
 check "unchanged mientras no hay cambios; escritura y resize suben la generación; tramos compactos" $?
 galgo kill gp110 >/dev/null 2>&1
 
-echo "resultado: $pass ok, $fail con falla"
+echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]
