@@ -94,3 +94,60 @@ fn zstd_fixture_and_errors_are_safe() {
     let mut t=UsageTracker::new(); t.track("p",Agent::Codex,"s",&path); let u=t.poll("p").unwrap(); assert_eq!(u.input,10); assert_eq!(u.context_pct,Some(12.0)); assert_eq!(t.poll("p").unwrap().input,10);
     fs::write(&path,"no es zstd SECRET").unwrap(); assert!(t.poll("p").is_some()); assert_eq!(t.last_error("p"),Some("zstd no pudo descomprimir la fuente de uso")); assert!(!t.last_error("p").unwrap().contains("SECRET"));
 }
+
+/// Fixture sintético con el id real de modelo (`claude-sonnet-5-5`). Coste a mano:
+/// (1000·2 + 500·0,10 + 200·10 + 100·2,50) / 10⁶ = 0,0043 $ (fila «Sonnet 5.5» de prices.toml).
+#[test]
+fn claude_sonnet_55_extrae_modelo_contexto_y_precio_de_lista() {
+    let dir = Temp::new(); let path = dir.file("sonnet.jsonl");
+    let a = r#"{"type":"assistant","isSidechain":false,"requestId":"req-s1","message":{"id":"msg-s1","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":500,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}"#;
+    append(&path, &format!("{a}\n"));
+    let mut t = UsageTracker::new(); t.track("p", Agent::Claude, "s", &path);
+    let u = t.poll("p").unwrap();
+    assert_eq!(u.model.as_deref(), Some("claude-sonnet-5-5"));
+    assert_eq!(u.cost_source, CostSource::ListPrice);
+    close(u.cost_usd.unwrap(), 0.0043);
+    // Contexto en tokens absolutos, sin ventana inventada.
+    assert_eq!(u.context_tokens, Some(1600));
+    assert_eq!(u.context_window, None);
+    assert_eq!(u.context_pct, None);
+}
+
+/// Un modelo sin fila verificada conserva su nombre, pero su coste queda desconocido (no se inventa).
+#[test]
+fn modelo_sin_precio_verificado_muestra_id_sin_coste() {
+    let dir = Temp::new(); let path = dir.file("sonnet5.jsonl");
+    let a = r#"{"type":"assistant","isSidechain":false,"requestId":"r","message":{"id":"m","model":"claude-sonnet-5","usage":{"input_tokens":10,"output_tokens":1}}}"#;
+    append(&path, &format!("{a}\n"));
+    let mut t = UsageTracker::new(); t.track("p", Agent::Claude, "s", &path);
+    let u = t.poll("p").unwrap();
+    assert_eq!(u.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(u.cost_usd, None);
+    assert_eq!(u.cost_source, CostSource::Unknown);
+}
+
+/// Un mensaje posterior de un modelo desconocido no borra el modelo conocido del panel.
+#[test]
+fn modelo_desconocido_no_borra_el_ultimo_conocido() {
+    let dir = Temp::new(); let path = dir.file("mixto.jsonl");
+    let a = r#"{"type":"assistant","isSidechain":false,"requestId":"r1","message":{"id":"m1","model":"claude-sonnet-5-5","usage":{"input_tokens":10,"output_tokens":1}}}"#;
+    let b = r#"{"type":"assistant","isSidechain":false,"requestId":"r2","message":{"id":"m2","model":"modelo-nuevo-9","usage":{"input_tokens":10,"output_tokens":1}}}"#;
+    append(&path, &format!("{a}\n{b}\n"));
+    let mut t = UsageTracker::new(); t.track("p", Agent::Claude, "s", &path);
+    let u = t.poll("p").unwrap();
+    assert_eq!(u.model.as_deref(), Some("claude-sonnet-5-5"));
+    assert_eq!(u.cost_usd, None, "un precio desconocido hace desconocido el coste total");
+}
+
+/// Un id de modelo con caracteres raros se descarta; la línea sigue contando tokens y no se marca parcial.
+#[test]
+fn id_de_modelo_mal_formado_se_descarta_sin_invalidar_la_linea() {
+    let dir = Temp::new(); let path = dir.file("raro.jsonl");
+    let a = r#"{"type":"assistant","isSidechain":false,"requestId":"r1","message":{"id":"m1","model":"<script> x","usage":{"input_tokens":7,"output_tokens":1}}}"#;
+    append(&path, &format!("{a}\n"));
+    let mut t = UsageTracker::new(); t.track("p", Agent::Claude, "s", &path);
+    let u = t.poll("p").unwrap();
+    assert_eq!(u.model, None);
+    assert_eq!(u.input, 7);
+    assert!(!u.partial);
+}

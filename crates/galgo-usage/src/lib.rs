@@ -40,7 +40,8 @@ struct Accum {
 impl Accum {
     fn new(agent: Agent) -> Self { Self { usage: PaneUsage { agent: agent.name().into(), model: None, input: 0, cache_read: 0, cache_write: 0, cache_write_5m: 0, cache_write_1h: 0, output: 0, reasoning: 0, cost_usd: None, cost_source: CostSource::Unknown, context_tokens: None, context_window: None, context_pct: None, updated_secs: 0, partial: false }, model: Model::Unknown, seen: HashSet::new(), last_codex: None, cost_valid: true, limits: None, updated: None } }
     fn partial(&mut self) { self.usage.partial = true; self.cost_valid = false; self.usage.cost_usd = None; self.usage.cost_source = CostSource::Unknown; }
-    fn model(&mut self, model: Option<Model>) { if let Some(m) = model { self.model = m; self.usage.model = m.name().map(str::to_owned); } }
+    /// Un modelo desconocido no borra el último conocido: un mensaje raro no deja el panel sin modelo.
+    fn model(&mut self, model: Option<Model>) { if let Some(m) = model.filter(|m| *m != Model::Unknown) { self.model = m; self.usage.model = m.name().map(str::to_owned); } }
     fn cost(&mut self, cost: Option<f64>, source: CostSource) {
         if cost.is_none_or(|v| !v.is_finite() || v < 0.0) { self.cost_valid = false; }
         if self.cost_valid { self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost.unwrap()); self.usage.cost_source = source; }
@@ -53,7 +54,7 @@ impl Accum {
                 if event.kind != Kind::Assistant { return; }
                 let Some(msg) = event.message else { return }; let Some(u) = msg.usage else { return };
                 if event.sidechain == Some(false) {
-                    self.model(msg.model);
+                    if let Some(id) = &msg.model { self.usage.model = Some(id.0.clone()); }
                     self.usage.context_tokens = Some(u.input_tokens.saturating_add(u.cache_read_input_tokens).saturating_add(u.cache_creation_input_tokens));
                     self.usage.context_window = None; self.usage.context_pct = None;
                 }
@@ -67,7 +68,7 @@ impl Accum {
                 let c = u.cache_creation.unwrap_or_default();
                 self.usage.cache_write_5m = self.usage.cache_write_5m.saturating_add(c.ephemeral_5m_input_tokens);
                 self.usage.cache_write_1h = self.usage.cache_write_1h.saturating_add(c.ephemeral_1h_input_tokens);
-                let price = msg.model.and_then(prices::price).and_then(|p| {
+                let price = msg.model.as_ref().and_then(|m| prices::price_id(&m.0)).and_then(|p| {
                     if u.speed.is_some_and(|s| s != Speed::Standard) || u.inference_geo.is_some_and(|g| g != Geo::Global)
                         || u.server_tool_use.is_some_and(|t| t.web_search_requests > 0 || t.web_fetch_requests > 0) { return None; }
                     if c.ephemeral_5m_input_tokens.saturating_add(c.ephemeral_1h_input_tokens) != u.cache_creation_input_tokens { return None; }

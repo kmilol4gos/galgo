@@ -1302,5 +1302,32 @@ assert json.load(open(sys.argv[2]))['previous']['command']=='cat'
 PY132B
 check "uninstall conserva edición y respaldo previo" $?
 env -u GALGO_PANE galgo statusline claude < "$TMP/statusline130-input" | grep -qx galgo; check "sin comando previo ofrece línea propia" $?
+echo "137. uso de Claude con el id real claude-sonnet-5-5: modelo y coste de lista; contexto en tokens, sin porcentaje"
+mkdir -p "$TMP/c137" && chmod 700 "$TMP/c137"
+export GALGO_SOCKET="$TMP/c137/g.sock"
+TR137="$TMP/c137/sonnet.jsonl"
+printf '%s\n' '{"type":"assistant","isSidechain":false,"requestId":"r1","message":{"id":"m1","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":500,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}' > "$TR137"
+galgo spawn t137 -- bash --norc >/dev/null
+rpc() { python3 -c 'import json,socket,sys,os
+s=socket.socket(socket.AF_UNIX); s.connect(os.environ["GALGO_SOCKET"]); s.sendall((sys.argv[1]+"\n").encode()); buf=b""
+while not buf.endswith(b"\n"):
+    d=s.recv(65536)
+    if not d: break
+    buf+=d
+print(buf.decode().strip())' "$1"; }
+rpc "{\"op\":\"hook\",\"pane\":\"t137\",\"event\":\"working\",\"summary\":null,\"source\":{\"agent\":\"claude\",\"session_id\":\"s137\",\"transcript\":\"$TR137\"}}" | grep -q '"ok":true'; check "el hook con el transcript sintético se acepta" $?
+sleep 2.5
+galgo --json ls | python3 -c 'import json,sys
+u=[x for x in json.load(sys.stdin) if x["name"]=="t137"][0]["usage"]
+assert u["model"]=="claude-sonnet-5-5", u["model"]
+assert u["cost_source"]=="list_price" and abs(u["cost_usd"]-0.0043)<1e-9, (u["cost_source"], u["cost_usd"])
+assert u["context_tokens"]==1600 and u["context_pct"] is None and u["context_window"] is None, u'
+check "modelo, coste de lista (0,0043 \$) y contexto sin ventana inventada" $?
+galgo usage --pane t137 | grep -qF "claude-sonnet-5-5"; check "galgo usage muestra el modelo" $?
+galgo usage --pane t137 | grep -qF "1600"; [ $? -ne 0 ]; check "galgo usage muestra el contexto en tokens (1,6k), no en porcentaje" $?
+galgo usage --by model | grep -qF "claude-sonnet-5-5"; check "galgo usage --by model agrupa por el id real" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+export GALGO_SOCKET="$TMP/galgo.sock"
+
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

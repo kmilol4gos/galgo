@@ -67,8 +67,19 @@ pub struct ClaudeUsage {
     #[serde(default)] pub inference_geo: Option<Geo>,
     #[serde(default)] pub server_tool_use: Option<ServerTools>,
 }
+/// Id de modelo de Claude tal como lo escribe el agente. Solo se guardan ids de una lista cerrada: cualquier
+/// otro texto se descarta (no se conserva nada que no se conozca), sin invalidar la línea.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelId(pub String);
+const CLAUDE_MODEL_IDS: [&str; 7] = [
+    "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5", "claude-haiku-4-5", "claude-fable-5-2",
+];
+fn model_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ModelId>, D::Error> {
+    let raw: Option<String> = Option::deserialize(d)?;
+    Ok(raw.filter(|s| CLAUDE_MODEL_IDS.contains(&s.as_str())).map(ModelId))
+}
 #[derive(Debug, Deserialize)]
-pub struct ClaudeMessage { pub id: Option<Id>, pub model: Option<Model>, pub usage: Option<ClaudeUsage> }
+pub struct ClaudeMessage { pub id: Option<Id>, #[serde(default, deserialize_with="model_id")] pub model: Option<ModelId>, pub usage: Option<ClaudeUsage> }
 #[derive(Debug, Deserialize)]
 pub struct ClaudeLine {
     #[serde(rename="type")] pub kind: Kind,

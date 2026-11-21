@@ -22,7 +22,9 @@ cache_read = 0.50
 output = 25.0
 [[price]]
 model = "Sonnet 5.5"
-id_verified = false
+# id observado en un transcript real de Claude Code (2026-11-21), el mismo que escribe `message.model`.
+api_ids = ["claude-sonnet-5-5"]
+id_verified = true
 source_url = "https://platform.claude.com/docs/en/about-claude/pricing"
 checked = "2026-11-21"
 input = 2.0
