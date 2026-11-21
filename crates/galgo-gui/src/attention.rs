@@ -80,30 +80,6 @@ impl Attention {
     }
 }
 
-/// Resumen de atención de un grupo de paneles: "2 bloqueado(s) · 1 sin leer · 1 sin confirmar". Vacío si
-/// ninguno pide atención.
-pub fn group_summary(group: &[&PaneInfo], attention: &Attention) -> String {
-    let (mut blocked, mut unread, mut orphan) = (0, 0, 0);
-    for p in group {
-        match badge(p, attention.is_unread(p.id)) {
-            Some(Badge::Blocked) => blocked += 1,
-            Some(Badge::DoneUnread) => unread += 1,
-            Some(Badge::Orphan) => orphan += 1,
-            None => {}
-        }
-    }
-    let mut parts = Vec::new();
-    if blocked > 0 {
-        parts.push(format!("{blocked} bloqueado(s)"));
-    }
-    if unread > 0 {
-        parts.push(format!("{unread} sin leer"));
-    }
-    if orphan > 0 {
-        parts.push(format!("{orphan} sin confirmar"));
-    }
-    parts.join(" · ")
-}
 
 /// Título de la ventana: "galgo" o "galgo (N)" cuando N paneles piden atención.
 pub fn window_title(count: usize) -> String {
@@ -238,8 +214,5 @@ mod tests {
         let p2 = pane(2, "y", Status::Blocked);
         let mut p3 = pane(3, "z", Status::Idle);
         p3.orphan = true;
-        assert_eq!(group_summary(&[&p1, &p2], &a), "1 bloqueado(s) · 1 sin leer");
-        assert_eq!(group_summary(&[&p3], &a), "1 sin confirmar");
-        assert_eq!(group_summary(&[&pane(4, "w", Status::Idle)], &a), "");
     }
 }

@@ -1,14 +1,11 @@
 use galgo_proto::{client, PaneInfo, Request, Status};
-use iced::{widget::{button, column, container, lazy, pick_list, progress_bar, row, scrollable, text, text_input, Space}, Color, Element, Font, Length, Task, Theme};
+use iced::{widget::{column, container, lazy, pick_list, progress_bar, row, scrollable, text, text_input, Space}, Color, Element, Font, Length, Task};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const BG: Color = Color::from_rgb(0.059, 0.067, 0.082);
-const SURFACE: Color = Color::from_rgb(0.083, 0.094, 0.113);
-const TEXT: Color = Color::from_rgb(0.906, 0.914, 0.937);
-const MUTED: Color = Color::from_rgb(0.60, 0.64, 0.70);
+use theme::{status_color, BG, MUTED, SIDEBAR, TEXT};
 
 mod attention;
 mod launch;
@@ -18,6 +15,7 @@ mod palette;
 mod recents;
 mod sidebar;
 mod term;
+mod theme;
 mod usage;
 
 use attention::{Alert, Attention, Badge};
@@ -487,20 +485,20 @@ fn first_match(app: &App) -> Option<String> {
 
 fn welcome_view(app: &App) -> Element<'_, Message> {
     let mut col = column![
-        text("Empieza un workspace").size(26),
-        text("Un workspace es una carpeta de trabajo: sus terminales y agentes viven en ella.").size(13).color(MUTED),
-        button(text("Abrir carpeta…   (Cmd+N)").size(15)).width(Length::Fill).padding(12).on_press(Message::PickFolder),
-        button(text("Nuevo terminal en el inicio").size(15)).width(Length::Fill).padding(12).on_press(Message::OpenFolder(home_dir())),
+        text("Empieza un workspace").size(22).color(TEXT),
+        text("Un workspace es una carpeta de trabajo: sus terminales y agentes viven en ella.").size(theme::BODY_SIZE).color(MUTED),
+        theme::btn_primary(text("Abrir carpeta…   (Cmd+N)").size(theme::BODY_SIZE)).width(Length::Fill).padding([10, 12]).on_press(Message::PickFolder),
+        theme::btn_secondary(text("Nuevo terminal en el inicio").size(theme::BODY_SIZE)).width(Length::Fill).padding([10, 12]).on_press(Message::OpenFolder(home_dir())),
     ]
-    .spacing(12)
+    .spacing(theme::GAP)
     .max_width(480);
     if let Some(last) = app.recents.first() {
         col = col.push(
-            button(text(format!("Reabrir lo último: {last}")).size(13)).width(Length::Fill).padding(10).on_press(Message::OpenFolder(last.clone())),
+            theme::btn_secondary(text(format!("Reabrir lo último: {last}")).size(theme::SMALL_SIZE)).width(Length::Fill).padding([8, 12]).on_press(Message::OpenFolder(last.clone())),
         );
     }
     for p in app.recents.iter().skip(1).take(4) {
-        col = col.push(button(text(p.as_str()).size(12).color(MUTED)).width(Length::Fill).padding(8).on_press(Message::OpenFolder(p.clone())));
+        col = col.push(theme::btn(text(p.as_str()).size(theme::SMALL_SIZE).color(MUTED)).width(Length::Fill).padding([6, 10]).on_press(Message::OpenFolder(p.clone())));
     }
     container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
 }
@@ -515,26 +513,22 @@ fn sidebar_tree_view<'a>(app: &'a App, mut list: iced::widget::Column<'a, Messag
         }
     }
     for project in sidebar::tree(&app.panes) {
-        list = list.push(text(project.name.clone()).size(14).color(MUTED));
+        list = list.push(text(project.name.to_uppercase()).size(theme::SMALL_SIZE).color(theme::DIM));
         for ws in project.workspaces {
             let key = ws.label.clone().unwrap_or_default();
             let folded = app.collapsed.contains(&key);
             let arrow = if folded { "▸" } else { "▾" };
             // Estados y atención del workspace; luego el coste total, si hay uso medido.
             let mut detail = sidebar::status_summary(&ws.panes);
-            let attention_note = attention::group_summary(&ws.panes, &app.attention);
-            if !attention_note.is_empty() {
-                detail = if detail.is_empty() { attention_note } else { format!("{detail} · {attention_note}") };
-            }
             if let Some(total) = usage::group_total(&ws.panes) {
                 detail = if detail.is_empty() { total } else { format!("{detail} · {total}") };
             }
             let head = column![text(format!("{arrow} {}", ws.name)).size(13), text(detail).size(11).color(MUTED)].spacing(2);
             list = list.push(
-                button(container(head).width(Length::Fill).padding([6, 8]))
+                theme::btn(container(head).width(Length::Fill).padding([6, 8]))
                     .width(Length::Fill)
                     .on_press(Message::ToggleGroup(key))
-                    .style(|_, _| button::Style { background: None, text_color: TEXT, ..Default::default() }),
+                    .style(theme::row(false)),
             );
             if !folded {
                 for pane in ws.panes {
@@ -546,19 +540,21 @@ fn sidebar_tree_view<'a>(app: &'a App, mut list: iced::widget::Column<'a, Messag
     list
 }
 
-/// Barra de pestañas del workspace enfocado, con «+», y los botones de dividir.
+/// Barra de pestañas del workspace enfocado: planas, con la activa subrayada; y los botones de dividir.
 fn tabs_bar(app: &App) -> Element<'_, Message> {
-    let mut bar = row![].spacing(6).align_y(iced::Alignment::Center).height(TABS_H);
+    let mut bar = row![].spacing(theme::GAP).align_y(iced::Alignment::Center).height(TABS_H);
     if let Some(ws) = focus_key(app).and_then(|k| app.layouts.by_key.get(&k)) {
         for (i, tab) in ws.tabs.iter().enumerate() {
             let name = app.panes.iter().find(|p| p.id == tab.focus).map_or("?", |p| p.name.as_str());
-            let marca = if i == ws.active { "▸ " } else { "" };
-            bar = bar.push(button(text(format!("{marca}{}  {name}", i + 1)).size(12)).padding([4, 10]).on_press(Message::SelectTab(i)));
+            let active = i == ws.active;
+            let label = text(format!("{}  {name}", i + 1)).size(theme::BODY_SIZE).color(if active { TEXT } else { MUTED });
+            let underline = container(Space::new(Length::Fill, Length::Fixed(2.0))).width(Length::Fill).style(theme::tab_underline(active));
+            bar = bar.push(column![theme::btn(label).padding([4, 8]).on_press(Message::SelectTab(i)), underline].width(Length::Shrink));
         }
     }
-    bar = bar.push(button(text("+").size(12)).padding([4, 10]).on_press(Message::NewTab));
-    bar = bar.push(button(text("Dividir →").size(12)).padding([4, 10]).on_press(Message::SplitFocused(true)));
-    bar = bar.push(button(text("Dividir ↓").size(12)).padding([4, 10]).on_press(Message::SplitFocused(false)));
+    bar = bar.push(theme::btn(text("+").size(theme::BODY_SIZE).color(MUTED)).padding([4, 8]).on_press(Message::NewTab));
+    bar = bar.push(theme::btn(text("Dividir →").size(theme::SMALL_SIZE).color(MUTED)).padding([4, 8]).on_press(Message::SplitFocused(true)));
+    bar = bar.push(theme::btn(text("Dividir ↓").size(theme::SMALL_SIZE).color(MUTED)).padding([4, 8]).on_press(Message::SplitFocused(false)));
     bar.into()
 }
 
@@ -586,7 +582,8 @@ fn node_view<'a>(app: &'a App, node: &'a layout::Node) -> Element<'a, Message> {
     }
 }
 
-/// Un panel: el enfocado con su vista congelada y su cursor; los demás, con la última pantalla que llegó.
+/// Un panel: el enfocado con su vista congelada y su cursor; los demás, con la última pantalla que llegó. El borde
+/// fino es el divisor del split; con el foco, del color de acento.
 fn leaf_view(app: &App, id: u32) -> Element<'_, Message> {
     let focused = app.selected == Some(id);
     let inner: Element<'_, Message> = if focused {
@@ -605,17 +602,12 @@ fn leaf_view(app: &App, id: u32) -> Element<'_, Message> {
             None => text("Esperando salida…").size(14).color(MUTED).into(),
         }
     };
-    let borde = if focused { Color::from_rgb(0.30, 0.45, 0.80) } else { Color::TRANSPARENT };
     container(inner)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(10)
         .clip(true)
-        .style(move |_| container::Style {
-            background: Some(term::DEFAULT_BG.into()),
-            border: iced::Border { color: borde, width: 1.0, radius: 6.0.into() },
-            ..Default::default()
-        })
+        .style(theme::leaf(focused))
         .into()
 }
 
@@ -652,18 +644,28 @@ fn palette_input_id() -> iced::widget::text_input::Id {
     iced::widget::text_input::Id::new("paleta")
 }
 
-/// Paleta: búsqueda arriba y resultados debajo; el resaltado se mueve con las flechas y se ejecuta con Enter.
+/// Paleta: búsqueda arriba y resultados debajo. El resaltado es una fila con fondo y una marca de acento; los atajos
+/// van a la derecha, en gris.
 fn palette_view(app: &App) -> Element<'_, Message> {
     let query = app.palette.as_deref().unwrap_or("");
     let results = palette_results(app);
-    let mut list = column![].spacing(4);
-    for (i, item) in results.iter().enumerate().take(12) {
-        let marca = if i == app.palette_cursor { "▸ " } else { "   " };
-        let line = row![text(format!("{marca}{}", item.label)).size(14), Space::with_width(Length::Fill), text(item.detail.clone()).size(11).color(MUTED)];
-        list = list.push(button(line).width(Length::Fill).padding(8).on_press(Message::PaletteRun(i)));
+    let mut list = column![].spacing(2);
+    for (i, item) in results.iter().enumerate().take(PALETTE_VISIBLE) {
+        let cursor = i == app.palette_cursor;
+        let marca = text(if cursor { "▸" } else { " " }).size(theme::BODY_SIZE).color(theme::ACCENT);
+        let keys = item.detail.starts_with("Cmd");
+        let line = row![
+            marca,
+            text(item.label.clone()).size(theme::BODY_SIZE).color(TEXT),
+            Space::with_width(Length::Fill),
+            text(item.detail.clone()).size(theme::SMALL_SIZE).color(if keys { theme::DIM } else { MUTED }),
+        ]
+        .spacing(theme::GAP)
+        .align_y(iced::Alignment::Center);
+        list = list.push(theme::btn(line).width(Length::Fill).padding([7, 10]).on_press(Message::PaletteRun(i)).style(theme::row(cursor)));
     }
     if results.is_empty() {
-        list = list.push(text("Sin resultados.").size(12).color(MUTED));
+        list = list.push(text("Sin resultados.").size(theme::SMALL_SIZE).color(MUTED));
     }
     column![
         text_input("Buscar workspace, panel o acción…", query)
@@ -672,14 +674,14 @@ fn palette_view(app: &App) -> Element<'_, Message> {
             .on_submit(Message::PaletteRun(app.palette_cursor))
             .padding(10),
         scrollable(list).height(Length::Fill),
-        text("↑ ↓ mover · Enter ejecutar · Esc cerrar").size(11).color(MUTED),
+        text("↑ ↓ mover · Enter ejecutar · Esc cerrar").size(theme::SMALL_SIZE).color(theme::DIM),
     ]
-    .spacing(12)
+    .spacing(theme::GAP)
     .max_width(640)
     .into()
 }
 
-/// Lanzador: un botón por agente, en el workspace y la carpeta del panel enfocado.
+/// Lanzador: una fila por agente, en el workspace y la carpeta del panel enfocado.
 fn launcher_view(app: &App) -> Element<'_, Message> {
     let (workspace, cwd) = focus_context(app);
     let target = format!(
@@ -687,36 +689,36 @@ fn launcher_view(app: &App) -> Element<'_, Message> {
         workspace.as_deref().unwrap_or("sin workspace"),
         cwd.as_deref().unwrap_or("inicio")
     );
-    let mut col = column![text("Lanzar agente").size(20), text(target).size(12).color(MUTED)].spacing(10).max_width(480);
+    let mut col = column![text("Lanzar agente").size(18).color(TEXT), text(target).size(theme::SMALL_SIZE).color(MUTED)].spacing(theme::GAP).max_width(480);
     for agent in launch::Agent::ALL {
-        col = col.push(button(text(agent.label()).size(15)).width(Length::Fill).padding(12).on_press(Message::Launch(agent)));
+        col = col.push(theme::btn_secondary(text(agent.label()).size(theme::BODY_SIZE)).width(Length::Fill).padding([8, 12]).on_press(Message::Launch(agent)));
     }
-    col = col.push(button(text("Cancelar").size(13)).on_press(Message::CloseLauncher));
+    col = col.push(theme::btn_secondary(text("Cancelar").size(theme::BODY_SIZE)).on_press(Message::CloseLauncher));
     container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
 }
 
 fn new_workspace_view(app: &App) -> Element<'_, Message> {
     let query = app.new_ws.as_deref().unwrap_or("");
     let matches = recents::matching(&app.recents, query);
-    let mut list = column![].spacing(6);
+    let mut list = column![].spacing(2);
     for p in matches.iter().take(10) {
-        list = list.push(button(text(p.as_str()).size(13)).width(Length::Fill).padding(8).on_press(Message::OpenFolder((*p).clone())));
+        list = list.push(theme::btn(text(p.as_str()).size(theme::BODY_SIZE)).width(Length::Fill).padding([6, 10]).on_press(Message::OpenFolder((*p).clone())));
     }
     if matches.is_empty() {
-        list = list.push(text("Sin coincidencias entre las carpetas recientes.").size(12).color(MUTED));
+        list = list.push(text("Sin coincidencias entre las carpetas recientes.").size(theme::SMALL_SIZE).color(MUTED));
     }
     column![
-        text("Nuevo workspace").size(20),
-        text("Elige una carpeta. Se abre un terminal en ella; el daemon deduce el proyecto y la rama del repo git.").size(12).color(MUTED),
+        text("Nuevo workspace").size(18).color(TEXT),
+        text("Elige una carpeta. Se abre un terminal en ella; el daemon deduce el proyecto y la rama del repo git.").size(theme::SMALL_SIZE).color(MUTED),
         text_input("Buscar en recientes…", query).id(new_ws_input_id()).on_input(Message::NewWsQuery).on_submit(Message::NewWsSubmit).padding(8),
         scrollable(list).height(Length::Fill),
         row![
-            button(text("Elegir carpeta…").size(13)).on_press(Message::PickFolder),
-            button(text("Cancelar").size(13)).on_press(Message::CloseNewWorkspace),
+            theme::btn_primary(text("Elegir carpeta…").size(theme::BODY_SIZE)).on_press(Message::PickFolder),
+            theme::btn_secondary(text("Cancelar").size(theme::BODY_SIZE)).on_press(Message::CloseNewWorkspace),
         ]
-        .spacing(8),
+        .spacing(theme::GAP),
     ]
-    .spacing(12)
+    .spacing(theme::GAP)
     .max_width(560)
     .into()
 }
@@ -878,11 +880,14 @@ fn select(app: &mut App, id: u32) -> Task<Message> {
 /// Filas y columnas que caben en el área del terminal para el tamaño de ventana actual.
 /// Área donde viven los paneles: a la derecha de la barra lateral, debajo de la cabecera, las pestañas y, si lo hay,
 /// la línea de detalle de uso (`extra_top`).
-fn terminal_area(window: (f32, f32), extra_top: f32) -> layout::Rect {
+fn terminal_area(window: (f32, f32), extra_top: f32, extra_bottom: f32) -> layout::Rect {
     let x = SIDEBAR_W + 12.0;
     let y = 12.0 + 44.0 + 10.0 + TABS_H + 10.0 + extra_top;
-    layout::Rect { x, y, w: (window.0 - x - 12.0).max(0.0), h: (window.1 - y - 12.0).max(0.0) }
+    layout::Rect { x, y, w: (window.0 - x - 12.0).max(0.0), h: (window.1 - y - 12.0 - extra_bottom).max(0.0) }
 }
+
+/// Altura de la línea de error que se pinta debajo del cuerpo, con su separación (B5).
+const ERROR_H: f32 = 26.0;
 
 /// Cuadrícula de texto que cabe en un rectángulo de panel (con el margen de 10 px del terminal).
 fn grid_in(rect: layout::Rect) -> (u16, u16) {
@@ -891,7 +896,7 @@ fn grid_in(rect: layout::Rect) -> (u16, u16) {
 
 /// Cuadrícula de la ventana entera (un panel nuevo sin split).
 fn grid_for(window: (f32, f32)) -> (u16, u16) {
-    grid_in(terminal_area(window, 0.0))
+    grid_in(terminal_area(window, 0.0, 0.0))
 }
 
 /// Altura extra por la línea de detalle de uso, si el panel enfocado la muestra.
@@ -902,7 +907,9 @@ fn detail_extra(app: &App) -> f32 {
 
 /// Área de los paneles con la altura real de la ventana y de la columna del cuerpo.
 fn terminal_area_for(app: &App) -> layout::Rect {
-    terminal_area(app.window, detail_extra(app))
+    // B5: la línea de error ocupa altura bajo el terminal; no se descuenta, los paneles se pedirían demasiadas filas.
+    let error = if app.error.is_some() { ERROR_H } else { 0.0 };
+    terminal_area(app.window, detail_extra(app), error)
 }
 
 /// Rectángulo del panel `id` dentro de la pestaña visible de su workspace.
@@ -1754,15 +1761,6 @@ fn screen_view(snap: &Snapshot, sel: Option<Selection>) -> Element<'static, Mess
     lines.into()
 }
 
-fn status_color(status: Status) -> Color {
-    match status {
-        Status::Done => Color::from_rgb(0.43, 0.83, 0.61),
-        Status::Blocked => Color::from_rgb(0.94, 0.70, 0.33),
-        Status::Failed | Status::Exited => Color::from_rgb(0.91, 0.43, 0.43),
-        Status::Working => Color::from_rgb(0.48, 0.69, 0.96),
-        Status::Idle => MUTED,
-    }
-}
 
 /// Texto y color de la insignia de atención de un panel.
 fn badge_look(b: Badge) -> (&'static str, Color) {
@@ -1799,8 +1797,8 @@ fn form_view<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
         .push(text("Manager (recibe el resultado)").size(12).color(MUTED))
         .push(pick_list(managers, Some(manager_sel), Message::FormManager))
         .push(row![
-            button(text("Crear").size(14)).on_press(Message::SubmitForm),
-            button(text("Cancelar").size(14)).on_press(Message::CancelForm),
+            theme::btn(text("Crear").size(14)).on_press(Message::SubmitForm),
+            theme::btn(text("Cancelar").size(14)).on_press(Message::CancelForm),
         ].spacing(10));
     if let Some(e) = &app.form_error {
         form = form.push(text(e.clone()).size(12).color(status_color(Status::Failed)));
@@ -1808,27 +1806,30 @@ fn form_view<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
     container(form).padding(16).into()
 }
 
-/// Botón de un panel en la barra lateral: nombre, estado, insignia de atención y notas.
+/// Fila de un panel en la barra lateral: punto de estado, nombre y estado; el uso, la atención y las notas debajo.
 fn pane_button<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
     let mut notes = Vec::new();
     if pane.orphan { notes.push("ENTREGA SIN CONFIRMAR".to_string()); }
     else if pane.unacked > 0 { notes.push(format!("{} pendientes", pane.unacked)); }
     if let Some(manager) = &pane.manager { notes.push(format!("reporta a {manager}")); }
     if let Some(waiting) = &pane.waiting_on { notes.push(format!("espera a {waiting}")); }
-    let mut info = column![text(&pane.name).size(15), text(pane.status.as_str().to_uppercase()).size(11).color(status_color(pane.status))].spacing(5);
+    let dot = text("●").size(theme::SMALL_SIZE + 1.0).color(theme::status_color(pane.status));
+    let name = row![dot, text(&pane.name).size(theme::BODY_SIZE).color(TEXT)].spacing(8).align_y(iced::Alignment::Center);
+    let mut info = column![name, text(pane.status.as_str()).size(theme::SMALL_SIZE).color(MUTED)].spacing(2);
     if let Some((line, color)) = pane.usage.as_ref().and_then(usage::pane_line) {
-        info = info.push(text(line).size(11).color(color.unwrap_or(MUTED)));
+        info = info.push(text(line).size(theme::SMALL_SIZE).color(color.unwrap_or(MUTED)));
     }
     if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
         let (label, color) = badge_look(b);
-        info = info.push(row![text("●").size(11).color(color), text(label).size(11).color(color)].spacing(6));
+        info = info.push(text(label).size(theme::SMALL_SIZE).color(color));
     }
-    if !notes.is_empty() { info = info.push(text(notes.join(" · ")).size(11).color(if pane.orphan { status_color(Status::Blocked) } else { MUTED })); }
+    if !notes.is_empty() { info = info.push(text(notes.join(" · ")).size(theme::SMALL_SIZE).color(if pane.orphan { theme::BLOCKED } else { MUTED })); }
     let selected = app.selected == Some(pane.id);
-    button(container(info).width(Length::Fill).padding(10)).width(Length::Fill).on_press(Message::Select(pane.id)).style(move |_, status| {
-        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        button::Style { background: Some(if selected { Color::from_rgb(0.14, 0.17, 0.20) } else if hover { Color::from_rgb(0.11, 0.12, 0.15) } else { SURFACE }.into()), text_color: TEXT, border: iced::border::rounded(6), ..Default::default() }
-    }).into()
+    theme::btn(container(info).width(Length::Fill).padding([6, 10]))
+        .width(Length::Fill)
+        .on_press(Message::Select(pane.id))
+        .style(theme::row(selected))
+        .into()
 }
 
 /// Pie de la barra lateral: cuotas por agente, con barras de 5 h y 7 d, reinicio y edad del dato.
@@ -1861,12 +1862,12 @@ fn limits_footer(app: &App) -> Element<'_, Message> {
 fn view(app: &App) -> Element<'_, Message> {
     let mut list = column![
         row![text("PANELES").size(12).color(MUTED), Space::with_width(Length::Fill), text(app.panes.len()).size(12).color(MUTED)].padding([0, 4]),
-        button(text("+ Nuevo workspace").size(13)).width(Length::Fill).on_press(Message::OpenNewWorkspace),
-        button(text("+ Nuevo panel").size(13)).width(Length::Fill).on_press(Message::OpenForm),
+        theme::btn_secondary(text("+ Nuevo workspace").size(theme::BODY_SIZE)).width(Length::Fill).on_press(Message::OpenNewWorkspace),
+        theme::btn_secondary(text("+ Nuevo panel").size(theme::BODY_SIZE)).width(Length::Fill).on_press(Message::OpenForm),
     ].spacing(8);
     if app.panes.is_empty() { list = list.push(text("No hay paneles todavía.").size(14).color(MUTED)); }
     let list = sidebar_tree_view(app, list);
-    let sidebar = container(column![scrollable(list).height(Length::Fill), limits_footer(app)].spacing(12)).width(260).height(Length::Fill).padding(16).style(|_| container::Style { background: Some(SURFACE.into()), ..Default::default() });
+    let sidebar = container(column![scrollable(list).height(Length::Fill), limits_footer(app)].spacing(theme::PAD)).width(260).height(Length::Fill).padding(theme::PAD).style(theme::surface(SIDEBAR));
     let selected_pane = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id));
     let title = selected_pane.map(|p| p.name.as_str()).unwrap_or("Sin paneles");
     let state = selected_pane.map(|p| p.status.as_str().to_uppercase()).unwrap_or_default();
@@ -1885,17 +1886,17 @@ fn view(app: &App) -> Element<'_, Message> {
         layout_view(app)
     };
 
-    let mut header = row![text(title).size(18), text(state).size(11).color(state_color), Space::with_width(Length::Fill)].spacing(12).align_y(iced::Alignment::Center).height(44);
+    let mut header = row![text(title).size(theme::TITLE_SIZE).color(TEXT), text(state).size(theme::SMALL_SIZE).color(state_color), Space::with_width(Length::Fill)].spacing(12).align_y(iced::Alignment::Center).height(44);
     if let Some(n) = shown(app).map(|s| s.scrollback).filter(|&n| n > 0) {
         header = header.push(text(format!("↑ {n}")).size(12).color(status_color(Status::Blocked)));
     }
     if app.form.is_none() && app.selected.is_some() {
         if app.confirm_close {
             header = header.push(text(format!("¿Cerrar «{title}»?")).size(12).color(status_color(Status::Blocked)))
-                .push(button(text("Sí, cerrar").size(12)).on_press(Message::ConfirmClose))
-                .push(button(text("No").size(12)).on_press(Message::CancelClose));
+                .push(theme::btn(text("Sí, cerrar").size(12)).on_press(Message::ConfirmClose))
+                .push(theme::btn(text("No").size(12)).on_press(Message::CancelClose));
         } else {
-            header = header.push(button(text("Cerrar panel").size(12)).on_press(Message::AskClose));
+            header = header.push(theme::btn_secondary(text("Cerrar panel").size(theme::SMALL_SIZE)).on_press(Message::AskClose));
         }
     }
     if app.sel_snap.is_some() {
@@ -1911,12 +1912,12 @@ fn view(app: &App) -> Element<'_, Message> {
     }
     body = body.push(body_content);
     if let Some(error) = &app.error { body = body.push(text(format!("Error: {error}")).size(12).color(status_color(Status::Failed))); }
-    container(row![sidebar, body]).width(Length::Fill).height(Length::Fill).style(|_| container::Style { background: Some(BG.into()), text_color: Some(TEXT), ..Default::default() }).into()
+    container(row![sidebar, body]).width(Length::Fill).height(Length::Fill).style(theme::surface(BG)).into()
 }
 
 fn main() -> iced::Result {
     iced::application(app_title, update, view)
-        .theme(|_| Theme::Dark)
+        .theme(|_| theme::app())
         .subscription(|_: &App| Subscription::batch([
             iced::time::every(Duration::from_millis(50)).map(|_| Message::TickScreen),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TickList),
@@ -2740,5 +2741,97 @@ mod tests {
         let _ = update(&mut app, Message::FolderRejected);
         assert!(app.error.as_deref().is_some_and(|e| e.contains("UTF-8")));
         assert!(app.recents.is_empty());
+    }
+
+    /// r13 B5: con una línea de error visible, el área de paneles es más baja que sin ella (no se pide una fila de más).
+    #[test]
+    fn r13_error_reserva_altura_bajo_el_terminal() {
+        let mut app = App { window: (1100.0, 700.0), panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
+        let sin = terminal_area_for(&app);
+        app.error = Some("no se envió".into());
+        let con = terminal_area_for(&app);
+        assert!((sin.h - con.h - ERROR_H).abs() < 0.5, "sin {} con {}", sin.h, con.h);
+    }
+}
+
+/// Render headless: dibuja `view(app)` a un pixmap con el renderer de tiny-skia y guarda un PNG. No abre ventanas ni
+/// toca el escritorio. Se usa con `cargo test render_capturas -- --ignored` y `GALGO_UX_DIR`.
+#[cfg(test)]
+mod render {
+    use super::*;
+    use iced_runtime::user_interface::{Cache, UserInterface};
+
+    fn pane_info(id: u32, name: &str, status: Status) -> PaneInfo {
+        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None }
+    }
+
+    fn snap(lines: &[&str], cols: u16) -> Snapshot {
+        let run = |t: &str| Run { t: t.into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false };
+        Snapshot { gen: 0, rows: lines.len() as u16, cols, cursor: (0, 0), cursor_hidden: true, lines: lines.iter().map(|l| vec![run(l)]).collect(), scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![] }
+    }
+
+    pub fn render(app: &App, (w, h): (u32, u32), path: &std::path::Path) {
+        // El `Element` de la vista usa el renderer de respaldo de iced; el de tiny-skia va en su variante Secondary.
+        let mut renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(iced::Font::DEFAULT, iced::Pixels(FONT_SIZE)));
+        let viewport = iced_graphics::Viewport::with_physical_size(iced::Size::new(w, h), 1.0);
+        let size = iced::Size::new(w as f32, h as f32);
+        let mut ui = UserInterface::build(view(app), size, Cache::default(), &mut renderer);
+        let style = iced_core::renderer::Style { text_color: TEXT };
+        ui.draw(&mut renderer, &theme::app(), &style, iced::mouse::Cursor::Unavailable);
+        let mut pixmap = tiny_skia::Pixmap::new(w, h).expect("pixmap");
+        let mut mask = tiny_skia::Mask::new(w, h).expect("mascara");
+        let damage = [iced::Rectangle::with_size(size)];
+        if let iced::Renderer::Secondary(r) = &mut renderer {
+            r.draw::<&str>(&mut pixmap.as_mut(), &mut mask, &viewport, &damage, BG, &[]);
+        }
+        // El buffer de tiny-skia tiene R y B en el orden contrario al de save_png: se intercambian antes de guardar.
+        for px in pixmap.data_mut().chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        pixmap.save_png(path).expect("guardar png");
+    }
+
+    #[test]
+    #[ignore]
+    fn render_capturas() {
+        let dir = std::path::PathBuf::from(std::env::var("GALGO_UX_DIR").unwrap_or_else(|_| "/tmp/galgo-ux".into()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut welcome = App { window: (1100.0, 700.0), ..Default::default() };
+        render(&welcome, (1100, 700), &dir.join("r-bienvenida.png"));
+        let mut p = pane_info(1, "claude", Status::Working);
+        p.workspace = Some("repo/main".into());
+        let mut q = pane_info(2, "shell", Status::Blocked);
+        q.workspace = Some("repo/main".into());
+        let mut d = pane_info(3, "codex", Status::Done);
+        d.workspace = Some("otro/dev".into());
+        welcome.panes = vec![p, q, d];
+        welcome.selected = Some(1);
+        welcome.layouts.sync(&pane_keys(&welcome));
+        welcome.snap = Some(snap(&["$ cargo test", "   Compiling galgo-gui", "test result: ok"], 60));
+        render(&welcome, (1100, 700), &dir.join("r-paneles.png"));
+        let mut palette = welcome.clone_for_render();
+        palette.palette = Some("cla".into());
+        render(&palette, (1100, 700), &dir.join("r-paleta.png"));
+        let mut nuevo = welcome.clone_for_render();
+        nuevo.new_ws = Some(String::new());
+        render(&nuevo, (1100, 700), &dir.join("r-nuevo-workspace.png"));
+        let mut lanz = welcome.clone_for_render();
+        lanz.launcher = true;
+        render(&lanz, (1100, 700), &dir.join("r-lanzador.png"));
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// Copia para renderizar variantes del mismo estado (la app no implementa Clone).
+    fn clone_for_render(&self) -> App {
+        App {
+            panes: self.panes.clone(),
+            selected: self.selected,
+            snap: self.snap.clone(),
+            window: self.window,
+            layouts: self.layouts.clone(),
+            ..Default::default()
+        }
     }
 }

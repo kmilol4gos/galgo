@@ -6,8 +6,8 @@ use galgo_proto::PaneInfo;
 use galgo_usage::{CostSource, Limits, PaneUsage};
 use iced::Color;
 
-pub const AMBER: Color = Color::from_rgb(0.94, 0.70, 0.33);
-pub const RED: Color = Color::from_rgb(0.91, 0.43, 0.43);
+pub const AMBER: Color = crate::theme::BLOCKED;
+pub const RED: Color = crate::theme::FAILED;
 
 /// Cifras con coma decimal: 598000 → "598k", 1400000 → "1,4M".
 pub fn count(n: u64) -> String {
