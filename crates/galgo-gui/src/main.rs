@@ -15,6 +15,7 @@ mod launch;
 mod newpane;
 mod palette;
 mod recents;
+mod sidebar;
 mod term;
 mod usage;
 
@@ -247,9 +248,9 @@ struct PaletteItem {
 /// Todos los resultados posibles: workspaces, paneles y comandos. Se filtran con la búsqueda.
 fn palette_items(app: &App) -> Vec<PaletteItem> {
     let mut items = Vec::new();
-    for (i, (ws, group)) in galgo_proto::group_by_workspace(&app.panes).into_iter().enumerate() {
-        let label = ws.clone().unwrap_or_else(|| "sin workspace".into());
-        items.push(PaletteItem { label: format!("Workspace · {label}"), detail: format!("{} panel(es)", group.len()), message: Message::SelectWorkspaceAt(i) });
+    for (i, ws) in sidebar::workspaces(&app.panes).into_iter().enumerate() {
+        let label = ws.label.clone().unwrap_or_else(|| "sin workspace".into());
+        items.push(PaletteItem { label: format!("Workspace · {label}"), detail: format!("{} panel(es)", ws.panes.len()), message: Message::SelectWorkspaceAt(i) });
     }
     for p in &app.panes {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
@@ -301,7 +302,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
 
 /// Workspace n-ésimo (0 = primero) en el orden de la barra lateral; se selecciona su primer panel.
 fn workspace_at(panes: &[PaneInfo], n: usize) -> Option<u32> {
-    galgo_proto::group_by_workspace(panes).get(n).and_then(|(_, group)| group.first()).map(|p| p.id)
+    sidebar::workspaces(panes).get(n).and_then(|w| w.panes.first()).map(|p| p.id)
 }
 
 /// Siguiente panel, en orden de la lista y dando la vuelta, que necesita atención (insignia visible).
@@ -411,6 +412,47 @@ fn welcome_view(app: &App) -> Element<'_, Message> {
         col = col.push(button(text(p.as_str()).size(12).color(MUTED)).width(Length::Fill).padding(8).on_press(Message::OpenFolder(p.clone())));
     }
     container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
+}
+
+/// Barra lateral: «Te necesitan» arriba, luego Proyecto > Workspace > paneles. Cada workspace se pliega.
+fn sidebar_tree_view<'a>(app: &'a App, mut list: iced::widget::Column<'a, Message>) -> iced::widget::Column<'a, Message> {
+    let needs = sidebar::needs_attention(&app.panes, |id| app.attention.is_unread(id));
+    if !needs.is_empty() {
+        list = list.push(text(format!("TE NECESITAN · {}", needs.len())).size(11).color(status_color(Status::Blocked)));
+        for pane in needs {
+            list = list.push(pane_button(app, pane));
+        }
+    }
+    for project in sidebar::tree(&app.panes) {
+        list = list.push(text(project.name.clone()).size(14).color(MUTED));
+        for ws in project.workspaces {
+            let key = ws.label.clone().unwrap_or_default();
+            let folded = app.collapsed.contains(&key);
+            let arrow = if folded { "▸" } else { "▾" };
+            // Estados y atención del workspace; luego el coste total, si hay uso medido.
+            let mut detail = sidebar::status_summary(&ws.panes);
+            let attention_note = attention::group_summary(&ws.panes, &app.attention);
+            if !attention_note.is_empty() {
+                detail = if detail.is_empty() { attention_note } else { format!("{detail} · {attention_note}") };
+            }
+            if let Some(total) = usage::group_total(&ws.panes) {
+                detail = if detail.is_empty() { total } else { format!("{detail} · {total}") };
+            }
+            let head = column![text(format!("{arrow} {}", ws.name)).size(13), text(detail).size(11).color(MUTED)].spacing(2);
+            list = list.push(
+                button(container(head).width(Length::Fill).padding([6, 8]))
+                    .width(Length::Fill)
+                    .on_press(Message::ToggleGroup(key))
+                    .style(|_, _| button::Style { background: None, text_color: TEXT, ..Default::default() }),
+            );
+            if !folded {
+                for pane in ws.panes {
+                    list = list.push(row![Space::with_width(12), pane_button(app, pane)]);
+                }
+            }
+        }
+    }
+    list
 }
 
 /// Identificador del campo de búsqueda de la paleta: para darle el foco al abrirla.
@@ -1401,24 +1443,7 @@ fn view(app: &App) -> Element<'_, Message> {
         button(text("+ Nuevo panel").size(13)).width(Length::Fill).on_press(Message::OpenForm),
     ].spacing(8);
     if app.panes.is_empty() { list = list.push(text("No hay paneles todavía.").size(14).color(MUTED)); }
-    for (ws, group) in galgo_proto::group_by_workspace(&app.panes) {
-        let key = ws.clone().unwrap_or_default();
-        let folded = app.collapsed.contains(&key);
-        let label = ws.clone().unwrap_or_else(|| "sin workspace".into());
-        let summary = attention::group_summary(&group, &app.attention);
-        let arrow = if folded { "▸" } else { "▾" };
-        let mut detail = if summary.is_empty() { format!("{} panel(es)", group.len()) } else { format!("{} panel(es) · {summary}", group.len()) };
-        if let Some(total) = usage::group_total(&group) {
-            detail = format!("{detail} · {total}");
-        }
-        let head = column![text(format!("{arrow} {label}")).size(13), text(detail).size(11).color(MUTED)].spacing(2);
-        list = list.push(button(container(head).width(Length::Fill).padding([6, 8])).width(Length::Fill).on_press(Message::ToggleGroup(key)).style(|_, _| button::Style { background: None, text_color: TEXT, ..Default::default() }));
-        if !folded {
-            for pane in group {
-                list = list.push(pane_button(app, pane));
-            }
-        }
-    }
+    let list = sidebar_tree_view(app, list);
     let sidebar = container(column![scrollable(list).height(Length::Fill), limits_footer(app)].spacing(12)).width(260).height(Length::Fill).padding(16).style(|_| container::Style { background: Some(SURFACE.into()), ..Default::default() });
     let selected_pane = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id));
     let title = selected_pane.map(|p| p.name.as_str()).unwrap_or("Sin paneles");
