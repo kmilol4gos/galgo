@@ -2,47 +2,11 @@
 
 mod claude;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use galgo_proto::{socket_path, Message, PaneInfo, Request, Response, Status};
+use galgo_proto::{client::request, socket_path, Message, PaneInfo, Request, Status};
 use serde_json::Value;
-use std::{io::{BufRead, BufReader, Write}, os::unix::{net::UnixStream, process::CommandExt}, process::{Command, Stdio}, time::Duration};
-
-fn request(req: &Request) -> Result<Response> {
-    let path = socket_path();
-    let mut stream = match UnixStream::connect(&path) {
-        Ok(s) => s,
-        Err(_) => {
-            let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-            std::fs::create_dir_all(dir)?;
-            let log_path = dir.join("galgod.log");
-            let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
-            let exe = std::env::current_exe()?.with_file_name("galgod");
-            let mut child = Command::new(&exe).stdin(Stdio::null()).stdout(Stdio::null())
-                .stderr(Stdio::from(log)).process_group(0).spawn()
-                .with_context(|| format!("no pude iniciar {}", exe.display()))?;
-            let mut connected = None;
-            for _ in 0..50 {
-                std::thread::sleep(Duration::from_millis(100));
-                if let Ok(s) = UnixStream::connect(&path) { connected = Some(s); break; }
-                if child.try_wait()?.is_some() { break; }
-            }
-            match connected {
-                Some(s) => s,
-                None => {
-                    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                    let tail = log.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-                    bail!("el daemon no respondió en {}; log {}:\n{}", path.display(), log_path.display(), tail);
-                }
-            }
-        }
-    };
-    writeln!(stream, "{}", serde_json::to_string(req)?)?;
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    if reply.is_empty() { bail!("el daemon cerró la conexión sin responder"); }
-    Ok(serde_json::from_str(&reply)?)
-}
+use std::os::unix::net::UnixStream;
 
 #[derive(Parser)]
 #[command(name = "galgo", version, about = "Controla paneles y agentes")]

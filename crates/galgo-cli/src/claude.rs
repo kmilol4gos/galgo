@@ -322,13 +322,20 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
             println!("respaldo: {}", backup.display());
         }
     }
-    let tmp = path.with_extension("json.galgo-tmp");
+    let mut random = [0u8; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let tmp = path.with_extension(format!("json.galgo-tmp-{}-{:016x}", std::process::id(), u64::from_ne_bytes(random)));
     let mut text = serde_json::to_string_pretty(settings)?;
     text.push('\n');
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
-    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    file.write_all(text.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
+    let result = (|| -> Result<()> {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.write_all(text.as_bytes())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result?;
     Ok(())
 }
 

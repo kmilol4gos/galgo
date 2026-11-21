@@ -4,7 +4,7 @@ use crate::{socket_path, Request, Response};
 use anyhow::{bail, Context, Result};
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::unix::{fs::{OpenOptionsExt, PermissionsExt}, net::UnixStream, process::CommandExt},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -16,11 +16,22 @@ pub fn connect() -> Result<UnixStream> {
     if let Ok(s) = UnixStream::connect(&path) {
         return Ok(s);
     }
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let log_path = dir.join("galgod.log");
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: i32 = 0x100;
+    #[cfg(target_os = "linux")]
+    const O_NOFOLLOW: i32 = 0x20000;
+    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600)
+        .custom_flags(O_NOFOLLOW).open(&log_path)
+        .with_context(|| format!("no pude abrir {}", log_path.display()))?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let galgod = std::env::current_exe()?.with_file_name("galgod");
-    Command::new(&galgod)
+    let mut child = Command::new(&galgod)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .process_group(0)
         .spawn()
         .with_context(|| format!("no pude iniciar {}", galgod.display()))?;
@@ -29,8 +40,11 @@ pub fn connect() -> Result<UnixStream> {
         if let Ok(s) = UnixStream::connect(&path) {
             return Ok(s);
         }
+        if child.try_wait()?.is_some() { break; }
     }
-    bail!("el daemon no respondió en {}", path.display())
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let tail = log.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+    bail!("el daemon no respondió en {}; log {}:\n{}", path.display(), log_path.display(), tail)
 }
 
 /// Envía una solicitud y espera su respuesta (una línea JSON por sentido).

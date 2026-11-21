@@ -50,6 +50,8 @@ galgo read reviewer      # lee la pantalla de un panel
 galgo stop               # detiene el daemon
 ```
 
+`galgo send` responde `ok` cuando el texto queda en la cola del panel, no cuando llega a su PTY. Si un panel no lee su entrada, la cola se llena (8 envíos) y los siguientes reciben un error claro en vez de congelar el daemon.
+
 El daemon se inicia solo. Cada panel recibe `GALGO_PANE`, `GALGO_PANE_NAME` y `GALGO_SOCKET`. El socket es `~/.galgo/galgo.sock` (o `$GALGO_SOCKET`).
 
 ### Un equipo completo

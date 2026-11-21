@@ -9,6 +9,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         mpsc::{sync_channel, SyncSender, TrySendError},
         Arc, Mutex,
@@ -23,6 +24,8 @@ use tokio::{
 
 /// Cuántas escrituras pueden esperar en la cola de un panel antes de rechazar la siguiente.
 const INPUT_QUEUE: usize = 8;
+/// errno ESRCH: el proceso no existe (igual en Linux y macOS).
+const ESRCH: i32 = 3;
 
 struct InboxMsg {
     id: u64,
@@ -32,6 +35,8 @@ struct InboxMsg {
     summary: String,
     created: Instant,
     acked: bool,
+    /// Entregado a una espera en curso; se confirma o se libera según la escritura.
+    claimed: bool,
     last_inject: Option<Instant>,
 }
 
@@ -47,6 +52,12 @@ struct Pane {
     input: SyncSender<Vec<u8>>,
     /// Para matar el proceso sin tener el hijo (el hilo de salida lo espera).
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// PID del proceso; es también el id del grupo de procesos (el PTY lo crea con setsid).
+    pid: Option<u32>,
+    /// El proceso terminó y se recolectó: ya no se le señala nada.
+    exited: bool,
+    /// Hubo entrada enviada al panel desde su último resultado entregado.
+    touched_since_report: bool,
     _master: Box<dyn MasterPty + Send>,
     inbox: Vec<InboxMsg>,
     last_summary: Option<String>,
@@ -92,6 +103,7 @@ impl State {
                 summary,
                 created: Instant::now(),
                 acked: false,
+                claimed: false,
                 last_inject: None,
             });
         }
@@ -245,6 +257,7 @@ impl Daemon {
             .spawn_command(builder)
             .with_context(|| format!("no pude ejecutar {}", cmd[0]))?;
         drop(pair.slave);
+        let pid = child.process_id();
         let killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
@@ -273,6 +286,9 @@ impl Daemon {
             screen: Arc::clone(&screen),
             input,
             killer,
+            pid,
+            exited: false,
+            touched_since_report: false,
             _master: pair.master,
             inbox: Vec::new(),
             last_summary: None,
@@ -302,16 +318,17 @@ impl Daemon {
         Ok(id)
     }
 
-    /// El proceso del panel terminó. Si no reportó resultado, el manager se entera igual.
+    /// El proceso del panel terminó. Siempre queda `exited` (conservando el último resumen).
+    /// Avisa al manager si no hubo resultado en este turno o si hubo actividad después.
     fn on_exit(&self, id: u32, code: Option<u32>) {
         let manager = {
             let mut st = self.state.lock().unwrap();
             let Some(p) = st.panes.get_mut(&id) else { return };
-            let (reported, manager) = (p.reported, p.manager);
-            if !reported {
-                p.status = Status::Exited;
-            }
-            if !reported {
+            let notify = !p.reported || p.touched_since_report;
+            p.exited = true;
+            p.status = Status::Exited;
+            let manager = p.manager;
+            if notify {
                 if let Some(m) = manager {
                     let why = match code {
                         Some(c) => format!("salió con código {c}"),
@@ -339,7 +356,7 @@ impl Daemon {
         }
         let mut lines = Vec::new();
         let mut ids = Vec::new();
-        for m in p.inbox.iter_mut().filter(|m| !m.acked) {
+        for m in p.inbox.iter_mut().filter(|m| !m.acked && !m.claimed) {
             if m.last_inject.is_none_or(|t| t.elapsed() >= retry) {
                 m.last_inject = Some(Instant::now());
                 lines.push(sanitize(&format!(
@@ -370,9 +387,11 @@ impl Daemon {
     /// Busca un mensaje del objetivo sin confirmar, o el estado final del objetivo.
     /// No confirma nada: la confirmación llega con `confirm`, tras escribir la respuesta.
     fn check_wait(&self, waiter: u32, target: u32) -> Option<(Value, Option<u64>)> {
-        let st = self.state.lock().unwrap();
-        if let Some(w) = st.panes.get(&waiter) {
-            if let Some(m) = w.inbox.iter().find(|m| !m.acked && m.from == target) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(w) = st.panes.get_mut(&waiter) {
+            if let Some(m) = w.inbox.iter_mut().find(|m| !m.acked && !m.claimed && m.from == target) {
+                // Reserva el mensaje: otra espera no lo recibe mientras esta respuesta se escribe.
+                m.claimed = true;
                 let v = json!({
                     "from": m.from_name, "kind": m.kind, "summary": m.summary, "delivered": "wait"
                 });
@@ -389,11 +408,23 @@ impl Daemon {
 
     /// Confirma un mensaje. Se llama solo después de que la respuesta se escribió al cliente.
     fn confirm(&self, pane: u32, msg: u64) {
+        self.set_claim(pane, msg, true);
+    }
+
+    /// Libera un mensaje reservado cuando la respuesta no llegó al cliente: queda entregable.
+    fn release(&self, pane: u32, msg: u64) {
+        self.set_claim(pane, msg, false);
+    }
+
+    fn set_claim(&self, pane: u32, msg: u64, confirmed: bool) {
         {
             let mut st = self.state.lock().unwrap();
             if let Some(p) = st.panes.get_mut(&pane) {
                 for m in p.inbox.iter_mut().filter(|m| m.id == msg) {
-                    m.acked = true;
+                    m.claimed = false;
+                    if confirmed {
+                        m.acked = true;
+                    }
                 }
             }
         }
@@ -469,6 +500,7 @@ impl Daemon {
                     chunk.push(b'\r');
                 }
                 p.input.try_send(chunk).map_err(input_error)?;
+                p.touched_since_report = true;
                 if enter {
                     // Una tarea nueva: el turno vuelve a estar abierto y el estado final se reinicia.
                     p.reported = false;
@@ -505,6 +537,7 @@ impl Daemon {
                     let p = st.panes.get_mut(&id).unwrap();
                     p.status = if failed { Status::Failed } else { Status::Done };
                     p.reported = true;
+                    p.touched_since_report = false;
                     p.last_summary = Some(summary.clone());
                     let manager = p.manager;
                     if let Some(m) = manager {
@@ -569,6 +602,7 @@ impl Daemon {
                                         let p = st.panes.get_mut(&id).unwrap();
                                         p.status = if failed { Status::Failed } else { Status::Done };
                                         p.reported = true;
+                                        p.touched_since_report = false;
                                         p.last_summary = Some(text.clone());
                                         st.push(m, id, if failed { "failed" } else { "done" }, text);
                                     }
@@ -630,9 +664,30 @@ impl Daemon {
                 Ok(json!({}))
             }
             Request::Kill { pane } => {
-                let mut st = self.state.lock().unwrap();
-                let id = st.resolve(&pane)?;
-                st.panes.get_mut(&id).unwrap().killer.kill()?;
+                let (id, pid) = {
+                    let mut st = self.state.lock().unwrap();
+                    let id = st.resolve(&pane)?;
+                    let p = st.panes.get_mut(&id).unwrap();
+                    if p.exited {
+                        bail!("el panel {} ya terminó", p.name);
+                    }
+                    if let Err(e) = p.killer.kill() {
+                        if e.raw_os_error() == Some(ESRCH) {
+                            bail!("el panel {} ya terminó", p.name);
+                        }
+                        return Err(e.into());
+                    }
+                    (id, p.pid)
+                };
+                // SIGHUP no basta para quien lo ignora: si sigue vivo tras una espera breve,
+                // SIGKILL al grupo de procesos. Con el candado tomado, el proceso no está recolectado.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let st = self.state.lock().unwrap();
+                if let (Some(p), Some(pid)) = (st.panes.get(&id), pid) {
+                    if !p.exited {
+                        Command::new("kill").args(["-KILL", "--", &format!("-{pid}")]).status()?;
+                    }
+                }
                 Ok(json!({}))
             }
             Request::Shutdown => {
@@ -659,7 +714,7 @@ impl Daemon {
 async fn serve(d: Arc<Daemon>, stream: UnixStream) {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
-    // Líneas que llegan mientras se atiende otra solicitud; se procesan en orden.
+    // Líneas que llegan mientras se atiende una espera; se procesan en orden.
     let mut queued: VecDeque<String> = VecDeque::new();
     loop {
         let line = match queued.pop_front() {
@@ -670,30 +725,39 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
             },
         };
         let (resp, ack) = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => {
+            Ok(req) if matches!(req, Request::Wait { .. }) => {
                 let mut fut = std::pin::pin!(d.dispatch(req));
                 let (res, ack) = loop {
                     tokio::select! {
                         out = &mut fut => break out,
                         next = lines.next_line() => match next {
                             Ok(Some(l)) => queued.push_back(l),
-                            // El cliente se fue: se cancela lo que esperaba y no se confirma nada.
+                            // Solo una espera se cancela con el EOF: el cliente ya no la espera.
                             _ => return,
                         },
                     }
                 };
                 (to_response(res), ack)
             }
+            Ok(req) => {
+                // Cualquier otra solicitud se ejecuta siempre, aunque el cliente cierre su escritura.
+                let (res, ack) = d.dispatch(req).await;
+                (to_response(res), ack)
+            }
             Err(e) => (Response::err(format!("solicitud inválida: {e}")), None),
         };
         let mut out = serde_json::to_string(&resp).unwrap();
         out.push('\n');
-        if w.write_all(out.as_bytes()).await.is_err() {
-            // Sin respuesta entregada, el mensaje sigue sin confirmar.
-            break;
-        }
+        let written = w.write_all(out.as_bytes()).await.is_ok();
         if let Some((pane, msg)) = ack {
-            d.confirm(pane, msg);
+            if written {
+                d.confirm(pane, msg);
+            } else {
+                d.release(pane, msg);
+            }
+        }
+        if !written {
+            break;
         }
     }
 }

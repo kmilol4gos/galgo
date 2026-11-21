@@ -287,5 +287,158 @@ echo "24. spawn con un cwd que no existe se rechaza"
 galgo spawn c24 --cwd "$TMP/no-existe" -- bash --norc 2>&1 | grep -q "no existe"; check "error claro" $?
 galgo ls | grep -q " c24 "; [ $? -ne 0 ]; check "no crea el panel" $?
 
+echo "50. MCP cancela wait sin bloquear ping ni consumir el resultado"
+galgo spawn m50 -- bash --norc >/dev/null
+galgo spawn w50 --manager m50 -- bash --norc >/dev/null
+GALGO_PANE=m50 python3 - <<'PY50'
+import json, os, select, subprocess, time
+p = subprocess.Popen(['galgo-mcp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def send(o):
+    p.stdin.write((json.dumps(o)+'\n').encode()); p.stdin.flush()
+try:
+    send({'jsonrpc':'2.0','id':50,'method':'tools/call','params':{'name':'galgo_wait','arguments':{'target':'w50','timeout_secs':20}}})
+    time.sleep(.5)
+    send({'jsonrpc':'2.0','method':'notifications/cancelled','params':{'requestId':50}})
+    send({'jsonrpc':'2.0','id':51,'method':'ping'})
+    assert select.select([p.stdout],[],[],2)[0], 'ping bloqueado'
+    assert json.loads(p.stdout.readline())['id'] == 51
+    subprocess.run(['galgo','done','--pane','w50','--summary','resultado50'], check=True)
+    time.sleep(.6)
+    assert b'resultado50' in subprocess.check_output(['galgo','inbox','--pane','m50'])
+    assert not select.select([p.stdout],[],[],.3)[0], 'respuesta a llamada cancelada'
+finally:
+    p.kill(); p.wait()
+PY50
+check "cancelación y ping" $?
+
+echo "51. temporal huérfano no impide instalar"
+mkdir -p "$TMP/cc51"
+echo '{}' > "$TMP/cc51/settings.json"
+touch "$TMP/cc51/settings.json.galgo-tmp"
+CLAUDE_CONFIG_DIR="$TMP/cc51" galgo hooks install claude --yes >/dev/null && CLAUDE_CONFIG_DIR="$TMP/cc51" galgo hooks install claude --yes >/dev/null
+check "dos instalaciones con temporal huérfano" $?
+
+echo "52. MCP recupera UTF-8 inválido y negocia versión"
+printf '\377\n%s\n%s\n' '{"jsonrpc":"2.0","id":52,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}' '{"jsonrpc":"2.0","id":53,"method":"ping"}' | galgo-mcp > "$TMP/mcp52" 2>/dev/null
+grep -q -- '"code":-32700' "$TMP/mcp52" && grep -q '"protocolVersion":"2025-06-18"' "$TMP/mcp52" && grep -q '"id":53' "$TMP/mcp52"; check "parse error, versión y ping" $?
+
+echo "53. log privado y sin seguir symlinks"
+mkdir -p "$TMP/log53"; echo original > "$TMP/log53/target"; ln -s target "$TMP/log53/galgod.log"
+GALGO_SOCKET="$TMP/log53/sock" galgo ls >"$TMP/log53/out" 2>&1
+[ $? -ne 0 ] && [ "$(cat "$TMP/log53/target")" = original ]; check "rechaza symlink" $?
+rm "$TMP/log53/galgod.log"
+GALGO_SOCKET="$TMP/log53/sock" galgo ls >/dev/null 2>&1
+python3 -c 'import os,sys; sys.exit((os.stat(sys.argv[1]).st_mode & 0o777) != 0o600)' "$TMP/log53/galgod.log"; check "log 0600" $?
+GALGO_SOCKET="$TMP/log53/sock" galgo stop >/dev/null 2>&1
+
+echo "40. el EOF tras una solicitud no la cancela"
+galgo spawn mgr40 -- bash --norc >/dev/null
+galgo spawn w40 --manager mgr40 -- bash --norc >/dev/null
+python3 -I - "$GALGO_SOCKET" 30 w40 <<'PY' >/dev/null 2>&1
+import json, socket, sys
+path, count, pane = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+ok = 0
+for i in range(count):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(path)
+    s.sendall((json.dumps({"op": "done", "pane": pane, "summary": f"r{i}", "failed": False}) + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    if data and json.loads(data).get("ok"):
+        ok += 1
+sys.exit(0 if ok == count else 1)
+PY
+check "las 30 solicitudes reciben respuesta" $?
+[ "$(galgo inbox --pane mgr40 | grep -c '^#')" = "30" ]; check "las 30 se ejecutaron" $?
+
+echo "41. salida después de un resultado: se avisa y queda exited"
+galgo spawn m41 -- bash --norc >/dev/null
+galgo spawn w41 --manager m41 -- bash --norc >/dev/null
+galgo send w41 'galgo done --summary "listo41"'
+sleep 0.5
+galgo send w41 $'exit 7\r' --no-enter
+sleep 1
+galgo inbox --pane m41 | grep -q "w41 \[exited\].*código 7"; check "el manager recibe la salida con código 7" $?
+galgo ls | grep w41 | grep -q exited; check "ls muestra exited" $?
+galgo inbox --pane m41 | grep -q "listo41"; check "el resultado anterior sigue en el inbox" $?
+
+echo "42. dos wait simultáneos: solo uno recibe el mismo mensaje"
+galgo spawn m42 -- bash --norc >/dev/null
+galgo spawn w42 --manager m42 -- bash --norc >/dev/null
+galgo --json wait w42 --pane m42 --timeout 10 > "$TMP/wa42" 2>&1 &
+A=$!
+galgo --json wait w42 --pane m42 --timeout 10 > "$TMP/wb42" 2>&1 &
+B=$!
+sleep 0.5
+galgo send w42 'galgo done --summary "unico42"'
+wait $A $B
+[ "$(cat "$TMP/wa42" "$TMP/wb42" | grep -c '"delivered"')" = "1" ]; check "solo un wait recibe el mensaje" $?
+
+echo "43. kill: SIGKILL si ignora SIGHUP; panel terminado, mensaje claro"
+galgo spawn k43 -- bash -c "trap '' HUP; echo \$\$ > $TMP/kpid43; exec sleep 300" >/dev/null
+sleep 0.5
+K=$(cat "$TMP/kpid43")
+galgo kill k43 >/dev/null 2>&1
+sleep 0.5
+! kill -0 "$K" 2>/dev/null; check "mata al proceso que ignora SIGHUP" $?
+kill -9 "$K" 2>/dev/null
+galgo spawn fin43 -- bash -c 'exit 0' >/dev/null
+sleep 1
+galgo kill fin43 > "$TMP/fk43" 2>&1
+grep -q "ya terminó" "$TMP/fk43"; check "panel terminado: mensaje claro" $?
+! grep -q "No such process" "$TMP/fk43"; check "sin 'No such process'" $?
+
+echo "54. MCP informa errores al iniciar galgod"
+LONG54="$TMP/$(printf '%0120d' 0)/galgo.sock"
+printf '%s\n' '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"galgo_list","arguments":{}}}' | GALGO_SOCKET="$LONG54" galgo-mcp > "$TMP/mcp54"
+grep -qiE 'sun_len|long|largo|invalid' "$TMP/mcp54"; check "error del daemon llega a MCP" $?
+
+echo "55. MCP respeta el orden sin bloquearse en wait"
+galgo spawn m55 -- bash --norc >/dev/null
+galgo spawn w55 --manager m55 -- bash --norc >/dev/null
+GALGO_PANE=m55 python3 - "$TMP/55-result" <<'PY55'
+import json, os, select, subprocess, sys, time
+p = subprocess.Popen(['galgo-mcp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def call(i, name, args):
+    return {'jsonrpc':'2.0','id':i,'method':'tools/call','params':{'name':name,'arguments':args}}
+def ping(i): return {'jsonrpc':'2.0','id':i,'method':'ping'}
+messages = [call(1,'galgo_spawn',{'name':'pane55','cmd':['bash','--norc']}),
+            call(2,'galgo_send',{'pane':'pane55','text':'echo prueba55'}),
+            call(3,'galgo_read',{'pane':'pane55'}), ping(4),
+            call(5,'galgo_wait',{'target':'w55','timeout_secs':10}), ping(6),
+            call(7,'galgo_read',{'pane':'pane55'})]
+try:
+    p.stdin.write((''.join(json.dumps(x)+'\n' for x in messages)).encode()); p.stdin.flush()
+    buf = b''; responses = []; deadline = time.monotonic() + 4
+    while len(responses) < 6 and time.monotonic() < deadline:
+        if not select.select([p.stdout], [], [], max(0, deadline-time.monotonic()))[0]: break
+        chunk = os.read(p.stdout.fileno(), 65536)
+        if not chunk: break
+        buf += chunk
+        while b'\n' in buf:
+            line, buf = buf.split(b'\n', 1); responses.append(json.loads(line))
+    assert [r['id'] for r in responses] == [1,2,3,4,6,7], responses
+    assert all('error' not in r and not r.get('result',{}).get('isError',False) for r in responses), responses
+    with open(sys.argv[1], 'w') as f: f.write('rapidas\n')
+    subprocess.run(['galgo','done','--pane','w55','--summary','resultado55'], check=True)
+    deadline = time.monotonic() + 4
+    while b'\n' not in buf and time.monotonic() < deadline:
+        if not select.select([p.stdout], [], [], max(0, deadline-time.monotonic()))[0]: break
+        buf += os.read(p.stdout.fileno(), 65536)
+    reply = json.loads(buf.split(b'\n', 1)[0])
+    assert reply['id'] == 5 and not reply['result']['isError'], reply
+    with open(sys.argv[1], 'a') as f: f.write('wait\n')
+finally:
+    p.kill(); p.wait()
+PY55
+grep -q '^rapidas$' "$TMP/55-result" 2>/dev/null; check "respuestas rápidas en orden y antes del wait" $?
+grep -q '^wait$' "$TMP/55-result" 2>/dev/null; check "wait responde tras completar el worker" $?
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

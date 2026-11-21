@@ -10,6 +10,7 @@ use std::fmt;
 
 /// Versión del protocolo si el cliente no envía `protocolVersion`.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Tiempo por defecto de `galgo_wait`, igual que `galgo wait`.
 const DEFAULT_WAIT_SECS: u64 = 600;
 
@@ -104,6 +105,7 @@ fn initialize_result(params: &Value) -> Value {
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
+        .filter(|v| SUPPORTED_VERSIONS.contains(v))
         .unwrap_or(PROTOCOL_VERSION);
     json!({
         "protocolVersion": version,
@@ -331,6 +333,14 @@ mod tests {
         assert_eq!(r["result"]["capabilities"], json!({ "tools": {} }));
         assert_eq!(r["result"]["serverInfo"]["name"], "galgo");
         assert_eq!(r["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn initialize_negocia_versiones_soportadas() {
+        for version in SUPPORTED_VERSIONS {
+            assert_eq!(initialize_result(&json!({"protocolVersion": version}))["protocolVersion"], *version);
+        }
+        assert_eq!(initialize_result(&json!({"protocolVersion": "2099-01-01"}))["protocolVersion"], PROTOCOL_VERSION);
     }
 
     #[test]
