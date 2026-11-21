@@ -195,6 +195,8 @@ struct App {
     others_gen: std::collections::HashMap<u32, u64>,
     others_loading: std::collections::HashSet<u32>,
     others_cursor: usize,
+    /// Foco que toma el hermano o la pestaña vecina al cerrar el panel enfocado (M1).
+    pending_focus: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +326,38 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         },
         _ => None,
     }
+}
+
+/// M2: un panel que puede tener trabajo en curso (todo salvo los terminados o caídos) pide confirmación al cerrarse.
+fn needs_confirm(p: &PaneInfo) -> bool {
+    !matches!(p.status, Status::Done | Status::Failed | Status::Exited)
+}
+
+/// M2: con el formulario abierto, Cmd+W cierra el formulario (no el panel de detrás) y Cmd+N sigue valiendo;
+/// el resto de atajos no actúa.
+fn shortcut_in_state(app: &App, key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
+    let message = shortcut(key, modifiers)?;
+    if app.form.is_none() {
+        return Some(message);
+    }
+    match message {
+        Message::CloseFocused => Some(Message::CancelForm),
+        Message::OpenNewWorkspace => Some(message),
+        _ => None,
+    }
+}
+
+/// M1: el panel que toma el foco al cerrar `id`: su hermano en la misma pestaña, o si era la única hoja, el foco de
+/// la pestaña vecina del mismo workspace. `None` si no hay ninguno.
+fn successor(app: &App, id: u32) -> Option<u32> {
+    let key = app.layouts.key_of(id)?;
+    let ws = app.layouts.by_key.get(&key)?;
+    let i = ws.tabs.iter().position(|t| t.root.ids().contains(&id))?;
+    if let Some(other) = ws.tabs[i].root.ids().into_iter().find(|x| *x != id) {
+        return Some(other);
+    }
+    let near = if i > 0 { i - 1 } else { i + 1 };
+    ws.tabs.get(near).map(|t| t.focus).filter(|x| *x != id)
 }
 
 /// Workspace n-ésimo (0 = primero) en el orden de la barra lateral; se selecciona su primer panel.
@@ -1120,9 +1154,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::CloseFocused => {
-            let working = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).is_some_and(|p| p.status == Status::Working);
-            if working {
-                // Un agente trabajando: se pide confirmación. Un panel parado se cierra con Cmd+W sin preguntar.
+            let vivo = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).is_some_and(needs_confirm);
+            if vivo {
                 app.confirm_close = true;
                 Task::none()
             } else {
@@ -1254,6 +1287,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                         app.confirm_close = false;
                         clear_selection(app);
                     }
+                    // M1: si el cierre dejó sin foco, el hermano del split o la pestaña vecina; solo si no hay, el primero.
+                    if app.selected.is_none() {
+                        if let Some(id) = app.pending_focus.take().filter(|id| app.panes.iter().any(|p| p.id == *id)) {
+                            app.selected = Some(id);
+                        }
+                    }
                     if app.selected.is_none() {
                         if let Some(id) = app.panes.first().map(|p| p.id) {
                             app.selected = Some(id);
@@ -1344,7 +1383,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
             if modifiers.command() && app.new_ws.is_none() && !app.launcher {
-                if let Some(message) = shortcut(&key, modifiers) {
+                if let Some(message) = shortcut_in_state(app, &key, modifiers) {
                     return update(app, message);
                 }
             }
@@ -1551,6 +1590,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ConfirmClose => {
             app.confirm_close = false;
+            // M1: el foco se decide antes de cerrar, mientras el panel y su hermano aún están en el layout.
+            app.pending_focus = app.selected.and_then(|id| successor(app, id));
             match app.selected {
                 Some(id) => send_request(Request::Kill { pane: id.to_string() }, Message::Killed),
                 None => Task::none(),
@@ -2253,9 +2294,10 @@ mod tests {
         let mut app = App { panes: vec![pane_info(1, "p", Status::Working)], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::CloseFocused);
         assert!(app.confirm_close, "trabajando: pregunta");
+        // M2: un panel parado puede estar ejecutando algo (shell, vim, un build): también pregunta.
         let mut app = App { panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::CloseFocused);
-        assert!(!app.confirm_close, "parado: no pregunta");
+        assert!(app.confirm_close, "parado: también pregunta (M2)");
     }
 
     /// C: la paleta lista workspaces, paneles y acciones; la búsqueda los filtra y Enter ejecuta el elegido.
@@ -2430,5 +2472,46 @@ mod tests {
         let visibles = app.layouts.active_tab("w").expect("pestaña activa").root.ids();
         assert!(visibles.contains(&1), "el seleccionado sigue visible: {visibles:?}");
         assert!(!visibles.contains(&4), "el externo está en otra pestaña");
+    }
+
+    /// r13 M1: cerrar el panel 2 de un split en r/main no salta al panel de otro workspace que el daemon lista primero.
+    #[test]
+    fn r13_cerrar_split_no_salta_a_otro_workspace() {
+        let mut otro = pane_info(3, "otro", Status::Idle);
+        otro.workspace = Some("otro/main".into());
+        let mut uno = pane_info(1, "uno", Status::Idle);
+        uno.workspace = Some("r/main".into());
+        let mut dos = pane_info(2, "dos", Status::Idle);
+        dos.workspace = Some("r/main".into());
+        let mut app = App { panes: vec![otro, uno, dos], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        app.layouts.split(1, true, 2);
+        app.layouts.sync(&pane_keys(&app));
+        let _ = update(&mut app, Message::Select(2));
+        let _ = update(&mut app, Message::ConfirmClose);
+        app.panes.retain(|p| p.id != 2);
+        let restantes = app.panes.clone();
+        let _ = update(&mut app, Message::Panes(Ok(restantes)));
+        assert_eq!(app.selected, Some(1), "el hermano del split, no el primero de la lista");
+        assert_eq!(app.layouts.key_of(1).as_deref(), Some("r/main"));
+    }
+
+    /// r13 M2: Cmd+W sobre un agente bloqueado o en espera pide confirmación; sobre uno terminado, no.
+    /// Con el formulario abierto, Cmd+W cierra el formulario y no toca el panel de detrás.
+    #[test]
+    fn r13_cmdw_con_formulario_y_estados() {
+        let cmd = keyboard::Modifiers::COMMAND;
+        let w = Key::Character("w".into());
+        let mut app = App { panes: vec![pane_info(1, "claude", Status::Blocked)], selected: Some(1), form: Some(NewPane::default()), ..Default::default() };
+        assert!(matches!(shortcut_in_state(&app, &w, cmd), Some(Message::CancelForm)));
+        app.form = None;
+        let _ = update(&mut app, Message::CloseFocused);
+        assert!(app.confirm_close, "bloqueado: pide confirmación");
+        let mut app = App { panes: vec![pane_info(2, "shell", Status::Idle)], selected: Some(2), ..Default::default() };
+        let _ = update(&mut app, Message::CloseFocused);
+        assert!(app.confirm_close, "un shell en Idle puede estar ejecutando algo: pide confirmación");
+        let mut app = App { panes: vec![pane_info(3, "viejo", Status::Done)], selected: Some(3), ..Default::default() };
+        let _ = update(&mut app, Message::CloseFocused);
+        assert!(!app.confirm_close, "terminado: no pregunta");
     }
 }
