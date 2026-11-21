@@ -114,6 +114,16 @@ pub enum Request {
     Read {
         pane: String,
     },
+    /// Pantalla con estilos y cursor, para clientes gráficos.
+    Snapshot {
+        pane: String,
+    },
+    /// Cambia el tamaño del PTY y de la pantalla.
+    Resize {
+        pane: String,
+        rows: u16,
+        cols: u16,
+    },
     SetStatus {
         pane: String,
         status: Status,
@@ -151,6 +161,35 @@ pub enum Request {
         pane: String,
     },
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Color {
+    Default,
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// Tramo de texto contiguo con el mismo estilo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    pub t: String,
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub rows: u16,
+    pub cols: u16,
+    /// (fila, columna) del cursor.
+    pub cursor: (u16, u16),
+    pub cursor_hidden: bool,
+    pub lines: Vec<Vec<Run>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

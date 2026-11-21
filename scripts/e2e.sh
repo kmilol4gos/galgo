@@ -606,5 +606,24 @@ sleep 0.5
 kill -9 "$S90" 2>/dev/null
 galgo kill l90 2>&1 | grep -q "ya terminó"; check "sin miembros, mensaje 'ya terminó'" $?
 
+echo "95. snapshot con estilos y resize (GUI)"
+galgo spawn s95 -- bash -c 'printf "\033[31mrojo\033[0m ok\n"; sleep 60' >/dev/null
+sleep 1
+python3 -I - "$GALGO_SOCKET" <<'PY95'
+import socket, json, sys, time
+def rq(m):
+    s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
+    s.send((json.dumps(m) + "\n").encode()); return json.loads(s.makefile().readline())
+d = rq({"op": "snapshot", "pane": "s95"})["data"]
+r0 = d["lines"][0][0]
+assert r0["t"] == "rojo" and r0["fg"] == {"Idx": 1}, r0
+assert rq({"op": "resize", "pane": "s95", "rows": 20, "cols": 60})["ok"]
+d = rq({"op": "snapshot", "pane": "s95"})["data"]
+assert (d["rows"], d["cols"]) == (20, 60), d
+assert not rq({"op": "resize", "pane": "s95", "rows": 0, "cols": 60})["ok"]
+PY95
+check "snapshot trae color por tramo y resize cambia la pantalla" $?
+galgo kill s95 >/dev/null 2>&1
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

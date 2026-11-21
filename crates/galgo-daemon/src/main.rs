@@ -572,6 +572,35 @@ impl Daemon {
                 let text = screen.lock().unwrap().screen().contents();
                 Ok(json!({ "text": text.trim_end() }))
             }
+            Request::Snapshot { pane } => {
+                let screen = {
+                    let st = self.state.lock().unwrap();
+                    Arc::clone(&st.panes[&st.resolve(&pane)?].screen)
+                };
+                let snap = snapshot(screen.lock().unwrap().screen());
+                Ok(serde_json::to_value(snap)?)
+            }
+            Request::Resize { pane, rows, cols } => {
+                if rows == 0 || cols == 0 {
+                    bail!("rows y cols deben ser mayores que 0");
+                }
+                let (screen, id) = {
+                    let st = self.state.lock().unwrap();
+                    let id = st.resolve(&pane)?;
+                    let p = &st.panes[&id];
+                    p._master
+                        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+                        .context("no pude cambiar el tamaño del PTY")?;
+                    (Arc::clone(&p.screen), id)
+                };
+                let _ = id;
+                let (nr, nc) = (
+                    std::num::NonZeroU16::new(rows).unwrap(),
+                    std::num::NonZeroU16::new(cols).unwrap(),
+                );
+                screen.lock().unwrap().screen_mut().set_size(nr, nc);
+                Ok(json!({}))
+            }
             Request::SetStatus { pane, status } => {
                 let id = {
                     let mut st = self.state.lock().unwrap();
@@ -910,5 +939,54 @@ async fn main() -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(serve(Arc::clone(&daemon), stream));
+    }
+}
+
+fn conv_color(c: vt100::Color) -> galgo_proto::Color {
+    match c {
+        vt100::Color::Default => galgo_proto::Color::Default,
+        vt100::Color::Idx(i) => galgo_proto::Color::Idx(i),
+        vt100::Color::Rgb(r, g, b) => galgo_proto::Color::Rgb(r, g, b),
+    }
+}
+
+fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
+    use galgo_proto::Run;
+    let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
+    let mut lines = Vec::with_capacity(rows as usize);
+    for r in 0..rows {
+        let mut runs: Vec<Run> = Vec::new();
+        for c in 0..cols {
+            let Some(cell) = screen.cell(r, c) else { continue };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let t = if cell.has_contents() { cell.contents().to_string() } else { " ".to_string() };
+            let (fg, bg) = (conv_color(cell.fgcolor()), conv_color(cell.bgcolor()));
+            let (bold, italic, underline, inverse) =
+                (cell.bold(), cell.italic(), cell.underline(), cell.inverse());
+            match runs.last_mut() {
+                Some(l)
+                    if l.fg == fg
+                        && l.bg == bg
+                        && l.bold == bold
+                        && l.italic == italic
+                        && l.underline == underline
+                        && l.inverse == inverse =>
+                {
+                    l.t.push_str(&t)
+                }
+                _ => runs.push(Run { t, fg, bg, bold, italic, underline, inverse }),
+            }
+        }
+        lines.push(runs);
+    }
+    galgo_proto::Snapshot {
+        rows,
+        cols,
+        cursor: screen.cursor_position(),
+        cursor_hidden: screen.hide_cursor(),
+        lines,
     }
 }

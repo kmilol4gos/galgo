@@ -57,3 +57,9 @@ Medir en el mismo Mac: tiempo monótono desde recepción del evento de tecla en 
 3. **Sincronización multicliente:** dos GUIs ven idéntica cuadrícula y estado; prueba fuerza pérdida/desborde y reconexión, verifica recuperación y que observador no redimensiona ni escribe.
 4. **Compatibilidad terminal:** suite reproducible para los cuatro protocolos de §2, Unicode, scrollback y pantalla alternativa; publicar matriz de resultados y elegir motor; no anunciar funciones fallidas.
 5. **Producto:** sidebar/proyectos, bandeja de atención y splits; test de estados blocked/done y dos ventanas sobre misma sesión; pruebas de accesibilidad y empaquetado en ambos sistemas, con limitaciones documentadas.
+
+### Corte vertical real (21-11-2026)
+
+La GUI (iced) ahora es un terminal usable: pide `Snapshot` al daemon cada 50 ms (tramos con color/negrita/cursiva/subrayado/inverso, cursor), pinta con `rich_text`, captura el teclado (letras, Enter, flechas, Ctrl+letra, Alt, Cmd+V pega) y lo envía en orden por un único hilo, y calcula filas×columnas de la ventana para enviar `Resize` al daemon. Verificado con captura de pantalla en macOS: colores ANSI, negrita, subrayado, inverso y cursor correctos; teclear en la GUI llega al shell; el resize cambió 40×140 a 33×94.
+
+Límites conocidos: sondeo (no suscripción por eventos), sin scrollback ni selección/copia, sin ratón, sin modo cursor de aplicación (flechas siempre `ESC [`), ancho de celda de Menlo asumido (8,43 px), caracteres anchos sin tratar, latencia sin medir, sin splits.
