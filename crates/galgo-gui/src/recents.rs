@@ -8,8 +8,13 @@ use std::path::{Path, PathBuf};
 /// Cuántas carpetas se recuerdan.
 pub const MAX: usize = 12;
 
+/// Tamaño máximo del archivo de recientes que se lee.
+const MAX_FILE: u64 = 64 * 1024;
+
 /// Pone `path` el primero de la lista, sin duplicados, y recorta a `MAX`.
 pub fn push(list: &mut Vec<String>, path: &str) {
+    // B9: `/a/` y `/a` son la misma carpeta; sin barra final, no se duplican.
+    let path = if path.len() > 1 { path.trim_end_matches('/') } else { path };
     list.retain(|p| p != path);
     list.insert(0, path.to_string());
     list.truncate(MAX);
@@ -29,6 +34,11 @@ pub fn file() -> PathBuf {
 /// Lee la lista. Un archivo que falta, que no se entiende o con carpetas que ya no existen da una lista vacía
 /// o filtrada: nunca es un error para la GUI.
 pub fn load(path: &Path) -> Vec<String> {
+    // B9: un FIFO o un archivo enorme no se lee: colgaría o consumiría la GUI al arrancar.
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return Vec::new() };
+    if !meta.file_type().is_file() || meta.len() > MAX_FILE {
+        return Vec::new();
+    }
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
     let list: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
     list.into_iter().filter(|p| Path::new(p).is_dir()).take(MAX).collect()
@@ -36,7 +46,8 @@ pub fn load(path: &Path) -> Vec<String> {
 
 /// Escribe la lista de forma atómica y privada (0600).
 pub fn save(path: &Path, list: &[String]) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    // B9: el temporal lleva el pid: otro proceso no puede bloquear el guardado con el mismo nombre.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
     f.write_all(serde_json::to_string(list).unwrap_or_else(|_| "[]".into()).as_bytes())?;
@@ -87,6 +98,24 @@ mod tests {
         std::fs::write(&file, "{no es json").unwrap();
         assert!(load(&file).is_empty());
         assert!(load(&dir.join("falta.json")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// r13 B9: un FIFO en el lugar del archivo no se lee (no cuelga); las barras finales no duplican carpetas.
+    #[test]
+    fn r13_fifo_no_cuelga_y_barras_finales_no_duplican() {
+        let dir = std::env::temp_dir().join(format!("galgo-r13-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("gui-recientes.json");
+        let ok = std::process::Command::new("mkfifo").arg(&fifo).status().map(|s| s.success()).unwrap_or(false);
+        if ok {
+            assert!(load(&fifo).is_empty(), "un FIFO no se lee");
+        }
+        let mut l = Vec::new();
+        push(&mut l, "/a/b/");
+        push(&mut l, "/a/b");
+        assert_eq!(l, vec!["/a/b".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -236,6 +236,8 @@ enum Message {
     NewWsSubmit,
     PickFolder,
     FolderPicked(Option<String>),
+    /// La carpeta elegida tiene una ruta que no es UTF-8: no se abre (B10).
+    FolderRejected,
     /// Crea un workspace en esa carpeta: un shell, sin formulario.
     OpenFolder(String),
     WorkspaceOpened(String, Result<serde_json::Value, String>),
@@ -1303,17 +1305,31 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     .set_title("Elegir la carpeta del workspace")
                     .pick_folder()
                     .await
-                    .map(|folder| folder.path().to_string_lossy().into_owned())
+                    .map(|folder| folder.path().to_path_buf())
             },
-            Message::FolderPicked,
+            // B10: una ruta que no es UTF-8 no se convierte en otra carpeta con caracteres de reemplazo.
+            |folder| match folder {
+                None => Message::FolderPicked(None),
+                Some(path) => match path.to_str() {
+                    Some(text) => Message::FolderPicked(Some(text.to_string())),
+                    None => Message::FolderRejected,
+                },
+            },
         ),
         Message::FolderPicked(Some(path)) => open_folder(app, path),
         Message::FolderPicked(None) => Task::none(),
+        Message::FolderRejected => {
+            app.error = Some("la carpeta tiene un nombre que no es UTF-8; elige otra o renómbrala".into());
+            Task::none()
+        }
         Message::OpenFolder(path) => open_folder(app, path),
         Message::WorkspaceOpened(path, Ok(data)) => {
             app.new_ws = None;
             app.error = None;
-            recents::push(&mut app.recents, &path);
+            // B9: el inicio no es un workspace reciente; las rutas se guardan sin barra final.
+            if path != home_dir() {
+                recents::push(&mut app.recents, &path);
+            }
             if let Some(file) = &app.recents_path {
                 let _ = recents::save(file, &app.recents);
             }
@@ -2715,5 +2731,14 @@ mod tests {
         }
         assert!(app.palette_cursor < PALETTE_VISIBLE, "cursor {}", app.palette_cursor);
         assert!(palette_items(&App::default()).len() >= 15, "la paleta tiene los comandos de división, pestañas y lanzadores");
+    }
+
+    /// r13 B10: una carpeta que no es UTF-8 se rechaza con un aviso, no se abre con otro nombre.
+    #[test]
+    fn r13_ruta_no_utf8_se_rechaza() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        let _ = update(&mut app, Message::FolderRejected);
+        assert!(app.error.as_deref().is_some_and(|e| e.contains("UTF-8")));
+        assert!(app.recents.is_empty());
     }
 }
