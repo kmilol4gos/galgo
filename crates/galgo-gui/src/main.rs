@@ -190,7 +190,9 @@ struct App {
     /// Pestañas y splits de cada workspace (solo en la GUI).
     layouts: layout::Layouts,
     /// Split pedido y aún sin panel: (panel con foco, lado a lado).
-    pending_split: Option<(u32, bool)>,
+    pending_split: std::collections::HashMap<String, (u32, bool)>,
+    /// Nombres de paneles pedidos y aún sin respuesta (B2): un lanzamiento nuevo no los repite.
+    inflight: Vec<String>,
     /// Últimas pantallas de los paneles visibles que no tienen el foco, y su generación.
     others: std::collections::HashMap<u32, Snapshot>,
     others_gen: std::collections::HashMap<u32, u64>,
@@ -248,6 +250,8 @@ enum Message {
     Launch(launch::Agent),
     /// Un panel creado desde un atajo o el lanzador: queda seleccionado.
     PaneLaunched(Result<serde_json::Value, String>),
+    /// Un lanzamiento que falló: su nombre queda libre y su split pendiente se descarta (B1, B2).
+    LaunchFailed(String, String),
     /// Pestañas y splits (E): cambiar de pestaña, elegir una, dividir el panel enfocado, mover el foco por direcciones.
     NextTab(isize),
     SelectTab(usize),
@@ -405,9 +409,18 @@ fn spawn_task(app: &mut App, req: galgo_proto::Request) -> Task<Message> {
 /// Como `spawn_task`, con el tamaño del panel que nace (un split nace con la mitad del área).
 fn spawn_task_sized(app: &mut App, req: galgo_proto::Request, (rows, cols): (u16, u16)) -> Task<Message> {
     app.spawn_size = Some((rows, cols));
+    // B2: el nombre pedido se reserva hasta que llegue la respuesta, para que el siguiente lanzamiento no lo repita.
+    let name = match &req {
+        galgo_proto::Request::Spawn { name, .. } => name.clone(),
+        _ => String::new(),
+    };
+    app.inflight.push(name.clone());
     Task::perform(
         async move { tokio::task::spawn_blocking(move || request(req)).await.map_err(|e| e.to_string()).and_then(|r| r) },
-        Message::PaneLaunched,
+        move |result| match result {
+            Ok(data) => Message::PaneLaunched(Ok(data)),
+            Err(e) => Message::LaunchFailed(name.clone(), e),
+        },
     )
 }
 
@@ -440,7 +453,7 @@ fn body_mode(app: &App) -> Body {
 
 /// Nombres de todos los paneles (vivos y restaurados): un nombre nuevo no puede repetirlos.
 fn names(app: &App) -> Vec<&str> {
-    app.panes.iter().map(|p| p.name.as_str()).collect()
+    app.panes.iter().map(|p| p.name.as_str()).chain(app.inflight.iter().map(String::as_str)).collect()
 }
 
 /// Crea un workspace en `path`: un shell en esa carpeta, con nombre libre y sin formulario.
@@ -1120,7 +1133,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             let (rows, cols) = grid_in(layout::halves(area, vertical).1);
             let name = launch::free_name("shell", &names(app));
             let req = launch::shell_request(&name, &login_shell(), &cwd.unwrap_or_else(home_dir), workspace, rows, cols);
-            app.pending_split = Some((focus, vertical));
+            app.pending_split.insert(name.clone(), (focus, vertical));
             spawn_task_sized(app, req, (rows, cols))
         }
         Message::FocusDir(dir) => {
@@ -1153,7 +1166,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.sizes.insert(p.id, (rows, cols));
                     app.panes.push(p.clone());
                     // Un split coloca el panel junto al enfocado; si no, nace en su pestaña.
-                    if let Some((focus, vertical)) = app.pending_split.take() {
+                    app.inflight.retain(|n| *n != p.name);
+                    if let Some((focus, vertical)) = app.pending_split.remove(&p.name) {
                         app.layouts.split(focus, vertical, p.id);
                     }
                     app.layouts.sync(&pane_keys(app));
@@ -1165,7 +1179,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::PaneLaunched(Err(e)) => {
-            app.pending_split = None;
+            app.error = Some(e);
+            Task::none()
+        }
+        Message::LaunchFailed(name, e) => {
+            app.inflight.retain(|n| *n != name);
+            app.pending_split.remove(&name);
             app.error = Some(e);
             Task::none()
         }
@@ -2380,12 +2399,12 @@ mod tests {
         let mut app = App { panes: vec![p1], selected: Some(1), ..Default::default() };
         app.layouts.sync(&pane_keys(&app));
         let _ = update(&mut app, Message::SplitFocused(true));
-        assert_eq!(app.pending_split, Some((1, true)));
-        let mut p2 = pane_info(2, "dos", Status::Idle);
+        assert_eq!(app.pending_split.get("shell"), Some(&(1, true)));
+        let mut p2 = pane_info(2, "shell", Status::Idle);
         p2.workspace = Some("repo/main".into());
         let json = serde_json::to_value(p2).unwrap();
         let _ = update(&mut app, Message::PaneLaunched(Ok(json)));
-        assert!(app.pending_split.is_none());
+        assert!(app.pending_split.is_empty());
         let tab = app.layouts.active_tab("repo/main").expect("la pestaña del workspace");
         assert_eq!(tab.root.ids(), vec![1, 2], "lado a lado en la misma pestaña");
         assert_eq!(tab.focus, 2, "el panel nuevo tiene el foco");
@@ -2398,8 +2417,8 @@ mod tests {
         let mut app = App { panes: vec![pane_info(1, "uno", Status::Idle)], selected: Some(1), ..Default::default() };
         app.layouts.sync(&pane_keys(&app));
         let _ = update(&mut app, Message::SplitFocused(false));
-        let _ = update(&mut app, Message::PaneLaunched(Err("sin daemon".into())));
-        assert!(app.pending_split.is_none());
+        let _ = update(&mut app, Message::LaunchFailed("shell".into(), "sin daemon".into()));
+        assert!(app.pending_split.is_empty());
     }
 
     /// E: Cmd+Opt+flecha mueve el foco al split vecino; sin vecino en esa dirección, no se mueve.
@@ -2556,7 +2575,7 @@ mod tests {
         app.layouts.sync(&pane_keys(&app));
         let _ = layout_resizes(&mut app);
         let _ = update(&mut app, Message::SplitFocused(true));
-        let mut dos = pane_info(2, "dos", Status::Idle);
+        let mut dos = pane_info(2, "shell", Status::Idle);
         dos.workspace = Some("r/main".into());
         let _ = update(&mut app, Message::PaneLaunched(Ok(serde_json::to_value(dos).unwrap())));
         let envios = layout_resizes(&mut app);
@@ -2603,5 +2622,38 @@ mod tests {
         assert_eq!(app.layouts.active_tab("w").unwrap().focus, 3);
         let _ = update(&mut app, Message::SelectWorkspaceAt(0));
         assert_eq!(app.selected, Some(3), "se queda en la pestaña activa, no en el panel 1");
+    }
+
+    /// r13 B1+B2: dos splits en vuelo reciben nombres distintos, y cada respuesta cae en su split aunque lleguen al revés.
+    #[test]
+    fn r13_dos_splits_en_vuelo_se_casan_por_nombre() {
+        let mut uno = pane_info(1, "uno", Status::Idle);
+        uno.workspace = Some("r/main".into());
+        let mut app = App { panes: vec![uno], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        let _ = update(&mut app, Message::SplitFocused(true));
+        let _ = update(&mut app, Message::SplitFocused(false));
+        assert_eq!(app.inflight, vec!["shell".to_string(), "shell-2".to_string()], "nombres distintos aunque estén en vuelo");
+        let mut abajo = pane_info(3, "shell-2", Status::Idle);
+        abajo.workspace = Some("r/main".into());
+        let _ = update(&mut app, Message::PaneLaunched(Ok(serde_json::to_value(abajo).unwrap())));
+        let mut derecha = pane_info(2, "shell", Status::Idle);
+        derecha.workspace = Some("r/main".into());
+        let _ = update(&mut app, Message::PaneLaunched(Ok(serde_json::to_value(derecha).unwrap())));
+        let area = terminal_area_for(&app);
+        let rects = app.layouts.active_tab("r/main").unwrap().root.rects(area);
+        let r = |id: u32| rects.iter().find(|(p, _)| *p == id).unwrap().1;
+        assert!(r(2).x > r(1).x && (r(2).y - r(1).y).abs() < 1.0, "2 a la derecha de 1");
+        assert!(r(3).y > r(1).y && (r(3).x - r(1).x).abs() < 1.0, "3 debajo de 1");
+        assert!(app.inflight.is_empty() && app.pending_split.is_empty());
+    }
+
+    /// r13 B2: con un lanzamiento en vuelo, el nombre siguiente no coincide con él.
+    #[test]
+    fn r13_nombres_en_vuelo_no_se_repiten() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        let _ = update(&mut app, Message::NewTab);
+        let _ = update(&mut app, Message::NewTab);
+        assert_eq!(app.inflight, vec!["shell".to_string(), "shell-2".to_string()]);
     }
 }
