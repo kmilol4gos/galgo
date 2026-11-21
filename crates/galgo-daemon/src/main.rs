@@ -37,7 +37,15 @@ struct InboxMsg {
     acked: bool,
     /// Entregado a una espera en curso; se confirma o se libera según la escritura.
     claimed: bool,
+    /// Con `client_ack`: la reserva vence si el cliente no confirma a tiempo.
+    hold_until: Option<Instant>,
     last_inject: Option<Instant>,
+}
+
+impl InboxMsg {
+    fn is_held(&self) -> bool {
+        self.claimed && self.hold_until.map_or(true, |t| t > Instant::now())
+    }
 }
 
 struct Pane {
@@ -104,6 +112,7 @@ impl State {
                 created: Instant::now(),
                 acked: false,
                 claimed: false,
+                hold_until: None,
                 last_inject: None,
             });
         }
@@ -136,6 +145,7 @@ struct Daemon {
     notify: Notify,
     socket: PathBuf,
     orphan_secs: u64,
+    ack_secs: u64,
     retry: Duration,
     /// Tiempo máximo para escribir una respuesta; un cliente que no lee no bloquea la entrega.
     write_timeout: Duration,
@@ -367,7 +377,7 @@ impl Daemon {
         }
         let mut lines = Vec::new();
         let mut ids = Vec::new();
-        for m in p.inbox.iter_mut().filter(|m| !m.acked && !m.claimed) {
+        for m in p.inbox.iter_mut().filter(|m| !m.acked && !m.is_held()) {
             if m.last_inject.is_none_or(|t| t.elapsed() >= retry) {
                 m.last_inject = Some(Instant::now());
                 lines.push(sanitize(&format!(
@@ -400,9 +410,10 @@ impl Daemon {
     fn check_wait(&self, waiter: u32, target: u32) -> Option<(Value, Option<u64>)> {
         let mut st = self.state.lock().unwrap();
         if let Some(w) = st.panes.get_mut(&waiter) {
-            if let Some(m) = w.inbox.iter_mut().find(|m| !m.acked && !m.claimed && m.from == target) {
+            if let Some(m) = w.inbox.iter_mut().find(|m| !m.acked && !m.is_held() && m.from == target) {
                 // Reserva el mensaje: otra espera no lo recibe mientras esta respuesta se escribe.
                 m.claimed = true;
+                m.hold_until = None;
                 let v = json!({
                     "from": m.from_name, "kind": m.kind, "summary": m.summary, "delivered": "wait",
                     "msg_id": m.id, "pane_id": waiter
@@ -423,6 +434,16 @@ impl Daemon {
         self.set_claim(pane, msg, true);
     }
 
+    /// La respuesta se escribió pero el cliente aún no confirma: se retiene un tiempo.
+    fn hold(&self, pane: u32, msg: u64, secs: u64) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(p) = st.panes.get_mut(&pane) {
+            for m in p.inbox.iter_mut().filter(|m| m.id == msg && !m.acked) {
+                m.hold_until = Some(Instant::now() + Duration::from_secs(secs));
+            }
+        }
+    }
+
     /// Libera un mensaje reservado cuando la respuesta no llegó al cliente: queda entregable.
     fn release(&self, pane: u32, msg: u64) {
         self.set_claim(pane, msg, false);
@@ -434,6 +455,7 @@ impl Daemon {
             if let Some(p) = st.panes.get_mut(&pane) {
                 for m in p.inbox.iter_mut().filter(|m| m.id == msg) {
                     m.claimed = false;
+                    m.hold_until = None;
                     if confirmed {
                         m.acked = true;
                     }
@@ -473,6 +495,8 @@ impl Daemon {
             }
             tokio::select! {
                 _ = &mut notified => {}
+                // Una reserva sin ack vence sola: hay que volver a mirar.
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     return (Err(anyhow!("tiempo agotado esperando al panel")), None);
                 }
@@ -794,7 +818,9 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
         if let Some((pane, msg)) = ack {
             // Con `client_ack` solo el cliente confirma, tras entregar: escribir en el socket
             // no prueba que alguien lo leyera.
-            if written && !client_ack {
+            if written && client_ack {
+                d.hold(pane, msg, d.ack_secs);
+            } else if written {
                 d.confirm(pane, msg);
             } else {
                 d.release(pane, msg);
@@ -828,6 +854,7 @@ async fn main() -> Result<()> {
         notify: Notify::new(),
         socket: socket.clone(),
         orphan_secs: env_u64("GALGO_ORPHAN_SECS", 30),
+        ack_secs: env_u64("GALGO_ACK_SECS", 5),
         retry: Duration::from_secs(env_u64("GALGO_RETRY_SECS", 60)),
         write_timeout: Duration::from_secs(env_u64("GALGO_WRITE_TIMEOUT_SECS", 10)),
     });
