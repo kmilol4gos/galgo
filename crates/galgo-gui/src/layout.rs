@@ -173,11 +173,15 @@ impl Layouts {
         }
     }
 
-    /// Pestaña nueva con el panel `id`, que queda activa.
+    /// Pestaña nueva con el panel `id`. G1: solo se activa si el workspace no tenía pestañas; un panel que llega de
+    /// fuera no cambia lo que se ve. Quien crea el panel y quiere verlo llama a `focus`.
     pub fn new_tab(&mut self, key: &str, id: u32) {
         let ws = self.by_key.entry(key.to_string()).or_default();
+        let was_empty = ws.tabs.is_empty();
         ws.tabs.push(Tab { root: Node::Leaf(id), focus: id });
-        ws.active = ws.tabs.len() - 1;
+        if was_empty {
+            ws.active = 0;
+        }
     }
 
     /// Divide la hoja con foco `focus` y pone `new` a su lado (o debajo). El nuevo panel toma el foco.
@@ -295,8 +299,12 @@ mod tests {
         assert_eq!(l.active_tab("w").unwrap().focus, 2);
         l.sync(&[(1, "w".into()), (2, "w".into()), (5, "w".into())]);
         assert_eq!(l.by_key["w"].tabs.len(), 2, "el 5 llega en pestaña nueva");
+        // G1: el panel 5 llega de fuera y no cambia la pestaña visible.
+        assert_eq!(l.by_key["w"].active, 0, "sync no activa una pestaña nueva en un workspace existente");
         l.cycle("w", 1);
         assert_eq!(l.key_of(5).as_deref(), Some("w"));
+        assert_eq!(l.by_key["w"].active, 1);
+        l.cycle("w", 1);
         assert_eq!(l.by_key["w"].active, 0, "da la vuelta");
         l.focus(5);
         assert_eq!(l.by_key["w"].active, 1);

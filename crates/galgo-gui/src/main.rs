@@ -978,7 +978,27 @@ fn app_title(app: &App) -> String {
     attention::window_title(app.attention.count(&app.panes))
 }
 
+/// Punto de entrada de la GUI: aplica el mensaje y, después, garantiza la invariante de foco.
 fn update(app: &mut App, message: Message) -> Task<Message> {
+    let task = update_inner(app, message);
+    keep_focus_visible(app);
+    task
+}
+
+/// Invariante (G1): el panel seleccionado está en la pestaña activa de su workspace. Si no lo está, la pestaña
+/// activa pasa a ser la suya. Así lo que se teclea siempre va a un panel que se ve.
+fn keep_focus_visible(app: &mut App) {
+    if let Some(id) = app.selected {
+        if let Some(key) = app.layouts.key_of(id) {
+            let visible = app.layouts.active_tab(&key).is_some_and(|t| t.root.ids().contains(&id));
+            if !visible {
+                app.layouts.focus(id);
+            }
+        }
+    }
+}
+
+fn update_inner(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::TickScreen => {
             if let Some(e) = outbox_error().lock().unwrap().take() {
@@ -2370,5 +2390,45 @@ mod tests {
         let _ = update(&mut app, Message::NextTab(1));
         assert_eq!(app.selected, Some(1), "da la vuelta");
         assert!(matches!(shortcut(&Key::Character("]".into()), keyboard::Modifiers::COMMAND), Some(Message::NextTab(1))));
+    }
+
+    /// r13 G1 (arranque): con tres paneles en un workspace, el seleccionado queda en la pestaña que se ve.
+    #[test]
+    fn r13_arranque_foco_visible() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        let panes: Vec<PaneInfo> = (1..=3)
+            .map(|i| {
+                let mut p = pane_info(i, &format!("p{i}"), Status::Idle);
+                p.workspace = Some("w".into());
+                p
+            })
+            .collect();
+        let _ = update(&mut app, Message::Panes(Ok(panes)));
+        let sel = app.selected.expect("hay selección");
+        let visibles = app.layouts.active_tab("w").expect("pestaña activa").root.ids();
+        assert!(visibles.contains(&sel), "seleccionado {sel}, visibles {visibles:?}");
+    }
+
+    /// r13 G1 (spawn externo): un panel que llega de fuera no cambia la vista ni el foco.
+    #[test]
+    fn r13_spawn_externo_no_roba_la_vista() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        let mut panes: Vec<PaneInfo> = (1..=3)
+            .map(|i| {
+                let mut p = pane_info(i, &format!("p{i}"), Status::Idle);
+                p.workspace = Some("w".into());
+                p
+            })
+            .collect();
+        let _ = update(&mut app, Message::Panes(Ok(panes.clone())));
+        let _ = update(&mut app, Message::Select(1));
+        let mut externo = pane_info(4, "externo", Status::Idle);
+        externo.workspace = Some("w".into());
+        panes.push(externo);
+        let _ = update(&mut app, Message::Panes(Ok(panes)));
+        assert_eq!(app.selected, Some(1), "el foco no se mueve");
+        let visibles = app.layouts.active_tab("w").expect("pestaña activa").root.ids();
+        assert!(visibles.contains(&1), "el seleccionado sigue visible: {visibles:?}");
+        assert!(!visibles.contains(&4), "el externo está en otra pestaña");
     }
 }
