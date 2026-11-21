@@ -12,6 +12,7 @@ const MUTED: Color = Color::from_rgb(0.60, 0.64, 0.70);
 
 mod attention;
 mod launch;
+mod layout;
 mod newpane;
 mod palette;
 mod recents;
@@ -38,7 +39,12 @@ const SIDEBAR_W: f32 = 260.0;
 const WHEEL_LINES: i32 = 3;
 /// Origen (esquina superior izquierda) de la cuadrícula dentro de la ventana: sidebar, padding del
 /// cuerpo (12), padding del contenedor del terminal (10), cabecera (44) y espacios (10).
-const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + 12.0 + 10.0, 12.0 + 44.0 + 10.0 + 10.0);
+/// Altura de la barra de pestañas (debajo de la cabecera).
+const TABS_H: f32 = 28.0;
+/// Altura de la línea de detalle de uso, cuando el panel enfocado tiene datos (con su separación).
+const DETAIL_H: f32 = 26.0;
+/// Origen de la cuadrícula de un panel único (referencia de las pruebas); un split usa el de su rectángulo.
+const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + 12.0 + 10.0, 12.0 + 44.0 + 10.0 + TABS_H + 10.0 + 10.0);
 /// Primera opción del desplegable de manager del formulario: ningún manager.
 const NO_MANAGER: &str = "(ninguno)";
 
@@ -180,6 +186,15 @@ struct App {
     /// Paleta de comandos abierta: texto de búsqueda y resultado resaltado.
     palette: Option<String>,
     palette_cursor: usize,
+    /// Pestañas y splits de cada workspace (solo en la GUI).
+    layouts: layout::Layouts,
+    /// Split pedido y aún sin panel: (panel con foco, lado a lado).
+    pending_split: Option<(u32, bool)>,
+    /// Últimas pantallas de los paneles visibles que no tienen el foco, y su generación.
+    others: std::collections::HashMap<u32, Snapshot>,
+    others_gen: std::collections::HashMap<u32, u64>,
+    others_loading: std::collections::HashSet<u32>,
+    others_cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +245,13 @@ enum Message {
     Launch(launch::Agent),
     /// Un panel creado desde un atajo o el lanzador: queda seleccionado.
     PaneLaunched(Result<serde_json::Value, String>),
+    /// Pestañas y splits (E): cambiar de pestaña, elegir una, dividir el panel enfocado, mover el foco por direcciones.
+    NextTab(isize),
+    SelectTab(usize),
+    SplitFocused(bool),
+    FocusDir(layout::Dir),
+    /// Pantalla de un panel visible sin el foco.
+    OtherScreen(u32, Result<ScreenReply, String>),
     /// Paleta de comandos (C): abrir/cerrar, buscar, mover el resaltado, ejecutar (por índice de resultado).
     OpenPalette,
     ClosePalette,
@@ -290,6 +312,10 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("n", false) => Some(Message::OpenNewWorkspace),
         ("t", false) => Some(Message::NewTab),
         ("w", false) => Some(Message::CloseFocused),
+        ("[", false) => Some(Message::NextTab(-1)),
+        ("]", false) => Some(Message::NextTab(1)),
+        ("d", false) => Some(Message::SplitFocused(true)),
+        ("d", true) => Some(Message::SplitFocused(false)),
         ("l", true) => Some(Message::OpenLauncher),
         ("u", true) => Some(Message::NextAttention),
         (d, false) => match d.parse::<usize>() {
@@ -333,7 +359,12 @@ fn context_request(app: &App, agent: launch::Agent) -> galgo_proto::Request {
 
 /// Crea un panel con la petición dada; al llegar queda seleccionado.
 fn spawn_task(app: &mut App, req: galgo_proto::Request) -> Task<Message> {
-    let (rows, cols) = grid_for(app.window);
+    let size = grid_for(app.window);
+    spawn_task_sized(app, req, size)
+}
+
+/// Como `spawn_task`, con el tamaño del panel que nace (un split nace con la mitad del área).
+fn spawn_task_sized(app: &mut App, req: galgo_proto::Request, (rows, cols): (u16, u16)) -> Task<Message> {
     app.spawn_size = Some((rows, cols));
     Task::perform(
         async move { tokio::task::spawn_blocking(move || request(req)).await.map_err(|e| e.to_string()).and_then(|r| r) },
@@ -453,6 +484,99 @@ fn sidebar_tree_view<'a>(app: &'a App, mut list: iced::widget::Column<'a, Messag
         }
     }
     list
+}
+
+/// Barra de pestañas del workspace enfocado, con «+», y los botones de dividir.
+fn tabs_bar(app: &App) -> Element<'_, Message> {
+    let mut bar = row![].spacing(6).align_y(iced::Alignment::Center).height(TABS_H);
+    if let Some(ws) = focus_key(app).and_then(|k| app.layouts.by_key.get(&k)) {
+        for (i, tab) in ws.tabs.iter().enumerate() {
+            let name = app.panes.iter().find(|p| p.id == tab.focus).map_or("?", |p| p.name.as_str());
+            let marca = if i == ws.active { "▸ " } else { "" };
+            bar = bar.push(button(text(format!("{marca}{}  {name}", i + 1)).size(12)).padding([4, 10]).on_press(Message::SelectTab(i)));
+        }
+    }
+    bar = bar.push(button(text("+").size(12)).padding([4, 10]).on_press(Message::NewTab));
+    bar = bar.push(button(text("Dividir →").size(12)).padding([4, 10]).on_press(Message::SplitFocused(true)));
+    bar = bar.push(button(text("Dividir ↓").size(12)).padding([4, 10]).on_press(Message::SplitFocused(false)));
+    bar.into()
+}
+
+/// El área de paneles: la pestaña visible del workspace enfocado, con sus splits.
+fn layout_view(app: &App) -> Element<'_, Message> {
+    match focus_key(app).and_then(|k| app.layouts.active_tab(&k)) {
+        Some(tab) => node_view(app, &tab.root),
+        None => text("Esperando salida…").size(14).color(MUTED).into(),
+    }
+}
+
+/// Un nodo del layout: una hoja es un panel; un split reparte su área en dos mitades iguales.
+fn node_view<'a>(app: &'a App, node: &'a layout::Node) -> Element<'a, Message> {
+    match node {
+        layout::Node::Leaf(id) => leaf_view(app, *id),
+        layout::Node::Split { vertical, a, b } => {
+            let first = container(node_view(app, a)).width(Length::FillPortion(1)).height(Length::Fill);
+            let second = container(node_view(app, b)).width(Length::FillPortion(1)).height(Length::Fill);
+            if *vertical {
+                row![first, second].width(Length::Fill).height(Length::Fill).into()
+            } else {
+                column![first, second].width(Length::Fill).height(Length::Fill).into()
+            }
+        }
+    }
+}
+
+/// Un panel: el enfocado con su vista congelada y su cursor; los demás, con la última pantalla que llegó.
+fn leaf_view(app: &App, id: u32) -> Element<'_, Message> {
+    let focused = app.selected == Some(id);
+    let inner: Element<'_, Message> = if focused {
+        match shown(app) {
+            // Con `lazy`, el árbol de la pantalla solo se reconstruye cuando cambia lo que se muestra.
+            Some(snap) => {
+                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen));
+                let sel = app.sel;
+                lazy(key, move |_| screen_view(snap, sel)).into()
+            }
+            None => text(if app.selected.is_none() { "Crea un panel con «+ Nuevo panel» o con `galgo spawn`." } else { "Esperando salida…" }).size(14).color(MUTED).into(),
+        }
+    } else {
+        match app.others.get(&id) {
+            Some(snap) => screen_view(snap, None),
+            None => text("Esperando salida…").size(14).color(MUTED).into(),
+        }
+    };
+    let borde = if focused { Color::from_rgb(0.30, 0.45, 0.80) } else { Color::TRANSPARENT };
+    container(inner)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(10)
+        .clip(true)
+        .style(move |_| container::Style {
+            background: Some(term::DEFAULT_BG.into()),
+            border: iced::Border { color: borde, width: 1.0, radius: 6.0.into() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Siguiente panel visible sin el foco que hay que sondear, por turnos. `None` si no hay ninguno libre.
+fn next_other(app: &mut App) -> Option<u32> {
+    let key = focus_key(app)?;
+    let ids = app.layouts.active_tab(&key)?.root.ids();
+    let others: Vec<u32> = ids.into_iter().filter(|id| Some(*id) != app.selected && !app.others_loading.contains(id)).collect();
+    if others.is_empty() {
+        return None;
+    }
+    let id = others[app.others_cursor % others.len()];
+    app.others_cursor = app.others_cursor.wrapping_add(1);
+    Some(id)
+}
+
+/// Pide la pantalla de un panel visible sin el foco: desplazamiento 0, con «lo que cambió» si ya tenemos una.
+fn load_other(id: u32, since: Option<u64>) -> Task<Message> {
+    Task::perform(async move {
+        tokio::task::spawn_blocking(move || snapshot_request(id, 0, since)).await.map_err(|e| e.to_string())?
+    }, move |r| Message::OtherScreen(id, r))
 }
 
 /// Identificador del campo de búsqueda de la paleta: para darle el foco al abrirla.
@@ -660,6 +784,7 @@ fn back_to_live(app: &mut App) {
 /// Selecciona un panel. Mirarlo no cambia su tamaño y lo deja sin marca de "sin leer".
 fn select(app: &mut App, id: u32) -> Task<Message> {
     app.selected = Some(id);
+    app.layouts.focus(id);
     app.snap = None;
     app.snap_gen = None;
     app.snap_offset = 0;
@@ -676,10 +801,67 @@ fn select(app: &mut App, id: u32) -> Task<Message> {
 }
 
 /// Filas y columnas que caben en el área del terminal para el tamaño de ventana actual.
+/// Área donde viven los paneles: a la derecha de la barra lateral, debajo de la cabecera, las pestañas y, si lo hay,
+/// la línea de detalle de uso (`extra_top`).
+fn terminal_area(window: (f32, f32), extra_top: f32) -> layout::Rect {
+    let x = SIDEBAR_W + 12.0;
+    let y = 12.0 + 44.0 + 10.0 + TABS_H + 10.0 + extra_top;
+    layout::Rect { x, y, w: (window.0 - x - 12.0).max(0.0), h: (window.1 - y - 12.0).max(0.0) }
+}
+
+/// Cuadrícula de texto que cabe en un rectángulo de panel (con el margen de 10 px del terminal).
+fn grid_in(rect: layout::Rect) -> (u16, u16) {
+    (((rect.h - 20.0) / LINE_H).floor().max(5.0) as u16, ((rect.w - 20.0) / CELL_W).floor().max(20.0) as u16)
+}
+
+/// Cuadrícula de la ventana entera (un panel nuevo sin split).
 fn grid_for(window: (f32, f32)) -> (u16, u16) {
-    let w = window.0 - SIDEBAR_W - 24.0 - 20.0;
-    let h = window.1 - 24.0 - 44.0 - 20.0 - 10.0;
-    (((h / LINE_H).floor().max(5.0)) as u16, ((w / CELL_W).floor().max(20.0)) as u16)
+    grid_in(terminal_area(window, 0.0))
+}
+
+/// Altura extra por la línea de detalle de uso, si el panel enfocado la muestra.
+fn detail_extra(app: &App) -> f32 {
+    let has = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).is_some_and(|p| p.usage.is_some());
+    if has { DETAIL_H } else { 0.0 }
+}
+
+/// Área de los paneles con la altura real de la ventana y de la columna del cuerpo.
+fn terminal_area_for(app: &App) -> layout::Rect {
+    terminal_area(app.window, detail_extra(app))
+}
+
+/// Rectángulo del panel `id` dentro de la pestaña visible de su workspace.
+fn pane_rect(app: &App, id: u32) -> Option<layout::Rect> {
+    let key = app.layouts.key_of(id)?;
+    let tab = app.layouts.active_tab(&key)?;
+    tab.root.rects(terminal_area_for(app)).into_iter().find(|(p, _)| *p == id).map(|(_, r)| r)
+}
+
+/// Origen de la cuadrícula de un rectángulo de panel (su margen de 10 px).
+fn origin_in(rect: layout::Rect) -> (f32, f32) {
+    (rect.x + 10.0, rect.y + 10.0)
+}
+
+/// Origen de la cuadrícula del panel enfocado; sin rectángulo conocido, el de referencia.
+fn focus_origin(app: &App) -> (f32, f32) {
+    app.selected.and_then(|id| pane_rect(app, id)).map_or(TERM_ORIGIN, origin_in)
+}
+
+/// Panel visible bajo el puntero, si hay alguno.
+fn leaf_at(app: &App, p: Point) -> Option<u32> {
+    let key = app.selected.and_then(|id| app.layouts.key_of(id))?;
+    let tab = app.layouts.active_tab(&key)?;
+    tab.root.rects(terminal_area_for(app)).into_iter().find(|(_, r)| p.x >= r.x && p.y >= r.y && p.x < r.x + r.w && p.y < r.y + r.h).map(|(id, _)| id)
+}
+
+/// Clave de workspace del panel enfocado.
+fn focus_key(app: &App) -> Option<String> {
+    app.selected.and_then(|id| app.layouts.key_of(id))
+}
+
+/// Pares (id, clave de workspace) de todos los paneles, para alinear el layout.
+fn pane_keys(app: &App) -> Vec<(u32, String)> {
+    app.panes.iter().map(|p| (p.id, p.workspace.clone().unwrap_or_default())).collect()
 }
 
 /// Pantalla que se muestra: la congelada si hay selección, si no la última recibida.
@@ -690,12 +872,12 @@ fn shown(app: &App) -> Option<&Snapshot> {
 /// Celda de la cuadrícula bajo el píxel (x, y), con el origen del terminal restado.
 /// Fuera de la cuadrícula por la derecha o por abajo se recorta al borde; por la izquierda o
 /// por arriba devuelve `None`.
-fn pixel_to_cell(x: f32, y: f32, grid: (u16, u16)) -> Option<Cell> {
+fn pixel_to_cell(origin: (f32, f32), x: f32, y: f32, grid: (u16, u16)) -> Option<Cell> {
     let (rows, cols) = grid;
     if rows == 0 || cols == 0 {
         return None;
     }
-    let (ox, oy) = TERM_ORIGIN;
+    let (ox, oy) = origin;
     if x < ox || y < oy {
         return None;
     }
@@ -705,21 +887,21 @@ fn pixel_to_cell(x: f32, y: f32, grid: (u16, u16)) -> Option<Cell> {
 }
 
 /// Si el píxel cae dentro de la cuadrícula visible (no en el recorte de los bordes).
-fn inside_grid(x: f32, y: f32, grid: (u16, u16)) -> bool {
-    let (ox, oy) = TERM_ORIGIN;
+fn inside_grid(origin: (f32, f32), x: f32, y: f32, grid: (u16, u16)) -> bool {
+    let (ox, oy) = origin;
     x >= ox && y >= oy && x < ox + grid.1 as f32 * CELL_W && y < oy + grid.0 as f32 * LINE_H
 }
 
 fn pointer_in_grid(app: &App) -> bool {
     match (app.pointer, shown(app)) {
-        (Some(p), Some(s)) => inside_grid(p.x, p.y, (s.rows, s.cols)),
+        (Some(p), Some(s)) => inside_grid(focus_origin(app), p.x, p.y, (s.rows, s.cols)),
         _ => false,
     }
 }
 
 fn grid_cell(app: &App, p: Point) -> Option<Cell> {
     let snap = shown(app)?;
-    pixel_to_cell(p.x, p.y, (snap.rows, snap.cols))
+    pixel_to_cell(focus_origin(app), p.x, p.y, (snap.rows, snap.cols))
 }
 
 /// Extremos de una selección en orden de lectura.
@@ -765,7 +947,7 @@ fn selection_text(snap: &Snapshot, sel: Selection) -> String {
 /// Solo se llama al escribir en un panel o al redimensionar la ventana: mirar un panel no cambia su tamaño.
 fn size_request(app: &mut App) -> Option<Request> {
     let id = app.selected?;
-    let (rows, cols) = grid_for(app.window);
+    let (rows, cols) = pane_rect(app, id).map(grid_in).unwrap_or_else(|| grid_for(app.window));
     if app.size_sent == Some((id, rows, cols)) {
         return None;
     }
@@ -802,7 +984,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if let Some(e) = outbox_error().lock().unwrap().take() {
                 app.error = Some(format!("no se envió: {e}"));
             }
-            match app.selected {
+            let focus_task = match app.selected {
                 Some(id) if !app.loading => {
                     app.loading = true;
                     // Solo se pide "lo que cambió" si la última respuesta completa es del mismo desplazamiento.
@@ -810,6 +992,65 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     load_screen(id, app.scroll, since)
                 }
                 _ => Task::none(),
+            };
+            // Un panel visible sin el foco se sondea por turnos: uno por tick, sin tocar su tamaño.
+            let other_task = match next_other(app) {
+                Some(id) => {
+                    app.others_loading.insert(id);
+                    load_other(id, app.others_gen.get(&id).copied())
+                }
+                None => Task::none(),
+            };
+            Task::batch([focus_task, other_task])
+        }
+        Message::OtherScreen(id, result) => {
+            app.others_loading.remove(&id);
+            if let Ok(ScreenReply::Full(snap)) = result {
+                app.others_gen.insert(id, snap.gen);
+                app.others.insert(id, snap);
+            }
+            Task::none()
+        }
+        Message::NextTab(delta) => {
+            let Some(key) = focus_key(app) else { return Task::none() };
+            app.layouts.cycle(&key, delta);
+            match app.layouts.active_tab(&key).map(|t| t.focus) {
+                Some(id) => select(app, id),
+                None => Task::none(),
+            }
+        }
+        Message::SelectTab(index) => {
+            let Some(key) = focus_key(app) else { return Task::none() };
+            if let Some(ws) = app.layouts.by_key.get_mut(&key) {
+                if index < ws.tabs.len() {
+                    ws.active = index;
+                }
+            }
+            match app.layouts.active_tab(&key).map(|t| t.focus) {
+                Some(id) => select(app, id),
+                None => Task::none(),
+            }
+        }
+        Message::SplitFocused(vertical) => {
+            let Some(focus) = app.selected else { return Task::none() };
+            let (workspace, cwd) = focus_context(app);
+            // El nuevo panel nace con la mitad del rectángulo del enfocado.
+            let area = pane_rect(app, focus).unwrap_or_else(|| terminal_area_for(app));
+            let (rows, cols) = grid_in(layout::halves(area, vertical).1);
+            let name = launch::free_name("shell", &names(app));
+            let req = launch::shell_request(&name, &login_shell(), &cwd.unwrap_or_else(home_dir), workspace, rows, cols);
+            app.pending_split = Some((focus, vertical));
+            spawn_task_sized(app, req, (rows, cols))
+        }
+        Message::FocusDir(dir) => {
+            let (Some(from), Some(key)) = (app.selected, focus_key(app)) else { return Task::none() };
+            let rects = match app.layouts.active_tab(&key) {
+                Some(tab) => tab.root.rects(terminal_area_for(app)),
+                None => return Task::none(),
+            };
+            match layout::neighbor(&rects, from, dir) {
+                Some(id) => select(app, id),
+                None => Task::none(),
             }
         }
         Message::TickList if !app.listing => { app.listing = true; Task::batch([load_panes(), load_limits()]) }
@@ -830,6 +1071,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
                     app.size_sent = Some((p.id, rows, cols));
                     app.panes.push(p.clone());
+                    // Un split coloca el panel junto al enfocado; si no, nace en su pestaña.
+                    if let Some((focus, vertical)) = app.pending_split.take() {
+                        app.layouts.split(focus, vertical, p.id);
+                    }
+                    app.layouts.sync(&pane_keys(app));
+                    app.layouts.focus(p.id);
                     let task = select(app, p.id);
                     Task::batch([task, load_panes()])
                 }
@@ -837,6 +1084,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::PaneLaunched(Err(e)) => {
+            app.pending_split = None;
             app.error = Some(e);
             Task::none()
         }
@@ -975,6 +1223,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 Ok(panes) => {
                     app.error = None;
                     app.panes = panes;
+                    app.layouts.sync(&pane_keys(app));
+                    app.others.retain(|id, _| app.panes.iter().any(|p| p.id == *id));
+                    app.others_gen.retain(|id, _| app.panes.iter().any(|p| p.id == *id));
                     if app.selected.is_some_and(|id| !app.panes.iter().any(|p| p.id == id)) {
                         app.selected = None;
                         app.snap = None;
@@ -1058,6 +1309,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     _ => Task::none(),
                 };
             }
+            // Cmd+Opt+flechas: el foco se mueve al split vecino.
+            if modifiers.command() && modifiers.alt() {
+                let dir = match &key {
+                    Key::Named(Named::ArrowLeft) => Some(layout::Dir::Left),
+                    Key::Named(Named::ArrowRight) => Some(layout::Dir::Right),
+                    Key::Named(Named::ArrowUp) => Some(layout::Dir::Up),
+                    Key::Named(Named::ArrowDown) => Some(layout::Dir::Down),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    return update(app, Message::FocusDir(dir));
+                }
+            }
             // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
             if modifiers.command() && app.new_ws.is_none() && !app.launcher {
                 if let Some(message) = shortcut(&key, modifiers) {
@@ -1125,6 +1389,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) => {
+            // Un clic en otro panel visible le da el foco; el arrastre empieza en el siguiente clic dentro de él.
+            if let Some(id) = app.pointer.and_then(|p| leaf_at(app, p)) {
+                if app.selected != Some(id) {
+                    return select(app, id);
+                }
+            }
             if !pointer_in_grid(app) {
                 return Task::none();
             }
@@ -1460,18 +1730,7 @@ fn view(app: &App) -> Element<'_, Message> {
     } else if let Some(f) = &app.form {
         form_view(app, f)
     } else {
-        let screen: Element<'_, Message> = match shown(app) {
-            // Con `lazy`, el árbol de la pantalla solo se reconstruye cuando cambia lo que se muestra.
-            Some(snap) => {
-                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen));
-                let sel = app.sel;
-                lazy(key, move |_| screen_view(snap, sel)).into()
-            }
-            None => text(if app.selected.is_none() { "Crea un panel con «+ Nuevo panel» o con `galgo spawn`." } else { "Esperando salida…" }).size(14).color(MUTED).into(),
-        };
-        container(screen).width(Length::Fill).height(Length::Fill).padding(10).clip(true)
-            .style(|_| container::Style { background: Some(term::DEFAULT_BG.into()), border: iced::border::rounded(8), ..Default::default() })
-            .into()
+        layout_view(app)
     };
 
     let mut header = row![text(title).size(18), text(state).size(11).color(state_color), Space::with_width(Length::Fill)].spacing(12).align_y(iced::Alignment::Center).height(44);
@@ -1492,6 +1751,9 @@ fn view(app: &App) -> Element<'_, Message> {
     }
     header = header.push(text("GALGO").size(11).color(MUTED));
     let mut body = column![header].spacing(10).padding(12).width(Length::Fill).height(Length::Fill);
+    if body_mode(app) == Body::Screen {
+        body = body.push(tabs_bar(app));
+    }
     if let Some(u) = selected_pane.and_then(|p| p.usage.as_ref()) {
         body = body.push(text(usage::detail_line(u)).size(11).color(MUTED));
     }
@@ -1561,27 +1823,27 @@ mod tests {
     #[test]
     fn pixel_a_celda_dentro_de_la_cuadricula() {
         let (x, y) = center(2, 3);
-        assert_eq!(pixel_to_cell(x, y, (10, 80)), Some((2, 3)));
+        assert_eq!(pixel_to_cell(TERM_ORIGIN, x, y, (10, 80)), Some((2, 3)));
         // Esquina superior izquierda del área del terminal.
-        assert_eq!(pixel_to_cell(TERM_ORIGIN.0, TERM_ORIGIN.1, (10, 80)), Some((0, 0)));
+        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1, (10, 80)), Some((0, 0)));
     }
 
     #[test]
     fn pixel_a_celda_recorta_al_borde_y_rechaza_fuera_por_la_izquierda() {
-        assert_eq!(pixel_to_cell(TERM_ORIGIN.0 + 10_000.0, TERM_ORIGIN.1 + 10_000.0, (10, 80)), Some((9, 79)));
-        assert_eq!(pixel_to_cell(TERM_ORIGIN.0 - 1.0, TERM_ORIGIN.1 + 5.0, (10, 80)), None);
-        assert_eq!(pixel_to_cell(TERM_ORIGIN.0 + 5.0, TERM_ORIGIN.1 - 1.0, (10, 80)), None);
-        assert_eq!(pixel_to_cell(50.0, 50.0, (10, 80)), None);
-        assert_eq!(pixel_to_cell(TERM_ORIGIN.0, TERM_ORIGIN.1, (0, 80)), None);
+        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0 + 10_000.0, TERM_ORIGIN.1 + 10_000.0, (10, 80)), Some((9, 79)));
+        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0 - 1.0, TERM_ORIGIN.1 + 5.0, (10, 80)), None);
+        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0 + 5.0, TERM_ORIGIN.1 - 1.0, (10, 80)), None);
+        assert_eq!(pixel_to_cell(TERM_ORIGIN, 50.0, 50.0, (10, 80)), None);
+        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1, (0, 80)), None);
     }
 
     /// B3: la rueda y el clic solo cuentan dentro de la cuadrícula.
     #[test]
     fn dentro_de_la_cuadricula_solo() {
-        assert!(inside_grid(TERM_ORIGIN.0, TERM_ORIGIN.1, (10, 80)));
-        assert!(!inside_grid(TERM_ORIGIN.0 + 10_000.0, TERM_ORIGIN.1, (10, 80)));
-        assert!(!inside_grid(TERM_ORIGIN.0, TERM_ORIGIN.1 + 10.0 * LINE_H, (10, 80)));
-        assert!(!inside_grid(50.0, 300.0, (10, 80)));
+        assert!(inside_grid(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1, (10, 80)));
+        assert!(!inside_grid(TERM_ORIGIN, TERM_ORIGIN.0 + 10_000.0, TERM_ORIGIN.1, (10, 80)));
+        assert!(!inside_grid(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1 + 10.0 * LINE_H, (10, 80)));
+        assert!(!inside_grid(TERM_ORIGIN, 50.0, 300.0, (10, 80)));
     }
 
     #[test]
@@ -2014,5 +2276,99 @@ mod tests {
         assert!(matches!(shortcut(&k, keyboard::Modifiers::COMMAND), Some(Message::OpenPalette)));
         let p = Key::Character("P".into());
         assert!(matches!(shortcut(&p, keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenPalette)));
+    }
+
+    /// E: dividir pide un panel al lado del enfocado; al llegar, queda en la misma pestaña y con el foco.
+    #[test]
+    fn dividir_pone_el_panel_al_lado_y_le_da_el_foco() {
+        let mut p1 = pane_info(1, "uno", Status::Idle);
+        p1.workspace = Some("repo/main".into());
+        let mut app = App { panes: vec![p1], selected: Some(1), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        let _ = update(&mut app, Message::SplitFocused(true));
+        assert_eq!(app.pending_split, Some((1, true)));
+        let mut p2 = pane_info(2, "dos", Status::Idle);
+        p2.workspace = Some("repo/main".into());
+        let json = serde_json::to_value(p2).unwrap();
+        let _ = update(&mut app, Message::PaneLaunched(Ok(json)));
+        assert!(app.pending_split.is_none());
+        let tab = app.layouts.active_tab("repo/main").expect("la pestaña del workspace");
+        assert_eq!(tab.root.ids(), vec![1, 2], "lado a lado en la misma pestaña");
+        assert_eq!(tab.focus, 2, "el panel nuevo tiene el foco");
+        assert_eq!(app.layouts.by_key["repo/main"].tabs.len(), 1, "no crea una pestaña extra");
+    }
+
+    /// E: si el lanzamiento falla, el split pendiente se descarta: el siguiente panel no se coloca mal.
+    #[test]
+    fn un_split_fallido_no_deja_el_pendiente() {
+        let mut app = App { panes: vec![pane_info(1, "uno", Status::Idle)], selected: Some(1), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        let _ = update(&mut app, Message::SplitFocused(false));
+        let _ = update(&mut app, Message::PaneLaunched(Err("sin daemon".into())));
+        assert!(app.pending_split.is_none());
+    }
+
+    /// E: Cmd+Opt+flecha mueve el foco al split vecino; sin vecino en esa dirección, no se mueve.
+    #[test]
+    fn foco_por_direccion_entre_splits() {
+        let mut app = App { panes: vec![pane_info(1, "izq", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        app.layouts.split(1, true, 2);
+        app.panes.push(pane_info(2, "der", Status::Idle));
+        app.layouts.sync(&pane_keys(&app));
+        app.selected = Some(2);
+        let _ = update(&mut app, Message::FocusDir(layout::Dir::Left));
+        assert_eq!(app.selected, Some(1));
+        let _ = update(&mut app, Message::FocusDir(layout::Dir::Left));
+        assert_eq!(app.selected, Some(1), "no hay nada más a la izquierda");
+    }
+
+    /// E: con un solo panel, el origen de su cuadrícula es el de referencia; un split lo desplaza.
+    #[test]
+    fn geometria_del_panel_unico_y_del_split() {
+        let mut app = App { panes: vec![pane_info(1, "uno", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        assert_eq!(focus_origin(&app), TERM_ORIGIN, "un panel sin split usa el origen de referencia");
+        app.layouts.split(1, true, 2);
+        app.panes.push(pane_info(2, "dos", Status::Idle));
+        app.selected = Some(2);
+        let (x, _) = focus_origin(&app);
+        assert!(x > TERM_ORIGIN.0, "el panel de la derecha empieza más a la derecha");
+        let (rows, cols) = grid_in(pane_rect(&app, 2).unwrap());
+        assert!(cols < grid_for((1100.0, 700.0)).1, "y tiene menos columnas que la ventana entera");
+        assert!(rows > 5);
+    }
+
+    /// E: las pantallas de los paneles visibles sin foco se sondean por turnos, y la respuesta se guarda.
+    #[test]
+    fn paneles_visibles_se_sondean_por_turnos() {
+        let mut app = App { panes: vec![pane_info(1, "a", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        app.layouts.split(1, true, 2);
+        app.panes.push(pane_info(2, "b", Status::Idle));
+        app.layouts.sync(&pane_keys(&app));
+        let first = next_other(&mut app);
+        assert_eq!(first, Some(2), "el único sin foco");
+        // Como en el tick: mientras su respuesta no llega, no se vuelve a pedir.
+        app.others_loading.insert(2);
+        assert_eq!(next_other(&mut app), None);
+        let _ = update(&mut app, Message::OtherScreen(2, Ok(ScreenReply::Full(snap(&["hola"], 20)))));
+        assert!(app.others.contains_key(&2));
+        assert!(!app.others_loading.contains(&2));
+        assert_eq!(app.others_gen.get(&2).copied(), Some(snap(&["hola"], 20).gen));
+    }
+
+    /// E: Cmd+] y Cmd+[ cambian de pestaña y el foco va a su panel.
+    #[test]
+    fn cambiar_de_pestana_lleva_el_foco() {
+        let mut app = App { panes: vec![pane_info(1, "a", Status::Idle), pane_info(2, "b", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        app.layouts.focus(1);
+        assert_eq!(app.layouts.by_key[""].tabs.len(), 2, "dos paneles sin workspace, dos pestañas");
+        let _ = update(&mut app, Message::NextTab(1));
+        assert_eq!(app.selected, Some(2));
+        let _ = update(&mut app, Message::NextTab(1));
+        assert_eq!(app.selected, Some(1), "da la vuelta");
+        assert!(matches!(shortcut(&Key::Character("]".into()), keyboard::Modifiers::COMMAND), Some(Message::NextTab(1))));
     }
 }
