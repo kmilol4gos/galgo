@@ -13,18 +13,56 @@ pub fn free_name(base: &str, taken: &[&str]) -> String {
         .unwrap_or_else(|| base.to_string())
 }
 
-/// `Spawn` de un shell en `cwd`. El workspace va vacío: lo deduce el daemon del repo git de `cwd`.
-pub fn shell_request(name: &str, shell: &str, cwd: &str, rows: u16, cols: u16) -> Request {
+/// Lo que se puede lanzar desde el lanzador: un agente conocido o un shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    Claude,
+    Codex,
+    Pi,
+    OpenCode,
+    Shell,
+}
+
+impl Agent {
+    pub const ALL: [Agent; 5] = [Agent::Claude, Agent::Codex, Agent::Pi, Agent::OpenCode, Agent::Shell];
+
+    /// Etiqueta del botón y base del nombre autogenerado.
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
+            Agent::Pi => "pi",
+            Agent::OpenCode => "opencode",
+            Agent::Shell => "shell",
+        }
+    }
+
+    /// Comando que ejecuta el panel. El shell es el del usuario.
+    pub fn command(self, shell: &str) -> Vec<String> {
+        match self {
+            Agent::Shell => vec![shell.to_string()],
+            other => vec![other.label().to_string()],
+        }
+    }
+}
+
+/// `Spawn` de un proceso en `cwd`, dentro de `workspace` si lo hay (si no, lo deduce el daemon del repo git).
+pub fn spawn_request(name: &str, cmd: Vec<String>, cwd: &str, workspace: Option<String>, rows: u16, cols: u16) -> Request {
     Request::Spawn {
         name: name.to_string(),
-        cmd: vec![shell.to_string()],
+        cmd,
         cwd: Some(cwd.to_string()),
         manager: None,
         inject: false,
         rows,
         cols,
-        workspace: None,
+        workspace,
     }
+}
+
+/// Un shell en `cwd`, dentro del workspace dado.
+pub fn shell_request(name: &str, shell: &str, cwd: &str, workspace: Option<String>, rows: u16, cols: u16) -> Request {
+    spawn_request(name, Agent::Shell.command(shell), cwd, workspace, rows, cols)
 }
 
 #[cfg(test)]
@@ -42,13 +80,31 @@ mod tests {
 
     #[test]
     fn shell_en_el_directorio_sin_workspace_explicito() {
-        match shell_request("shell", "/bin/zsh", "/Users/x/proyecto", 40, 140) {
+        match shell_request("shell", "/bin/zsh", "/Users/x/proyecto", None, 40, 140) {
             Request::Spawn { name, cmd, cwd, workspace, manager, .. } => {
                 assert_eq!(name, "shell");
                 assert_eq!(cmd, vec!["/bin/zsh"]);
                 assert_eq!(cwd.as_deref(), Some("/Users/x/proyecto"));
                 assert_eq!(workspace, None);
                 assert_eq!(manager, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Cada agente lanza su comando; el shell usa el del usuario; el workspace se conserva.
+    #[test]
+    fn cada_agente_lanza_su_comando() {
+        assert_eq!(Agent::Claude.command("/bin/zsh"), vec!["claude"]);
+        assert_eq!(Agent::Codex.command("/bin/zsh"), vec!["codex"]);
+        assert_eq!(Agent::Pi.command("/bin/zsh"), vec!["pi"]);
+        assert_eq!(Agent::OpenCode.command("/bin/zsh"), vec!["opencode"]);
+        assert_eq!(Agent::Shell.command("/bin/zsh"), vec!["/bin/zsh"]);
+        match spawn_request("claude-2", Agent::Claude.command("/bin/zsh"), "/x", Some("repo/main".into()), 40, 140) {
+            Request::Spawn { name, cmd, workspace, .. } => {
+                assert_eq!(name, "claude-2");
+                assert_eq!(cmd, vec!["claude"]);
+                assert_eq!(workspace.as_deref(), Some("repo/main"));
             }
             other => panic!("{other:?}"),
         }

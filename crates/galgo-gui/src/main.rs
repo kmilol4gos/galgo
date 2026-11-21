@@ -173,6 +173,8 @@ struct App {
     /// Carpetas abiertas recientemente (la más reciente primero) y dónde se guardan.
     recents: Vec<String>,
     recents_path: Option<std::path::PathBuf>,
+    /// Lanzador de agentes abierto.
+    launcher: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -212,15 +214,76 @@ enum Message {
     /// Crea un workspace en esa carpeta: un shell, sin formulario.
     OpenFolder(String),
     WorkspaceOpened(String, Result<serde_json::Value, String>),
+    /// Atajos (B): pestaña nueva en el workspace actual, workspace por número, siguiente que necesita atención,
+    /// cerrar el panel enfocado, lanzador de agentes.
+    NewTab,
+    SelectWorkspaceAt(usize),
+    NextAttention,
+    CloseFocused,
+    OpenLauncher,
+    CloseLauncher,
+    Launch(launch::Agent),
+    /// Un panel creado desde un atajo o el lanzador: queda seleccionado.
+    PaneLaunched(Result<serde_json::Value, String>),
 }
 
 /// Atajos de la ventana con Cmd. Lo que no es atajo llega al panel seleccionado.
 fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     let Key::Character(c) = key else { return None };
-    match (c.as_str(), modifiers.shift()) {
+    let lower = c.as_str().to_lowercase();
+    match (lower.as_str(), modifiers.shift()) {
         ("n", false) => Some(Message::OpenNewWorkspace),
+        ("t", false) => Some(Message::NewTab),
+        ("w", false) => Some(Message::CloseFocused),
+        ("l", true) => Some(Message::OpenLauncher),
+        ("u", true) => Some(Message::NextAttention),
+        (d, false) => match d.parse::<usize>() {
+            Ok(n @ 1..=9) => Some(Message::SelectWorkspaceAt(n - 1)),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// Workspace n-ésimo (0 = primero) en el orden de la barra lateral; se selecciona su primer panel.
+fn workspace_at(panes: &[PaneInfo], n: usize) -> Option<u32> {
+    galgo_proto::group_by_workspace(panes).get(n).and_then(|(_, group)| group.first()).map(|p| p.id)
+}
+
+/// Siguiente panel, en orden de la lista y dando la vuelta, que necesita atención (insignia visible).
+fn next_attention(panes: &[PaneInfo], selected: Option<u32>, unread: impl Fn(u32) -> bool) -> Option<u32> {
+    let flagged: Vec<u32> = panes.iter().filter(|p| attention::badge(p, unread(p.id)).is_some()).map(|p| p.id).collect();
+    if flagged.is_empty() {
+        return None;
+    }
+    let after = selected.and_then(|s| flagged.iter().position(|&id| id == s)).map_or(0, |i| i + 1);
+    flagged.get(after % flagged.len()).copied()
+}
+
+/// Lo que heredan los paneles nuevos del panel enfocado: su workspace y su carpeta.
+fn focus_context(app: &App) -> (Option<String>, Option<String>) {
+    app.selected
+        .and_then(|id| app.panes.iter().find(|p| p.id == id))
+        .map_or((None, None), |p| (p.workspace.clone(), p.cwd.clone()))
+}
+
+/// Petición de un panel nuevo en el contexto del enfocado. Sin carpeta conocida, el directorio de inicio.
+fn context_request(app: &App, agent: launch::Agent) -> galgo_proto::Request {
+    let (rows, cols) = grid_for(app.window);
+    let (workspace, cwd) = focus_context(app);
+    let cwd = cwd.unwrap_or_else(home_dir);
+    let name = launch::free_name(agent.label(), &names(app));
+    launch::spawn_request(&name, agent.command(&login_shell()), &cwd, workspace, rows, cols)
+}
+
+/// Crea un panel con la petición dada; al llegar queda seleccionado.
+fn spawn_task(app: &mut App, req: galgo_proto::Request) -> Task<Message> {
+    let (rows, cols) = grid_for(app.window);
+    app.spawn_size = Some((rows, cols));
+    Task::perform(
+        async move { tokio::task::spawn_blocking(move || request(req)).await.map_err(|e| e.to_string()).and_then(|r| r) },
+        Message::PaneLaunched,
+    )
 }
 
 /// Qué ocupa el cuerpo de la ventana: bienvenida, «Nuevo workspace», formulario o el terminal.
@@ -228,6 +291,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
 enum Body {
     Welcome,
     NewWorkspace,
+    Launcher,
     Form,
     Screen,
 }
@@ -235,6 +299,8 @@ enum Body {
 fn body_mode(app: &App) -> Body {
     if app.new_ws.is_some() {
         Body::NewWorkspace
+    } else if app.launcher {
+        Body::Launcher
     } else if app.form.is_some() {
         Body::Form
     } else if app.panes.is_empty() {
@@ -254,7 +320,7 @@ fn open_folder(app: &mut App, path: String) -> Task<Message> {
     let (rows, cols) = grid_for(app.window);
     let name = launch::free_name("shell", &names(app));
     app.spawn_size = Some((rows, cols));
-    let req = launch::shell_request(&name, &login_shell(), &path, rows, cols);
+    let req = launch::shell_request(&name, &login_shell(), &path, None, rows, cols);
     Task::perform(
         async move {
             let result = tokio::task::spawn_blocking(move || request(req)).await.map_err(|e| e.to_string()).and_then(|r| r);
@@ -287,6 +353,22 @@ fn welcome_view(app: &App) -> Element<'_, Message> {
     for p in app.recents.iter().skip(1).take(4) {
         col = col.push(button(text(p.as_str()).size(12).color(MUTED)).width(Length::Fill).padding(8).on_press(Message::OpenFolder(p.clone())));
     }
+    container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
+}
+
+/// Lanzador: un botón por agente, en el workspace y la carpeta del panel enfocado.
+fn launcher_view(app: &App) -> Element<'_, Message> {
+    let (workspace, cwd) = focus_context(app);
+    let target = format!(
+        "Workspace: {} · carpeta: {}",
+        workspace.as_deref().unwrap_or("sin workspace"),
+        cwd.as_deref().unwrap_or("inicio")
+    );
+    let mut col = column![text("Lanzar agente").size(20), text(target).size(12).color(MUTED)].spacing(10).max_width(480);
+    for agent in launch::Agent::ALL {
+        col = col.push(button(text(agent.label()).size(15)).width(Length::Fill).padding(12).on_press(Message::Launch(agent)));
+    }
+    col = col.push(button(text("Cancelar").size(13)).on_press(Message::CloseLauncher));
     container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
 }
 
@@ -601,6 +683,67 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::TickList if !app.listing => { app.listing = true; Task::batch([load_panes(), load_limits()]) }
         Message::TickList => Task::none(),
+        Message::NewTab => {
+            let (rows, cols) = grid_for(app.window);
+            let (workspace, cwd) = focus_context(app);
+            let name = launch::free_name("shell", &names(app));
+            let cwd = cwd.unwrap_or_else(home_dir);
+            let req = launch::shell_request(&name, &login_shell(), &cwd, workspace, rows, cols);
+            spawn_task(app, req)
+        }
+        Message::PaneLaunched(Ok(data)) => {
+            app.launcher = false;
+            app.error = None;
+            match serde_json::from_value::<PaneInfo>(data) {
+                Ok(p) => {
+                    let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
+                    app.size_sent = Some((p.id, rows, cols));
+                    app.panes.push(p.clone());
+                    let task = select(app, p.id);
+                    Task::batch([task, load_panes()])
+                }
+                Err(_) => load_panes(),
+            }
+        }
+        Message::PaneLaunched(Err(e)) => {
+            app.error = Some(e);
+            Task::none()
+        }
+        Message::SelectWorkspaceAt(n) => match workspace_at(&app.panes, n) {
+            Some(id) => select(app, id),
+            None => Task::none(),
+        },
+        Message::NextAttention => {
+            let next = next_attention(&app.panes, app.selected, |id| app.attention.is_unread(id));
+            match next {
+                Some(id) => select(app, id),
+                None => Task::none(),
+            }
+        }
+        Message::CloseFocused => {
+            let working = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).is_some_and(|p| p.status == Status::Working);
+            if working {
+                // Un agente trabajando: se pide confirmación. Un panel parado se cierra con Cmd+W sin preguntar.
+                app.confirm_close = true;
+                Task::none()
+            } else {
+                update(app, Message::ConfirmClose)
+            }
+        }
+        Message::OpenLauncher => {
+            app.form = None;
+            app.new_ws = None;
+            app.launcher = true;
+            Task::none()
+        }
+        Message::CloseLauncher => {
+            app.launcher = false;
+            Task::none()
+        }
+        Message::Launch(agent) => {
+            let req = context_request(app, agent);
+            spawn_task(app, req)
+        }
         Message::OpenNewWorkspace => {
             app.form = None;
             app.new_ws = Some(String::new());
@@ -742,15 +885,16 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Event(Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })) => {
             // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
-            if modifiers.command() && app.new_ws.is_none() {
+            if modifiers.command() && app.new_ws.is_none() && !app.launcher {
                 if let Some(message) = shortcut(&key, modifiers) {
                     return update(app, message);
                 }
             }
-            // Con «Nuevo workspace» o el formulario abiertos, el teclado es suyo, no del panel.
-            if app.new_ws.is_some() {
+            // Con «Nuevo workspace» o el lanzador abiertos, el teclado es suyo, no del panel.
+            if app.new_ws.is_some() || app.launcher {
                 if matches!(&key, Key::Named(Named::Escape)) {
                     app.new_ws = None;
+                    app.launcher = false;
                 }
                 return Task::none();
             }
@@ -1150,6 +1294,8 @@ fn view(app: &App) -> Element<'_, Message> {
     let state_color = selected_pane.map(|p| status_color(p.status)).unwrap_or(MUTED);
     let body_content: Element<'_, Message> = if body_mode(app) == Body::NewWorkspace {
         new_workspace_view(app)
+    } else if body_mode(app) == Body::Launcher {
+        launcher_view(app)
     } else if body_mode(app) == Body::Welcome {
         welcome_view(app)
     } else if let Some(f) = &app.form {
@@ -1594,5 +1740,80 @@ mod tests {
         assert_eq!(app.error.as_deref(), Some("sin daemon"));
         assert!(app.new_ws.is_some());
         assert!(app.recents.is_empty());
+    }
+
+    /// B: los atajos nuevos, y sus teclas con Cmd (Shift cambia el número de la tecla de letra).
+    #[test]
+    fn atajos_de_la_fase_b() {
+        let cmd = keyboard::Modifiers::COMMAND;
+        let shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
+        let k = |c: &str| Key::Character(c.into());
+        assert!(matches!(shortcut(&k("t"), cmd), Some(Message::NewTab)));
+        assert!(matches!(shortcut(&k("w"), cmd), Some(Message::CloseFocused)));
+        assert!(matches!(shortcut(&k("U"), shift), Some(Message::NextAttention)));
+        assert!(matches!(shortcut(&k("l"), shift), Some(Message::OpenLauncher)));
+        assert!(matches!(shortcut(&k("3"), cmd), Some(Message::SelectWorkspaceAt(2))));
+        assert!(shortcut(&k("0"), cmd).is_none());
+        assert!(shortcut(&k("9"), cmd).is_some());
+    }
+
+    /// B: Cmd+1..9 selecciona el workspace n-ésimo en el orden de la barra lateral.
+    #[test]
+    fn cmd_numero_elige_workspace_en_orden_de_barra() {
+        let mut a = pane_info(1, "a", Status::Idle);
+        a.workspace = Some("repo/main".into());
+        let mut b = pane_info(2, "b", Status::Idle);
+        b.workspace = Some("otro/dev".into());
+        let mut c = pane_info(3, "c", Status::Idle);
+        c.workspace = Some("repo/main".into());
+        let panes = vec![a, b, c];
+        // El orden es el de la barra lateral: alfabético por workspace (otro/dev antes que repo/main).
+        assert_eq!(workspace_at(&panes, 0), Some(2), "otro/dev va primero");
+        assert_eq!(workspace_at(&panes, 1), Some(1), "repo/main, con su primer panel");
+        assert_eq!(workspace_at(&panes, 2), None);
+    }
+
+    /// B: Cmd+Shift+U recorre los paneles que necesitan atención, dando la vuelta.
+    #[test]
+    fn siguiente_que_necesita_atencion_da_la_vuelta() {
+        let mut bloq = pane_info(4, "bloq", Status::Blocked);
+        bloq.workspace = None;
+        let panes = vec![pane_info(1, "ok", Status::Idle), bloq, pane_info(3, "hecho", Status::Done), pane_info(5, "ok2", Status::Working)];
+        // El panel 3 tiene «terminó» sin leer (unread); el 4 está bloqueado.
+        let unread = |id: u32| id == 3;
+        // En orden de la lista de paneles: el 4 (bloqueado) está antes que el 3 (sin leer).
+        assert_eq!(next_attention(&panes, None, unread), Some(4));
+        assert_eq!(next_attention(&panes, Some(4), unread), Some(3));
+        assert_eq!(next_attention(&panes, Some(3), unread), Some(4), "da la vuelta");
+        assert_eq!(next_attention(&panes[..1], None, unread), None, "nadie necesita atención");
+    }
+
+    /// B: un agente nuevo hereda el workspace y la carpeta del panel enfocado; su nombre no repite ninguno.
+    #[test]
+    fn lanzar_agente_hereda_el_contexto_del_enfocado() {
+        let mut p = pane_info(1, "claude", Status::Idle);
+        p.workspace = Some("repo/main".into());
+        p.cwd = Some("/Users/x/repo".into());
+        let app = App { panes: vec![p], selected: Some(1), ..Default::default() };
+        match context_request(&app, launch::Agent::Claude) {
+            galgo_proto::Request::Spawn { name, cmd, cwd, workspace, .. } => {
+                assert_eq!(name, "claude-2", "claude ya existe");
+                assert_eq!(cmd, vec!["claude"]);
+                assert_eq!(cwd.as_deref(), Some("/Users/x/repo"));
+                assert_eq!(workspace.as_deref(), Some("repo/main"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// B: Cmd+W sobre un panel parado no pregunta; sobre uno que trabaja, pide confirmación.
+    #[test]
+    fn cmd_w_confirma_solo_si_hay_agente_trabajando() {
+        let mut app = App { panes: vec![pane_info(1, "p", Status::Working)], selected: Some(1), ..Default::default() };
+        let _ = update(&mut app, Message::CloseFocused);
+        assert!(app.confirm_close, "trabajando: pregunta");
+        let mut app = App { panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
+        let _ = update(&mut app, Message::CloseFocused);
+        assert!(!app.confirm_close, "parado: no pregunta");
     }
 }
