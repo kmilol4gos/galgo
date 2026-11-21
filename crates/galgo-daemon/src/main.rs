@@ -404,7 +404,8 @@ impl Daemon {
                 // Reserva el mensaje: otra espera no lo recibe mientras esta respuesta se escribe.
                 m.claimed = true;
                 let v = json!({
-                    "from": m.from_name, "kind": m.kind, "summary": m.summary, "delivered": "wait"
+                    "from": m.from_name, "kind": m.kind, "summary": m.summary, "delivered": "wait",
+                    "msg_id": m.id, "pane_id": waiter
                 });
                 return Some((v, Some(m.id)));
             }
@@ -482,7 +483,7 @@ impl Daemon {
     /// Atiende una solicitud. `wait` devuelve además el mensaje a confirmar tras responder.
     async fn dispatch(self: &Arc<Self>, req: Request) -> (Result<Value>, Option<(u32, u64)>) {
         match req {
-            Request::Wait { waiter, target, timeout_secs } => {
+            Request::Wait { waiter, target, timeout_secs, .. } => {
                 self.wait_for(waiter, target, timeout_secs).await
             }
             other => (self.handle(other).await, None),
@@ -757,8 +758,10 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
                 _ => break,
             },
         };
+        let mut client_ack = false;
         let (resp, ack) = match serde_json::from_str::<Request>(&line) {
             Ok(req) if matches!(req, Request::Wait { .. }) => {
+                client_ack = matches!(req, Request::Wait { client_ack: true, .. });
                 let mut fut = std::pin::pin!(d.dispatch(req));
                 let mut read_open = true;
                 let (res, ack) = loop {
@@ -789,7 +792,9 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
             Ok(Ok(()))
         );
         if let Some((pane, msg)) = ack {
-            if written {
+            // Con `client_ack` solo el cliente confirma, tras entregar: escribir en el socket
+            // no prueba que alguien lo leyera.
+            if written && !client_ack {
                 d.confirm(pane, msg);
             } else {
                 d.release(pane, msg);

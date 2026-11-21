@@ -133,6 +133,7 @@ fn run() -> Result<()> {
             waiter: pane.clone(),
             target: target.clone(),
             timeout_secs: *timeout,
+            client_ack: true,
         },
         Cmd::Inbox { pane } => Request::Inbox { pane: pane.clone() },
         Cmd::Ack { msg, pane } => Request::Ack { pane: pane.clone(), msg: *msg },
@@ -155,7 +156,17 @@ fn run() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&resp.data)?);
         return Ok(());
     }
-    print_human(&cli.cmd, resp.data)
+    let ack = match (&cli.cmd, resp.data["msg_id"].as_u64(), resp.data["pane_id"].as_u64()) {
+        (Cmd::Wait { .. }, Some(msg), Some(pane)) => Some((pane, msg)),
+        _ => None,
+    };
+    print_human(&cli.cmd, resp.data)?;
+    // Se confirma después de imprimir: si el proceso muere antes, el mensaje sigue pendiente.
+    if let Some((pane, msg)) = ack {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = request(&Request::Ack { pane: pane.to_string(), msg });
+    }
+    Ok(())
 }
 
 fn print_human(cmd: &Cmd, data: Value) -> Result<()> {

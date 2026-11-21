@@ -167,6 +167,7 @@ fn build_request(name: &str, args: &Value, env: &Env) -> Result<Request, String>
             waiter: own_pane(env)?,
             target: str_arg(args, "target")?,
             timeout_secs: opt_u64(args, "timeout_secs").unwrap_or(DEFAULT_WAIT_SECS),
+            client_ack: true,
         }),
         "galgo_done" => Ok(Request::Done {
             pane: own_pane(env)?,
@@ -488,7 +489,7 @@ mod tests {
         call(&call_tool_line("galgo_wait", json!({ "target": "w1" })), &daemon, Some("mgr"));
         call(&call_tool_line("galgo_done", json!({ "summary": "listo" })), &daemon, Some("w1"));
         let seen = seen.borrow();
-        assert!(matches!(&seen[0], Request::Wait { waiter, target, timeout_secs: 600 } if waiter == "mgr" && target == "w1"));
+        assert!(matches!(&seen[0], Request::Wait { waiter, target, timeout_secs: 600, client_ack: true } if waiter == "mgr" && target == "w1"));
         assert!(matches!(&seen[1], Request::Done { pane, failed: false, .. } if pane == "w1"));
     }
 

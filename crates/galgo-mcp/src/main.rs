@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, io::{self, BufRead, Read, Write}, net::Shutdown, os::unix::net::UnixStream, sync::{Arc, Mutex}, thread, time::Duration};
 
 #[derive(Default)]
-struct Call { cancelled: bool, response_received: bool, stream: Option<UnixStream> }
+struct Call { cancelled: bool, response_received: bool, stream: Option<UnixStream>, pending_ack: Option<(String, u64)> }
 type Calls = Arc<Mutex<HashMap<String, Arc<Mutex<Call>>>>>;
 
 fn daemon_request(req: Request, call: &Arc<Mutex<Call>>) -> anyhow::Result<Response> {
@@ -27,10 +27,13 @@ fn daemon_request(req: Request, call: &Arc<Mutex<Call>>) -> anyhow::Result<Respo
             Ok(n) => {
                 reply.extend_from_slice(&buf[..n]);
                 if let Some(end) = reply.iter().position(|b| *b == b'\n') {
-                    let response = serde_json::from_slice(&reply[..end])?;
+                    let response: Response = serde_json::from_slice(&reply[..end])?;
                     // Tras leer una respuesta completa, siempre la imprimimos: el daemon
                     // puede haberla confirmado. Esto no elimina la carrera anterior a la lectura.
                     state.response_received = true;
+                    if let (Some(msg), Some(pane)) = (response.data["msg_id"].as_u64(), response.data["pane_id"].as_u64()) {
+                        state.pending_ack = Some((pane.to_string(), msg));
+                    }
                     return Ok(response);
                 }
             }
@@ -102,9 +105,15 @@ fn main() -> io::Result<()> {
             threads.push(thread::spawn(move || {
                 let reply = handle_line(&line, &|req| daemon_request(req, &call));
                 let mut all = calls.lock().unwrap();
-                let state = call.lock().unwrap();
-                if !state.cancelled { if let Some(reply) = reply { output(&reply); } }
+                let mut state = call.lock().unwrap();
+                let printed = !state.cancelled && reply.is_some();
+                if printed { if let Some(reply) = reply { output(&reply); } }
+                // Se confirma solo tras imprimir; una espera cancelada deja el mensaje pendiente.
+                let ack = state.pending_ack.take().filter(|_| printed);
                 all.remove(&id);
+                drop(state);
+                drop(all);
+                if let Some((pane, msg)) = ack { let _ = client::request(&Request::Ack { pane, msg }); }
             }));
         } else if let Some(reply) = handle_line(&line, &|req| client::request(&req)) { output(&reply); }
     }

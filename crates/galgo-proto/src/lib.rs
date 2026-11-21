@@ -130,6 +130,9 @@ pub enum Request {
         waiter: String,
         target: String,
         timeout_secs: u64,
+        /// El cliente confirma con `Ack` tras entregar el resultado; el daemon no confirma al escribir.
+        #[serde(default)]
+        client_ack: bool,
     },
     /// Evento de un hook de agente. `summary` es el último mensaje del agente o el motivo del bloqueo.
     Hook {
