@@ -48,7 +48,7 @@ pub enum EnvCmd {
         dir: PathBuf,
         #[arg(long, default_value = ".env")]
         file: String,
-        #[arg(long, default_value_t = 600)]
+        #[arg(long, default_value_t = 100)]
         timeout: u64,
         #[arg(long, env = "GALGO_PANE")]
         pane: String,
@@ -80,11 +80,22 @@ pub fn run(cmd: &EnvCmd) -> Result<()> {
         EnvCmd::Set { key, dirs, file } => {
             check_key(key)?;
             let value = read_value(key)?;
+            if value.is_empty() {
+                eprintln!("aviso: el valor está vacío");
+            }
             for d in dirs {
                 let path = target(d, file)?;
-                let new = set_in(&read_or_empty(&path)?, key, &value);
-                write_private(&path, &new)?;
-                let warn = if git_ignored(&path) == Some(false) { "  ⚠ no está en .gitignore" } else { "" };
+                locked(d, || {
+                    let new = set_in(&read_or_empty(&path)?, key, &value);
+                    write_private(&path, &new)
+                })?;
+                let mut warn = String::new();
+                if git_ignored(&path) == Some(false) {
+                    warn.push_str("  ⚠ no está en .gitignore");
+                }
+                if std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                    warn.push_str("  ⚠ permisos abiertos a otros usuarios (chmod 600)");
+                }
                 println!("{key} → {}{warn}", path.display());
             }
             Ok(())
@@ -93,10 +104,16 @@ pub fn run(cmd: &EnvCmd) -> Result<()> {
             check_key(key)?;
             for d in dirs {
                 let path = target(d, file)?;
-                let text = read_or_empty(&path)?;
-                let new = unset_in(&text, key);
-                if new != text {
+                let changed = locked(d, || {
+                    let text = read_or_empty(&path)?;
+                    let new = unset_in(&text, key);
+                    if new == text {
+                        return Ok(false);
+                    }
                     write_private(&path, &new)?;
+                    Ok(true)
+                })?;
+                if changed {
                     println!("{key} quitada de {}", path.display());
                 } else {
                     println!("{key} no estaba en {}", path.display());
@@ -122,15 +139,21 @@ pub fn run(cmd: &EnvCmd) -> Result<()> {
                 bail!("{}", resp.error.unwrap_or_else(|| "el daemon rechazó el aviso".into()));
             }
             let end = Instant::now() + Duration::from_secs(*timeout);
+            let resume = || {
+                let _ = request(&Request::Hook { pane: pane.clone(), event: HookEvent::Working, summary: None });
+            };
             while Instant::now() < end {
                 if has(&path) {
-                    let _ = request(&Request::Hook { pane: pane.clone(), event: HookEvent::Working, summary: None });
+                    resume();
                     println!("{key} disponible en {}", path.display());
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            bail!("tiempo agotado esperando {key}")
+            // El worker no debe quedar `blocked` para siempre. Repite el comando para seguir esperando
+            // (el manager no recibe el mismo aviso dos veces).
+            resume();
+            bail!("tiempo agotado esperando {key}; vuelve a ejecutar el comando para seguir esperando")
         }
     }
 }
@@ -142,7 +165,22 @@ fn target(dir: &Path, file: &str) -> Result<PathBuf> {
     if !dir.is_dir() {
         bail!("{} no es un directorio", dir.display());
     }
-    Ok(dir.join(file))
+    let path = dir.join(file);
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("{} es un enlace simbólico; galgo no escribe secretos a través de enlaces", path.display());
+    }
+    Ok(path)
+}
+
+/// Serializa las ediciones del mismo directorio (varios agentes o varios `--dir`).
+fn locked<T>(dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::os::fd::AsRawFd;
+    let d = std::fs::File::open(dir).with_context(|| format!("no se pudo abrir {}", dir.display()))?;
+    // SAFETY: flock sobre un descriptor válido que vive hasta el final de la función.
+    if unsafe { libc::flock(d.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        bail!("no se pudo bloquear {}", dir.display());
+    }
+    f()
 }
 
 fn check_key(key: &str) -> Result<()> {
@@ -165,9 +203,11 @@ fn read_or_empty(path: &Path) -> Result<String> {
 
 /// Escribe de forma atómica. Conserva los permisos del archivo; uno nuevo queda en 0600.
 fn write_private(path: &Path, text: &str) -> Result<()> {
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let real = path.to_path_buf();
     let mode = std::fs::metadata(&real).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o600);
-    let tmp = real.with_extension(format!("galgo-tmp-{}", std::process::id()));
+    let mut tmp_name = real.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".galgo-tmp-{}", std::process::id()));
+    let tmp = real.with_file_name(tmp_name);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -246,50 +286,117 @@ fn read_hidden() -> Result<String> {
             bail!("no se pudo leer el terminal");
         }
         let mut quiet = old;
-        quiet.c_lflag &= !libc::ECHO;
+        quiet.c_lflag &= !(libc::ECHO | libc::ISIG);
         libc::tcsetattr(0, libc::TCSAFLUSH, &quiet);
         let mut line = String::new();
         let r = std::io::stdin().read_line(&mut line);
         libc::tcsetattr(0, libc::TCSAFLUSH, &old);
         r?;
+        // Con ISIG apagado Ctrl+C y Ctrl+Z llegan como bytes: así el eco siempre se restaura.
+        if line.contains(['\x03', '\x1a']) {
+            bail!("cancelado");
+        }
         Ok(line.trim_end_matches(['\n', '\r']).to_string())
     }
 }
 
 // ---- Edición de texto .env (pura, con pruebas) ----
 
-/// Nombre de la variable que define esta línea, si la define.
-fn line_key(line: &str) -> Option<&str> {
+struct Entry {
+    /// Primera y última línea (incluida) que ocupa la definición; varias si el valor es multilínea.
+    first: usize,
+    last: usize,
+    key: String,
+    exported: bool,
+    empty: bool,
+}
+
+/// (nombre, exportada?, resto tras `=`) si la línea empieza una definición.
+fn parse_def(line: &str) -> Option<(&str, bool, &str)> {
     let t = line.trim_start();
     if t.starts_with('#') {
         return None;
     }
-    let t = t.strip_prefix("export").filter(|r| r.starts_with([' ', '\t'])).map_or(t, str::trim_start);
-    let (k, _) = t.split_once('=')?;
+    let (exported, t) = match t.strip_prefix("export") {
+        Some(r) if r.starts_with([' ', '\t']) => (true, r.trim_start()),
+        _ => (false, t),
+    };
+    let (k, v) = t.split_once('=')?;
     let k = k.trim_end();
-    (!k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then_some(k)
+    (!k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then_some((k, exported, v))
 }
 
-fn line_value(line: &str) -> &str {
-    line.split_once('=').map_or("", |(_, v)| v.trim())
+/// Posición del cierre de `quote` en `s` (ya sin la comilla de apertura), respetando `\` en comillas dobles.
+fn close_quote(s: &str, quote: char) -> Option<usize> {
+    let mut esc = false;
+    for (i, c) in s.char_indices() {
+        if esc {
+            esc = false;
+        } else if c == '\\' && quote == '"' {
+            esc = true;
+        } else if c == quote {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn scan(lines: &[&str]) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i].trim_end_matches(['\n', '\r']);
+        let raw = if i == 0 { raw.trim_start_matches('\u{feff}') } else { raw };
+        let Some((key, exported, rest)) = parse_def(raw) else {
+            i += 1;
+            continue;
+        };
+        let rest = rest.trim_start();
+        let first = i;
+        let mut empty = false;
+        if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+            let inner = &rest[1..];
+            match close_quote(inner, q) {
+                Some(end) => empty = inner[..end].is_empty(),
+                None => {
+                    // Valor multilínea: se consume hasta la línea que cierra la comilla.
+                    let mut j = i + 1;
+                    while j < lines.len() && close_quote(lines[j], q).is_none() {
+                        j += 1;
+                    }
+                    i = j.min(lines.len() - 1);
+                }
+            }
+        } else {
+            let v = rest.split(" #").next().unwrap_or("").trim();
+            empty = v.is_empty() || v.starts_with('#');
+        }
+        out.push(Entry { first, last: i, key: key.to_string(), exported, empty });
+        i += 1;
+    }
+    out
 }
 
 /// (nombre, vacía?) de cada variable, en orden.
 pub fn keys_in(text: &str) -> Vec<(String, bool)> {
-    text.lines()
-        .filter_map(|l| line_key(l).map(|k| (k.to_string(), line_value(l).trim_matches(['"', '\'']).is_empty())))
-        .collect()
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    scan(&lines).into_iter().map(|e| (e.key, e.empty)).collect()
 }
 
 pub fn is_set(text: &str, key: &str) -> bool {
     keys_in(text).iter().any(|(k, empty)| k == key && !empty)
 }
 
+/// Comillas simples (literales para bash, dotenv y python-dotenv) salvo que el valor tenga `'` o
+/// saltos de línea; entonces comillas dobles escapando todo lo que bash interpretaría.
 fn quote(value: &str) -> String {
     let plain = !value.is_empty()
         && value.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:@+,=%".contains(c));
     if plain {
         return value.to_string();
+    }
+    if !value.contains(['\'', '\n', '\r']) {
+        return format!("'{value}'");
     }
     let mut s = String::from("\"");
     for c in value.chars() {
@@ -299,6 +406,7 @@ fn quote(value: &str) -> String {
             '\n' => s.push_str("\\n"),
             '\r' => s.push_str("\\r"),
             '$' => s.push_str("\\$"),
+            '`' => s.push_str("\\`"),
             c => s.push(c),
         }
     }
@@ -308,35 +416,51 @@ fn quote(value: &str) -> String {
 
 /// Reemplaza la variable en su sitio o la añade al final. Conserva el resto tal cual.
 pub fn set_in(text: &str, key: &str, value: &str) -> String {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let entries: Vec<Entry> = scan(&lines).into_iter().filter(|e| e.key == key).collect();
     let new_line = format!("{key}={}", quote(value));
     let mut out = String::new();
+    let mut i = 0;
     let mut done = false;
-    for line in text.split_inclusive('\n') {
-        if line_key(line.trim_end_matches(['\n', '\r'])) == Some(key) {
+    while i < lines.len() {
+        if let Some(e) = entries.iter().find(|e| e.first == i) {
             if !done {
-                let prefix = if line.trim_start().starts_with("export") { "export " } else { "" };
-                let eol = if line.ends_with('\n') { "\n" } else { "" };
-                out.push_str(&format!("{prefix}{new_line}{eol}"));
+                let prefix = if e.exported { "export " } else { "" };
+                let had_eol = lines[e.last].ends_with('\n');
+                out.push_str(&format!("{prefix}{new_line}{}", if had_eol { eol } else { "" }));
                 done = true;
             }
+            i = e.last + 1;
             continue;
         }
-        out.push_str(line);
+        out.push_str(lines[i]);
+        i += 1;
     }
     if !done {
         if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
+            out.push_str(eol);
         }
         out.push_str(&new_line);
-        out.push('\n');
+        out.push_str(eol);
     }
     out
 }
 
 pub fn unset_in(text: &str, key: &str) -> String {
-    text.split_inclusive('\n')
-        .filter(|l| line_key(l.trim_end_matches(['\n', '\r'])) != Some(key))
-        .collect()
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let entries: Vec<Entry> = scan(&lines).into_iter().filter(|e| e.key == key).collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(e) = entries.iter().find(|e| e.first == i) {
+            i = e.last + 1;
+            continue;
+        }
+        out.push_str(lines[i]);
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -347,7 +471,7 @@ mod tests {
     fn adds_replaces_and_keeps_the_rest() {
         let t = "# nota\nA=1\nexport B=2\n\nC=3";
         assert_eq!(set_in(t, "A", "uno"), "# nota\nA=uno\nexport B=2\n\nC=3");
-        assert_eq!(set_in(t, "B", "x y"), "# nota\nA=1\nexport B=\"x y\"\n\nC=3");
+        assert_eq!(set_in(t, "B", "x y"), "# nota\nA=1\nexport B='x y'\n\nC=3");
         assert_eq!(set_in(t, "D", "4"), "# nota\nA=1\nexport B=2\n\nC=3\nD=4\n");
         assert_eq!(set_in("", "K", "v"), "K=v\n");
     }
@@ -355,15 +479,31 @@ mod tests {
     #[test]
     fn duplicates_collapse_and_comments_are_ignored() {
         assert_eq!(set_in("A=1\n#A=9\nA=2\n", "A", "3"), "A=3\n#A=9\n");
-        assert_eq!(keys_in("#A=1\nB=\nC=\"\"\nD=x\n"), vec![("B".into(), true), ("C".into(), true), ("D".into(), false)]);
+        assert_eq!(keys_in("#A=1\nB=\nC=\"\"\nD=x\nE= # nada\n"), vec![("B".into(), true), ("C".into(), true), ("D".into(), false), ("E".into(), true)]);
     }
 
     #[test]
-    fn quoting_is_safe() {
+    fn quoting_is_literal_for_shells() {
         assert_eq!(quote("sk-abc.123"), "sk-abc.123");
-        assert_eq!(quote("a b#c"), "\"a b#c\"");
-        assert_eq!(quote("p\"q\\r$s\nt"), "\"p\\\"q\\\\r\\$s\\nt\"");
-        assert_eq!(quote(""), "\"\"");
+        assert_eq!(quote("a b#c$d`e\\f\"g"), "'a b#c$d`e\\f\"g'");
+        assert_eq!(quote("it's\nx`y$z"), "\"it's\\nx\\`y\\$z\"");
+        assert_eq!(quote(""), "''");
+    }
+
+    #[test]
+    fn multiline_values_are_skipped_whole() {
+        let t = "A=1\nPRIV=\"-----BEGIN\nKUpRKfFLfRYC9AIK=jbJT\n-----END\"\nB=2\n";
+        assert_eq!(keys_in(t).iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["A", "PRIV", "B"]);
+        assert_eq!(set_in(t, "PRIV", "x"), "A=1\nPRIV=x\nB=2\n");
+        assert_eq!(unset_in(t, "PRIV"), "A=1\nB=2\n");
+    }
+
+    #[test]
+    fn crlf_bom_and_export_lookalikes() {
+        assert_eq!(set_in("A=1\r\n", "B", "2"), "A=1\r\nB=2\r\n");
+        assert_eq!(set_in("A=1\r\nB=2\r\n", "A", "9"), "A=9\r\nB=2\r\n");
+        assert_eq!(set_in("\u{feff}A=1\n", "A", "2"), "A=2\n");
+        assert_eq!(set_in("exports=1\n", "exports", "x"), "exports=x\n");
     }
 
     #[test]

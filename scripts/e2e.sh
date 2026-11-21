@@ -560,7 +560,7 @@ echo "80. galgo env: pone variables sin pasar por el daemon ni por argv"
 E80="$TMP/e80"; mkdir -p "$E80/a" "$E80/b"
 printf '# nota\nFOO=1\n' > "$E80/a/.env"
 printf 'sk-secreto 80\n' | galgo env set API_KEY --dir "$E80/a" --dir "$E80/b" >/dev/null
-grep -q '^API_KEY="sk-secreto 80"$' "$E80/a/.env" && grep -q '^FOO=1$' "$E80/a/.env"; check "escribe en varios directorios y conserva lo demás" $?
+grep -q "^API_KEY='sk-secreto 80'\$" "$E80/a/.env" && grep -q '^FOO=1$' "$E80/a/.env"; check "escribe en varios directorios y conserva lo demás" $?
 [ "$(stat -f %Lp "$E80/b/.env" 2>/dev/null || stat -c %a "$E80/b/.env")" = "600" ]; check "archivo nuevo con permisos 0600" $?
 galgo env list --dir "$E80/a" | grep -q "API_KEY" && ! galgo env list --dir "$E80/a" | grep -q "secreto"; check "list muestra nombres, no valores" $?
 galgo spawn m80 -- bash --norc >/dev/null
@@ -574,6 +574,25 @@ sleep 1.5
 galgo read w80 | grep -q "DB_URL disponible"; check "el worker sigue al aparecer la variable" $?
 galgo read w80 | grep -q "postgres://x"; [ $? -ne 0 ]; check "el valor nunca aparece en la conversación" $?
 galgo inbox --pane m80 | grep -q "postgres://x"; [ $? -ne 0 ]; check "ni en el inbox del manager" $?
+
+echo "81. galgo env: concurrencia, enlaces, multilínea y petición sin quedar blocked"
+E81="$TMP/e81"; mkdir -p "$E81"
+for i in $(seq 1 20); do ( printf 'v%s\n' "$i" | galgo env set "K$i" --dir "$E81" >/dev/null 2>&1 ) & done
+wait
+[ "$(grep -c '^K' "$E81/.env")" = "20" ]; check "20 escrituras simultáneas no pierden variables" $?
+mkdir -p "$E81/l"; echo X=1 > "$E81/real"; ln -s ../real "$E81/l/.env"
+printf 's\n' | galgo env set Y --dir "$E81/l" 2>&1 | grep -q "enlace simbólico"; check "rechaza escribir a través de un enlace" $?
+[ "$(cat "$E81/real")" = "X=1" ]; check "el destino del enlace queda intacto" $?
+printf 'PRIV="-----BEGIN\nabc/def+ghi=\n-----END"\nZ=1\n' > "$E81/.env2"
+galgo env list --dir "$E81" --file .env2 | grep -q "abc"; [ $? -ne 0 ]; check "list no muestra líneas del cuerpo de un valor multilínea" $?
+printf 'p`echo PWNED`\n' | galgo env set SAFE --dir "$E81" >/dev/null
+( set -a; . "$E81/.env"; set +a; [ "$SAFE" = 'p`echo PWNED`' ] ); check "el valor con comillas invertidas se lee literal con source" $?
+galgo spawn m81 -- bash --norc >/dev/null
+galgo spawn w81 --manager m81 -- bash --norc >/dev/null
+galgo send w81 'galgo env request NOPE --timeout 2 --dir . ; echo FIN81'
+sleep 4
+galgo ls | grep w81 | grep -q blocked; [ $? -ne 0 ]; check "tras vencer la petición el worker no queda blocked" $?
+galgo inbox --pane m81 | grep -c "necesita la variable NOPE" | grep -q '^1$'; check "un solo aviso al manager" $?
 
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

@@ -69,6 +69,8 @@ struct Pane {
     _master: Box<dyn MasterPty + Send>,
     inbox: Vec<InboxMsg>,
     last_summary: Option<String>,
+    /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
+    last_blocked: Option<String>,
     waiting_on: Option<(u32, Instant)>,
     /// Ya entregó su resultado en este turno (`galgo done` o el evento de fin de turno).
     /// Solo se limpia con un prompt nuevo o con un envío con Enter.
@@ -304,6 +306,7 @@ impl Daemon {
             _master: pair.master,
             inbox: Vec::new(),
             last_summary: None,
+            last_blocked: None,
             waiting_on: None,
             reported: false,
         };
@@ -604,6 +607,7 @@ impl Daemon {
                         HookEvent::Working => {
                             // Una herramienta que termina no cambia un resultado ya entregado.
                             let p = st.panes.get_mut(&id).unwrap();
+                            p.last_blocked = None;
                             if !matches!(p.status, Status::Done | Status::Failed) {
                                 p.status = Status::Working;
                             }
@@ -614,12 +618,12 @@ impl Daemon {
                             }
                         }
                         HookEvent::Blocked => {
-                            let prev = std::mem::replace(
-                                &mut st.panes.get_mut(&id).unwrap().status,
-                                Status::Blocked,
-                            );
+                            let p = st.panes.get_mut(&id).unwrap();
+                            let prev = std::mem::replace(&mut p.status, Status::Blocked);
+                            let new_reason = summary.is_some() && summary != p.last_blocked;
+                            p.last_blocked = summary.clone();
                             // El manager no debe esperar para siempre a alguien que espera a una persona.
-                            if prev != Status::Blocked {
+                            if prev != Status::Blocked || new_reason {
                                 if let Some(m) = manager {
                                     let why = summary.unwrap_or_else(|| "pide una decisión".into());
                                     st.push(m, id, "blocked", why);

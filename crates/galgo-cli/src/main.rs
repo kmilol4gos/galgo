@@ -159,19 +159,21 @@ fn run() -> Result<()> {
     if !resp.ok {
         bail!("{}", resp.error.unwrap_or_else(|| "error desconocido".into()));
     }
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&resp.data)?);
-        return Ok(());
-    }
     let ack = match (&cli.cmd, resp.data["msg_id"].as_u64(), resp.data["pane_id"].as_u64()) {
         (Cmd::Wait { .. }, Some(msg), Some(pane)) => Some((pane, msg)),
         _ => None,
     };
-    print_human(&cli.cmd, resp.data)?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&resp.data)?);
+    } else {
+        print_human(&cli.cmd, resp.data)?;
+    }
     // Se confirma después de imprimir: si el proceso muere antes, el mensaje sigue pendiente.
     if let Some((pane, msg)) = ack {
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let _ = request(&Request::Ack { pane: pane.to_string(), msg });
+        // Si la salida está rota no se confirma: el resultado no llegó a nadie.
+        if std::io::Write::flush(&mut std::io::stdout()).is_ok() {
+            let _ = request(&Request::Ack { pane: pane.to_string(), msg });
+        }
     }
     Ok(())
 }

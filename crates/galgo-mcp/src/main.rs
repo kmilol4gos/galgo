@@ -47,10 +47,9 @@ fn daemon_request(req: Request, call: &Arc<Mutex<Call>>) -> anyhow::Result<Respo
     }
 }
 
-fn output(text: &str) {
+fn output(text: &str) -> bool {
     let mut out = io::stdout().lock();
-    let _ = writeln!(out, "{text}");
-    let _ = out.flush();
+    writeln!(out, "{text}").and_then(|_| out.flush()).is_ok()
 }
 
 fn cancel(call: &Arc<Mutex<Call>>) {
@@ -106,8 +105,7 @@ fn main() -> io::Result<()> {
                 let reply = handle_line(&line, &|req| daemon_request(req, &call));
                 let mut all = calls.lock().unwrap();
                 let mut state = call.lock().unwrap();
-                let printed = !state.cancelled && reply.is_some();
-                if printed { if let Some(reply) = reply { output(&reply); } }
+                let printed = !state.cancelled && reply.as_deref().is_some_and(output);
                 // Se confirma solo tras imprimir; una espera cancelada deja el mensaje pendiente.
                 let ack = state.pending_ack.take().filter(|_| printed);
                 all.remove(&id);
