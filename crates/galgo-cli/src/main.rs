@@ -1,8 +1,10 @@
 //! galgo: CLI para controlar paneles y agentes a través del daemon.
 
 mod claude;
+mod codex;
 mod env;
 mod pi;
+mod skill;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -92,6 +94,11 @@ enum Cmd {
         #[command(subcommand)]
         action: env::EnvCmd,
     },
+    /// Instala, desinstala o consulta la skill de un agente.
+    Skill {
+        #[command(subcommand)]
+        action: skill::SkillCmd,
+    },
     /// Instala o quita los hooks de un agente.
     Hooks {
         #[command(subcommand)]
@@ -111,6 +118,7 @@ fn run() -> Result<()> {
     match &cli.cmd {
         Cmd::Hook { agent } => std::process::exit(claude::run_hook(*agent)),
         Cmd::Hooks { action } => return claude::hooks_command(action),
+        Cmd::Skill { action } => return skill::run(action),
         Cmd::Env { action } => return env::run(action),
         _ => {}
     }
@@ -147,7 +155,7 @@ fn run() -> Result<()> {
         Cmd::Ack { msg, pane } => Request::Ack { pane: pane.clone(), msg: *msg },
         Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
         Cmd::Stop => Request::Shutdown,
-        Cmd::Hook { .. } | Cmd::Hooks { .. } | Cmd::Env { .. } => unreachable!("se atienden antes"),
+        Cmd::Hook { .. } | Cmd::Hooks { .. } | Cmd::Env { .. } | Cmd::Skill { .. } => unreachable!("se atienden antes"),
     };
 
     // `stop` no necesita arrancar un daemon que no existe.

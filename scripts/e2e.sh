@@ -759,5 +759,139 @@ GALGO_PANE=m97 PI_CODING_AGENT_DIR="$TMP/pi-config97" pi --mode rpc --no-session
 HOME="$HOME97" galgo hooks uninstall pi --yes >/dev/null
 [ "$(cat "$HOME97/.pi/agent/extensions/galgo.ts")" = 'extensión anterior' ] && [ ! -e "$HOME97/.pi/agent/extensions/galgo.ts.galgo-bak" ]; check "uninstall restaura extensión previa" $?
 
+echo "98. hooks Codex: instalación reversible y eventos reales"
+HOME98="$TMP/home98"
+mkdir -p "$HOME98/.codex"
+printf '%s\n' '{"description":"preservar","hooks":{"Stop":[{"hooks":[{"type":"command","command":"true","timeout":2}]}]}}' > "$HOME98/.codex/hooks.json"
+cp "$HOME98/.codex/hooks.json" "$TMP/original98.json"
+env -u CODEX_HOME HOME="$HOME98" galgo hooks install codex --yes >/dev/null && env -u CODEX_HOME HOME="$HOME98" galgo hooks install codex --yes | grep -q 'ya está instalado'; check "instala Codex idempotentemente" $?
+cmp -s "$HOME98/.codex/hooks.json.galgo-bak" "$TMP/original98.json"; check "Codex respalda configuración previa" $?
+galgo spawn m98 -- bash --norc >/dev/null
+galgo spawn w98 --manager m98 -- bash --norc >/dev/null
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit"}' | GALGO_PANE=w98 galgo hook codex
+galgo ls | grep w98 | grep -q working; check "Codex informa prompt_submitted" $?
+printf '%s\n' '{"hook_event_name":"Stop","last_assistant_message":"resultado Codex"}' | GALGO_PANE=w98 galgo hook codex
+galgo inbox --pane m98 | grep -q 'resultado Codex'; check "Codex entrega resultado al manager" $?
+out=$(printf '%s\n' '{"hook_event_name":"SessionStart"}' | env -u GALGO_PANE GALGO_SOCKET="$TMP/no-codex.sock" galgo hook codex 2>&1); rc=$?
+[ "$rc" = 0 ] && [ -z "$out" ] && [ ! -S "$TMP/no-codex.sock" ]; check "hook Codex silencioso sin panel ni daemon" $?
+galgo spawn z98 --manager m98 -- bash --norc >/dev/null
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit"}' | GALGO_PANE=z98 galgo hook codex
+galgo done --pane z98 --summary 'done explícito' >/dev/null
+printf '%s\n' '{"hook_event_name":"Stop","last_assistant_message":"duplicado inesperado"}' | GALGO_PANE=z98 galgo hook codex
+! galgo inbox --pane m98 | grep -q 'duplicado inesperado'; check "Codex Stop no duplica galgo done" $?
+galgo status blocked --pane z98
+HOME98="$HOME98" python3 -I - "$GALGO_SOCKET" <<'PY98'
+import http.server, json, os, pathlib, subprocess, sys, threading
+home = pathlib.Path(os.environ['HOME98'])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        msg = {'id':'msg_mock','type':'message','status':'completed','role':'assistant','content':[{'type':'output_text','text':'respuesta real Codex','annotations':[]}]}
+        response = {'id':'resp_mock','object':'response','status':'completed','model':'mock','output':[msg],'usage':{'input_tokens':1,'output_tokens':1,'total_tokens':2}}
+        events = [
+            {'type':'response.created','response':dict(response,status='in_progress',output=[])},
+            {'type':'response.output_item.added','output_index':0,'item':dict(msg,status='in_progress',content=[])},
+            {'type':'response.output_text.delta','item_id':'msg_mock','output_index':0,'content_index':0,'delta':'respuesta real Codex'},
+            {'type':'response.output_text.done','item_id':'msg_mock','output_index':0,'content_index':0,'text':'respuesta real Codex'},
+            {'type':'response.output_item.done','output_index':0,'item':msg},
+            {'type':'response.completed','response':response},
+        ]
+        body = (''.join('event: '+e['type']+'\ndata: '+json.dumps(e)+'\n\n' for e in events)+'data: [DONE]\n\n').encode()
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *args): pass
+server = http.server.HTTPServer(('127.0.0.1',0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+(home/'.codex/config.toml').write_text('model = "mock"\nmodel_provider = "mock"\n[model_providers.mock]\nname = "mock"\nbase_url = "http://127.0.0.1:%d/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n' % server.server_port)
+env = dict(os.environ, HOME=str(home), CODEX_HOME=str(home/'.codex'), GALGO_PANE='z98', GALGO_SOCKET=sys.argv[1])
+try:
+    run = subprocess.run(['codex','exec','--skip-git-repo-check','--dangerously-bypass-hook-trust','--json','test'], cwd=home, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35)
+    inbox = subprocess.check_output(['galgo','inbox','--pane','m98'], env=env).decode()
+    if run.returncode != 0 or 'respuesta real Codex' not in inbox:
+        print('Codex exit:', run.returncode, 'stdout:', run.stdout.decode(errors='replace')[-3000:], 'stderr:', run.stderr.decode(errors='replace')[-3000:], 'inbox:', inbox)
+        sys.exit(1)
+finally:
+    server.shutdown()
+PY98
+check "Codex real carga hooks y entrega Stop con servidor simulado" $?
+env -u CODEX_HOME HOME="$HOME98" galgo hooks uninstall codex --yes >/dev/null
+python3 -I - "$HOME98/.codex/hooks.json" "$TMP/original98.json" <<'PY98CHECK'
+import json,sys
+with open(sys.argv[1]) as a, open(sys.argv[2]) as b: sys.exit(0 if json.load(a) == json.load(b) else 1)
+PY98CHECK
+check "uninstall preserva hooks originales" $?
+env -u CODEX_HOME HOME="$HOME98" galgo hooks uninstall codex --yes | grep -q 'No hay hooks'; check "uninstall Codex idempotente" $?
+
+echo "99. skill Claude: instalación reversible y protección de cambios"
+HOME99="$TMP/home-skill99"
+SKILL99="$HOME99/.claude/skills/galgo/SKILL.md"
+mkdir -p "$HOME99/.claude/skills/galgo" "$HOME99/.claude/skills/otra"
+printf '%s\n' 'skill anterior' > "$SKILL99"
+printf '%s\n' 'otra intacta' > "$HOME99/.claude/skills/otra/SKILL.md"
+HOME="$HOME99" galgo skill install claude --yes >/dev/null && HOME="$HOME99" galgo skill install claude --yes | grep -q 'Ya está instalada'; check "instala skill Claude idempotentemente" $?
+[ "$(cat "$SKILL99.galgo-bak")" = 'skill anterior' ] && [ "$(cat "$HOME99/.claude/skills/otra/SKILL.md")" = 'otra intacta' ]; check "respaldo y skill ajena conservados" $?
+HOME="$HOME99" galgo skill status claude | grep -q 'instalada' && grep -q '^name: galgo$' "$SKILL99" && grep -q 'galgo_wait' "$SKILL99" && grep -q 'galgo env request' "$SKILL99"; check "status y contenido de skill" $?
+cp "$SKILL99" "$TMP/skill99-installed"
+printf '\n%s\n' 'edición del usuario' >> "$SKILL99"
+HOME="$HOME99" galgo skill status claude | grep -q modificada && ! HOME="$HOME99" galgo skill uninstall claude --yes >/dev/null 2>&1 && grep -q 'edición del usuario' "$SKILL99" && [ "$(cat "$SKILL99.galgo-bak")" = 'skill anterior' ]; check "no sobrescribe skill editada ni respaldo" $?
+cp "$TMP/skill99-installed" "$SKILL99"
+HOME="$HOME99" galgo skill uninstall claude --yes >/dev/null && [ "$(cat "$SKILL99")" = 'skill anterior' ] && [ ! -e "$SKILL99.galgo-bak" ]; check "uninstall restaura el archivo previo" $?
+HOME="$HOME99" galgo skill uninstall claude --yes | grep -q 'No hay skill gestionada'; check "uninstall idempotente preserva archivo ajeno" $?
+
+echo "100. el daemon no hereda marcadores de Claude Code en el entorno de los paneles"
+mkdir -p "$TMP/cc100"
+CLAUDE_CODE_CHILD_SESSION=1 CLAUDECODE=1 GALGO_SOCKET="$TMP/cc100/g.sock" galgo ls >/dev/null 2>&1
+GALGO_SOCKET="$TMP/cc100/g.sock" galgo spawn x100 -- sh -c "env > $TMP/env100"
+sleep 0.5
+! grep -q "CLAUDE_CODE_CHILD_SESSION\|^CLAUDECODE=" "$TMP/env100"; check "el hijo no ve CLAUDE_CODE_CHILD_SESSION ni CLAUDECODE" $?
+grep -q "^HOME=" "$TMP/env100"; check "el resto del entorno sigue llegando" $?
+GALGO_SOCKET="$TMP/cc100/g.sock" galgo stop >/dev/null 2>&1
+
+echo "101. snapshot marca las filas que continúan (soft wrap) (M2)"
+galgo spawn wr101 --cwd "$TMP" -- bash -c "printf '%0200d\n' 0; sleep 30" >/dev/null
+sleep 0.7
+python3 -I - "$GALGO_SOCKET" <<'PY101'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"op": "snapshot", "pane": "wr101"}) + "\n").encode())
+d = json.loads(s.makefile().readline())["data"]
+w = d["wrapped"]
+sys.exit(0 if w[0] is True and w[1] is False and len(w) == d["rows"] else 1)
+PY101
+check "la fila de 200 ceros continúa en la siguiente; la siguiente no" $?
+galgo kill wr101 >/dev/null 2>&1
+
+echo "110. snapshot con generación: since devuelve unchanged solo si nada cambió; Resize y escritura la suben"
+galgo spawn gp110 -- bash --norc >/dev/null
+sleep 0.7
+python3 -I - "$GALGO_SOCKET" <<'PY110'
+import json, socket, sys
+def rq(m):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sys.argv[1])
+    s.sendall((json.dumps(m) + "\n").encode())
+    line = s.makefile("rb").readline()
+    s.close()
+    return line
+full = json.loads(rq({"op": "snapshot", "pane": "gp110"}))["data"]
+g1 = full["gen"]
+same = json.loads(rq({"op": "snapshot", "pane": "gp110", "since": g1}))["data"]
+ok = same == {"unchanged": True, "gen": g1}
+rq({"op": "send", "pane": "gp110", "text": "echo hola110", "enter": True})
+import time; time.sleep(0.5)
+after_write = json.loads(rq({"op": "snapshot", "pane": "gp110", "since": g1}))["data"]
+ok = ok and "rows" in after_write and after_write["gen"] > g1
+g2 = after_write["gen"]
+rq({"op": "resize", "pane": "gp110", "rows": 30, "cols": 100})
+after_resize = json.loads(rq({"op": "snapshot", "pane": "gp110", "since": g2}))["data"]
+ok = ok and "rows" in after_resize and after_resize["gen"] > g2 and after_resize["rows"] == 30
+# Un tramo sin estilo no escribe fg/bg ni los booleanos en falso.
+raw = rq({"op": "snapshot", "pane": "gp110"}).decode()
+ok = ok and '"fg":"Default"' not in raw and '"bold":false' not in raw
+sys.exit(0 if ok else 1)
+PY110
+check "unchanged mientras no hay cambios; escritura y resize suben la generación; tramos compactos" $?
+galgo kill gp110 >/dev/null 2>&1
+
 echo "resultado: $pass ok, $fail con falla"
 [ "$fail" = "0" ]

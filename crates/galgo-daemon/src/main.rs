@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
+    sync::atomic::{AtomicU64, Ordering},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -71,6 +72,9 @@ struct Pane {
     manager: Option<u32>,
     inject: bool,
     screen: Arc<Mutex<vt100::Parser>>,
+    /// Generación de la pantalla. Se incrementa bajo el candado de `screen`, en cada escritura del
+    /// lector y en cada `Resize`, así que un snapshot que la lea siempre corresponde a esa generación.
+    gen: Arc<AtomicU64>,
     /// Cola de escritura al PTY. La atiende un hilo propio: nunca se escribe en un hilo de tokio.
     input: SyncSender<Vec<u8>>,
     /// Para matar el proceso sin tener el hijo (el hilo de salida lo espera).
@@ -281,6 +285,14 @@ impl Daemon {
         if let Some(dir) = cwd {
             builder.cwd(dir);
         }
+        // El daemon puede haberse arrancado desde una sesión de Claude Code, que deja marcadores
+        // (CLAUDE_CODE_*, CLAUDECODE). Un agente en el panel los vería y se creería sub-sesión.
+        for (key, _) in std::env::vars_os() {
+            let k = key.to_string_lossy();
+            if k.starts_with("CLAUDE_CODE_") || k == "CLAUDECODE" {
+                builder.env_remove(&key);
+            }
+        }
         builder.env("TERM", "xterm-256color");
         builder.env("GALGO_PANE", id.to_string());
         builder.env("GALGO_PANE_NAME", &name);
@@ -299,6 +311,7 @@ impl Daemon {
             std::num::NonZeroU16::new(cols).context("cols debe ser mayor que 0")?,
         );
         let screen = Arc::new(Mutex::new(vt100::Parser::new(v_rows, v_cols, 2000)));
+        let gen = Arc::new(AtomicU64::new(0));
 
         let (input, input_rx) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
         std::thread::spawn(move || {
@@ -317,6 +330,7 @@ impl Daemon {
             manager: manager_id,
             inject,
             screen: Arc::clone(&screen),
+            gen: Arc::clone(&gen),
             input,
             killer,
             pid,
@@ -343,7 +357,11 @@ impl Daemon {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => screen.lock().unwrap().process(&buf[..n]),
+                    Ok(n) => {
+                        let mut parser = screen.lock().unwrap();
+                        parser.process(&buf[..n]);
+                        gen.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
             // El hijo se recolecta aquí, sin candados: no queda <defunct> y sabemos cómo terminó.
@@ -588,15 +606,22 @@ impl Daemon {
                 let text = screen.lock().unwrap().screen().contents();
                 Ok(json!({ "text": text.trim_end() }))
             }
-            Request::Snapshot { pane, offset } => {
-                let screen = {
+            Request::Snapshot { pane, offset, since } => {
+                let (screen, gen) = {
                     let st = self.state.lock().unwrap();
-                    Arc::clone(&st.panes[&st.resolve(&pane)?].screen)
+                    let p = &st.panes[&st.resolve(&pane)?];
+                    (Arc::clone(&p.screen), Arc::clone(&p.gen))
                 };
                 let mut parser = screen.lock().unwrap();
+                let current = gen.load(Ordering::SeqCst);
+                // Sin cambios desde la generación que pidió el cliente: no se serializa nada.
+                if since == Some(current) {
+                    return Ok(json!({ "unchanged": true, "gen": current }));
+                }
                 // Se mira hacia atrás solo para construir la respuesta; luego se vuelve a la pantalla viva.
                 parser.screen_mut().set_scrollback(offset as usize);
                 let mut snap = snapshot(parser.screen());
+                snap.gen = current;
                 snap.scrollback = parser.screen().scrollback() as u16;
                 snap.scrollback_max = parser.screen().scrollback_len() as u16;
                 snap.bracketed_paste = parser.screen().bracketed_paste();
@@ -605,9 +630,10 @@ impl Daemon {
             }
             Request::Resize { pane, rows, cols } => {
                 check_size(rows, cols)?;
-                let screen = {
+                let (screen, screen_gen) = {
                     let st = self.state.lock().unwrap();
-                    Arc::clone(&st.panes[&st.resolve(&pane)?].screen)
+                    let p = &st.panes[&st.resolve(&pane)?];
+                    (Arc::clone(&p.screen), Arc::clone(&p.gen))
                 };
                 // Orden fijo: primero la pantalla, luego el estado. Ningún camino toma el candado de la
                 // pantalla con el del estado ya tomado, así que el orden no puede bloquearse. Mientras
@@ -624,6 +650,7 @@ impl Daemon {
                 let nr = std::num::NonZeroU16::new(rows).context("rows debe ser mayor que 0")?;
                 let nc = std::num::NonZeroU16::new(cols).context("cols debe ser mayor que 0")?;
                 parser.screen_mut().set_size(nr, nc);
+                screen_gen.fetch_add(1, Ordering::SeqCst);
                 Ok(json!({}))
             }
             Request::SetStatus { pane, status } => {
@@ -1008,6 +1035,7 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
         lines.push(runs);
     }
     galgo_proto::Snapshot {
+        gen: 0,
         rows,
         cols,
         cursor: screen.cursor_position(),
@@ -1016,6 +1044,7 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
         scrollback: 0,
         scrollback_max: 0,
         bracketed_paste: false,
+        wrapped: (0..rows).map(|r| screen.row_wrapped(r)).collect(),
     }
 }
 

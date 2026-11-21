@@ -3,58 +3,104 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const executable = __GALGO_EXECUTABLE__;
+/** Tiempo máximo por aviso. PI no espera a los avisos: un daemon lento no detiene el agente. */
+const SEND_TIMEOUT_MS = 300;
+/** Longitud máxima del resumen, contada en puntos de código (no corta pares suplentes). */
+const SUMMARY_CHARS = 2400;
+
+/** Corta un texto por puntos de código, para no dejar medio emoji (un suplente suelto no es JSON válido). */
+const cut = (text: string, max: number) => Array.from(text).slice(0, max).join("");
 
 export default function (pi: ExtensionAPI) {
   if (!process.env.GALGO_PANE) return;
-  let queue = Promise.resolve();
+  // Solo reporta un agente que atiende a una persona. En `-p` o modo JSON no hay UI: es un sub-agente
+  // lanzado desde una herramienta, y no debe reclamar el panel ni enviar su resultado como el del panel.
+  let enabled = false;
   let active = false;
   let last: any = undefined;
-  const report = (payload: object) => {
-    queue = queue.then(() => new Promise<void>((resolve) => {
-      try {
-        const child = spawn(executable, ["hook", "pi"], { stdio: ["pipe", "ignore", "ignore"] });
-        let finished = false;
-        const finish = () => { if (!finished) { finished = true; clearTimeout(timer); resolve(); } };
-        const timer = setTimeout(() => { child.kill("SIGKILL"); finish(); }, 1000);
-        child.on("error", finish);
-        child.on("close", finish);
-        child.stdin.on("error", () => {});
-        child.stdin.end(JSON.stringify(payload));
-      } catch { resolve(); }
-    })).catch(() => {});
-    return queue;
-  };
-  pi.on("session_start", async (_event, ctx) => {
-    active = !ctx.isIdle();
-    await report({ type: "session_start", idle: !active });
+  let queue: any[] = [];
+  let draining = false;
+
+  const send = (payload: object) => new Promise<void>((resolve) => {
+    try {
+      const child = spawn(executable, ["hook", "pi"], { stdio: ["pipe", "ignore", "ignore"] });
+      let finished = false;
+      const finish = () => { if (!finished) { finished = true; clearTimeout(timer); resolve(); } };
+      const timer = setTimeout(() => { child.kill("SIGKILL"); finish(); }, SEND_TIMEOUT_MS);
+      child.on("error", finish);
+      child.on("close", finish);
+      child.stdin.on("error", () => {});
+      child.stdin.end(JSON.stringify(payload));
+    } catch { resolve(); }
   });
-  pi.on("before_agent_start", async (event) => {
+
+  const drain = async () => {
+    if (draining) return;
+    draining = true;
+    while (queue.length > 0) {
+      await send(queue.shift());
+    }
+    draining = false;
+  };
+
+  // Los avisos se encolan y se envían en orden, sin bloquear al handler. Si se acumulan avisos de
+  // interfaz, basta el último estado: se descartan los ui_prompt_* que aún no salieron.
+  const report = (payload: any) => {
+    if (!enabled) return;
+    if (String(payload.type).startsWith("ui_prompt")) {
+      queue = queue.filter((p) => !String(p.type).startsWith("ui_prompt"));
+    }
+    queue.push(payload);
+    void drain();
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    enabled = Boolean(ctx.hasUI) && (ctx.mode === "tui" || ctx.mode === "rpc");
+    if (!enabled) return;
+    active = !ctx.isIdle();
+    report({ type: "session_start", idle: !active });
+  });
+  pi.on("before_agent_start", (event) => {
     if (event.messageType === "user") {
       last = undefined;
-      await report({ type: "before_agent_start", messageType: "user" });
+      report({ type: "before_agent_start", messageType: "user" });
     }
   });
-  pi.on("agent_start", async () => {
+  pi.on("agent_start", () => {
     active = true;
     last = undefined;
-    await report({ type: "agent_start" });
+    report({ type: "agent_start" });
   });
   pi.on("agent_end", (event) => {
     last = [...event.messages].reverse().find((m: any) => m.role === "assistant");
   });
-  pi.on("ui_prompt_start", (event) => {
-    void report({ type: "ui_prompt_start", title: event.title });
+  pi.on("ui_prompt_start", (event: any) => {
+    report({ type: "ui_prompt_start", title: event.title ?? event.reason });
   });
+  // Siempre con el estado real: si el diálogo se abrió fuera de un turno, vuelve a idle.
   pi.on("ui_prompt_end", () => {
-    if (active) void report({ type: "ui_prompt_end" });
+    report({ type: "ui_prompt_end", active });
   });
-  pi.on("agent_settled", async (event) => {
+  pi.on("agent_settled", (event) => {
     active = false;
-    const summary = Array.isArray(last?.content)
-      ? last.content.filter((x: any) => x.type === "text").map((x: any) => x.text).join("\n").slice(0, 2400)
-      : undefined;
-    const outcome = event.aborted || last?.stopReason === "aborted" || last?.stopReason === "error"
-      ? "failed" : last?.stopReason === "stop" ? "completed" : "unknown";
-    await report({ type: "agent_settled", outcome, summary, error: last?.errorMessage });
+    const reason: string | undefined = last?.stopReason;
+    const text = Array.isArray(last?.content)
+      ? last.content.filter((x: any) => x.type === "text").map((x: any) => x.text).join("\n")
+      : "";
+    const summary = text ? cut(text, SUMMARY_CHARS) : undefined;
+    let outcome: "completed" | "failed";
+    let error: string | undefined;
+    if (event.aborted || reason === "aborted" || reason === "error") {
+      outcome = "failed";
+      error = last?.errorMessage ?? (reason ? `se detuvo con stopReason=${reason}` : "se detuvo");
+    } else if (reason === "stop") {
+      outcome = "completed";
+    } else {
+      // length, toolUse, deferred o sin mensaje: el turno no terminó con una respuesta completa.
+      // Se informa como fallo con el motivo, para que el manager lo vea en lugar de esperar en silencio.
+      outcome = "failed";
+      error = `se detuvo con stopReason=${reason ?? "desconocido"}`;
+    }
+    report({ type: "agent_settled", outcome, summary, error: error ? cut(error, SUMMARY_CHARS) : undefined });
   });
 }

@@ -36,6 +36,7 @@ const INSTALLED: &[(&str, Option<&str>)] = &[
 pub enum Agent {
     Claude,
     Pi,
+    Codex,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -142,6 +143,7 @@ pub fn run_hook(agent: Agent) -> i32 {
     let mapped = match agent {
         Agent::Claude => map_event(&payload),
         Agent::Pi => crate::pi::map_event(&payload),
+        Agent::Codex => crate::codex::map_event(&payload),
     };
     let Some((event, summary)) = mapped else { return 0 };
     if let Err(e) = notify_daemon(pane, event, summary) {
@@ -346,6 +348,9 @@ fn write_settings(path: &Path, settings: &Value) -> Result<()> {
 
 pub fn hooks_command(cmd: &HooksCmd) -> Result<()> {
     match cmd {
+        HooksCmd::Install { agent: Agent::Codex, scope, yes, dry_run } => crate::codex::install_command(*scope, *yes, *dry_run)?,
+        HooksCmd::Uninstall { agent: Agent::Codex, scope, yes } => crate::codex::uninstall_command(*scope, *yes)?,
+        HooksCmd::Status { agent: Agent::Codex, scope } => crate::codex::status_command(*scope)?,
         HooksCmd::Install { agent: Agent::Pi, scope, yes, dry_run } => crate::pi::install_command(*scope, *yes, *dry_run)?,
         HooksCmd::Uninstall { agent: Agent::Pi, scope, yes } => crate::pi::uninstall_command(*scope, *yes)?,
         HooksCmd::Status { agent: Agent::Pi, scope } => crate::pi::status_command(*scope)?,

@@ -120,6 +120,10 @@ pub enum Request {
         /// Líneas hacia atrás en el historial (0 = pantalla en vivo).
         #[serde(default)]
         offset: u16,
+        /// Generación que el cliente ya tiene. Si la pantalla no ha cambiado desde entonces, el daemon
+        /// responde `{unchanged: true, gen}` en vez del snapshot. Solo es válida con el mismo `offset`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
     },
     /// Cambia el tamaño del PTY y de la pantalla.
     Resize {
@@ -166,27 +170,48 @@ pub enum Request {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Color {
+    #[default]
     Default,
     Idx(u8),
     Rgb(u8, u8, u8),
 }
 
-/// Tramo de texto contiguo con el mismo estilo.
+/// Tramo de texto contiguo con el mismo estilo. Los valores por defecto no se escriben: un tramo
+/// sin estilo es solo `{"t": "..."}`. Al leer, lo que falte vale su valor por defecto.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
     pub t: String,
+    #[serde(default, skip_serializing_if = "Color::is_default")]
     pub fg: Color,
+    #[serde(default, skip_serializing_if = "Color::is_default")]
     pub bg: Color,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub bold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub italic: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub underline: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub inverse: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl Color {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Color::Default)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Generación de la pantalla: cambia con cada escritura del panel y con cada `Resize`.
+    #[serde(default)]
+    pub gen: u64,
     pub rows: u16,
     pub cols: u16,
     /// (fila, columna) del cursor.
@@ -202,6 +227,9 @@ pub struct Snapshot {
     /// La aplicación del panel activó bracketed paste (modo 2004): el pegado debe envolverse.
     #[serde(default)]
     pub bracketed_paste: bool,
+    /// Por fila: `true` si la línea continúa en la siguiente (soft wrap). Vacío en respuestas antiguas.
+    #[serde(default)]
+    pub wrapped: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,4 +285,31 @@ pub fn socket_path() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".galgo").join("galgo.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un tramo sin estilo es solo su texto; los valores por defecto no se escriben, pero se leen.
+    #[test]
+    fn tramo_compacto() {
+        let plain = Run { t: "x".into(), fg: Color::Default, bg: Color::Default, bold: false, italic: false, underline: false, inverse: false };
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"t":"x"}"#);
+        let styled = Run { fg: Color::Idx(1), bold: true, ..plain.clone() };
+        assert_eq!(serde_json::to_string(&styled).unwrap(), r#"{"t":"x","fg":{"Idx":1},"bold":true}"#);
+        let back: Run = serde_json::from_str(r#"{"t":"x"}"#).unwrap();
+        assert_eq!(back, plain);
+    }
+
+    /// `since` solo viaja cuando el cliente lo pide; los clientes viejos no lo envían.
+    #[test]
+    fn since_solo_si_se_pide() {
+        let sin = Request::Snapshot { pane: "p".into(), offset: 0, since: None };
+        assert!(!serde_json::to_string(&sin).unwrap().contains("since"));
+        let con = Request::Snapshot { pane: "p".into(), offset: 0, since: Some(7) };
+        assert!(serde_json::to_string(&con).unwrap().contains(r#""since":7"#));
+        let viejo: Request = serde_json::from_str(r#"{"op":"snapshot","pane":"p"}"#).unwrap();
+        assert!(matches!(viejo, Request::Snapshot { since: None, offset: 0, .. }));
+    }
 }

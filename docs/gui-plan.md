@@ -73,3 +73,14 @@ Cambios hechos: tope de tamaño de panel (500 filas × 1000 columnas, en `Resize
 **Pendientes (no abordados):**
 - **B2, ancho de caracteres:** los caracteres anchos y los combinados desalinean el cursor y las columnas, porque el snapshot omite la celda de continuación y la GUI cuenta caracteres. Solución propuesta: que `Run` lleve su ancho en columnas y emitir cada carácter ancho en un span de ancho fijo.
 - **B6, tamaño del snapshot:** con una pantalla de 74×267 y un color por celda, cada snapshot pesa unos 2,25 MB, y la GUI lo pide 20 veces por segundo aunque no cambie. Solución propuesta: un contador de generación que el lector incremente en cada escritura y un `Snapshot { since }` que responda «sin cambios»; además, `skip_serializing_if` para los valores por defecto.
+
+### Revisión 8: selección, soft wrap y nuevo panel
+
+**Hecho.** La selección se congela: al empezarla, la GUI guarda la pantalla que el usuario ve; el resaltado y Cmd+C usan esa copia, y la vista no se actualiza mientras dure la selección. Consecuencia: mientras hay una selección, el panel parece parado aunque siga trabajando; se libera con un clic, una tecla, o la rueda. Esto también cubre el caso de `clear` con la selección puesta (B5 de la revisión 8). Las filas que continúan en la siguiente (soft wrap) se copian sin salto de línea (`Snapshot.wrapped`). La rueda y el clic solo cuentan dentro de la cuadrícula, así que la barra lateral no mueve el historial. Un panel nuevo se crea desde «+ Nuevo panel» con el tamaño de la ventana y, si tiene manager, este recibe sus resultados. Las insignias «necesita una decisión», «terminó · sin leer» y «entrega sin confirmar» aparecen en la lista; el título muestra cuántos paneles piden atención («galgo (N)»). Con la ventana sin foco, las alertas nuevas llegan como notificación de macOS.
+
+**Procesos del panel.** `Spawn` quita del entorno del hijo las variables `CLAUDE_CODE_*` y `CLAUDECODE`, heredadas si el daemon se arrancó desde una sesión de Claude Code.
+
+**Pendientes (no abordados):**
+- **B1, selección por carácter, no por columna:** la copia y el resaltado cuentan caracteres, así que con combinados o caracteres anchos se copia texto incorrecto (p. ej. `café` sin el acento). Solución propuesta: que el snapshot marque el ancho de cada celda y que la selección trabaje por celda.
+- **B2, bordes y arrastre fuera de pantalla:** en el borde izquierdo o superior, arrastrar deja la selección corta, y no hay autodesplazamiento al arrastrar fuera de la pantalla. Solución propuesta: recortar al borde mientras dura el arrastre y desplazar el historial; para eso hace falta una coordenada absoluta de las filas.
+- **B4, pantalla alterna y ratón:** en `less`, `vim` o `htop` la rueda no envía flechas y los clics no llegan a la aplicación. Solución propuesta: exponer en el snapshot si hay pantalla alterna y el modo de ratón (`Screen::mouse_protocol_mode`) y actuar en consecuencia.

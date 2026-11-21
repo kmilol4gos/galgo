@@ -1,5 +1,7 @@
 use galgo_proto::{client, PaneInfo, Request, Status};
-use iced::{widget::{button, column, container, row, scrollable, text, Space}, Color, Element, Font, Length, Task, Theme};
+use iced::{widget::{button, column, container, lazy, pick_list, row, scrollable, text, text_input, Space}, Color, Element, Font, Length, Task, Theme};
+use serde::Deserialize;
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -8,14 +10,18 @@ const SURFACE: Color = Color::from_rgb(0.083, 0.094, 0.113);
 const TEXT: Color = Color::from_rgb(0.906, 0.914, 0.937);
 const MUTED: Color = Color::from_rgb(0.60, 0.64, 0.70);
 
+mod attention;
+mod newpane;
 mod term;
 
+use attention::{Alert, Attention, Badge};
 use galgo_proto::{Run, Snapshot};
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::text::Span;
 use iced::widget::{rich_text, span};
-use iced::{font, Event, Point, Subscription};
+use iced::{event, font, Event, Point, Subscription};
+use newpane::{NewPane, Preset};
 use std::sync::{mpsc, OnceLock};
 
 const FONT_SIZE: f32 = 14.0;
@@ -27,11 +33,13 @@ const WHEEL_LINES: i32 = 3;
 /// Origen (esquina superior izquierda) de la cuadrícula dentro de la ventana: sidebar, padding del
 /// cuerpo (12), padding del contenedor del terminal (10), cabecera (44) y espacios (10).
 const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + 12.0 + 10.0, 12.0 + 44.0 + 10.0 + 10.0);
+/// Primera opción del desplegable de manager del formulario: ningún manager.
+const NO_MANAGER: &str = "(ninguno)";
 
 /// (fila, columna) dentro de la pantalla mostrada.
 type Cell = (u16, u16);
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 struct Selection {
     anchor: Cell,
     head: Cell,
@@ -119,6 +127,12 @@ struct App {
     panes: Vec<PaneInfo>,
     selected: Option<u32>,
     snap: Option<Snapshot>,
+    /// Generación y desplazamiento de `snap`, para pedir solo lo que cambió.
+    snap_gen: Option<u64>,
+    snap_offset: u16,
+    /// Copia de la pantalla tomada al empezar una selección: lo que se resalta y se copia.
+    /// Mientras existe, la vista no se actualiza, así la selección no se desplaza.
+    sel_snap: Option<Snapshot>,
     error: Option<String>,
     loading: bool,
     listing: bool,
@@ -135,6 +149,14 @@ struct App {
     paste_pending: bool,
     /// Teclas que llegaron mientras tanto; se envían después del pegado.
     key_queue: Vec<String>,
+    attention: Attention,
+    /// Formulario de "Nuevo panel", abierto mientras existe.
+    form: Option<NewPane>,
+    form_error: Option<String>,
+    /// Pide confirmación antes de cerrar el panel seleccionado.
+    confirm_close: bool,
+    /// La ventana tiene el foco: si no, las alertas van a notificación de macOS.
+    focused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -142,10 +164,23 @@ enum Message {
     TickScreen,
     TickList,
     Panes(Result<Vec<PaneInfo>, String>),
-    Screen(u32, Result<Snapshot, String>),
+    Screen(u32, u16, Result<ScreenReply, String>),
     Select(u32),
     Event(Event),
     Paste(Option<String>),
+    OpenForm,
+    CancelForm,
+    FormName(String),
+    FormPreset(String),
+    FormCustom(String),
+    FormCwd(String),
+    FormManager(String),
+    SubmitForm,
+    Spawned(Result<serde_json::Value, String>),
+    AskClose,
+    CancelClose,
+    ConfirmClose,
+    Killed(Result<serde_json::Value, String>),
 }
 
 fn request(req: Request) -> Result<serde_json::Value, String> {
@@ -160,12 +195,81 @@ fn load_panes() -> Task<Message> {
     }, Message::Panes)
 }
 
-fn load_screen(id: u32, offset: u16) -> Task<Message> {
+/// Respuesta de `snapshot` leída en una sola pasada: `data` queda crudo hasta saber qué es.
+#[derive(Deserialize)]
+struct SnapEnvelope<'a> {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(borrow)]
+    data: &'a serde_json::value::RawValue,
+}
+
+/// `{"unchanged": true, "gen": N}`. Con `deny_unknown_fields`, un snapshot completo falla al primer campo
+/// que no es suyo, sin recorrerlo entero.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Unchanged {
+    unchanged: bool,
+    gen: u64,
+}
+
+#[derive(Debug, Clone)]
+enum ScreenReply {
+    /// La pantalla sigue en la generación pedida: no hay nada que redibujar.
+    Unchanged(u64),
+    Full(Snapshot),
+}
+
+/// Pide la pantalla de un panel. `since` solo se envía con el mismo `offset` que la última respuesta completa.
+fn snapshot_request(id: u32, offset: u16, since: Option<u64>) -> Result<ScreenReply, String> {
+    let req = Request::Snapshot { pane: id.to_string(), offset, since };
+    let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    line.push('\n');
+    let mut stream = client::connect().map_err(|e| format!("{e:#}"))?;
+    stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).map_err(|e| e.to_string())?;
+    if reply.is_empty() {
+        return Err("el daemon cerró la conexión sin responder".into());
+    }
+    parse_snapshot_reply(&reply)
+}
+
+/// Interpreta una línea de respuesta de `snapshot` sin reparsear el snapshot: `data` se lee una vez.
+fn parse_snapshot_reply(reply: &str) -> Result<ScreenReply, String> {
+    let env: SnapEnvelope = serde_json::from_str(reply).map_err(|e| e.to_string())?;
+    if !env.ok {
+        return Err(env.error.unwrap_or_else(|| "Error del daemon".into()));
+    }
+    let raw = env.data.get();
+    if let Ok(u) = serde_json::from_str::<Unchanged>(raw) {
+        if u.unchanged {
+            return Ok(ScreenReply::Unchanged(u.gen));
+        }
+    }
+    serde_json::from_str::<Snapshot>(raw).map(ScreenReply::Full).map_err(|e| e.to_string())
+}
+
+fn load_screen(id: u32, offset: u16, since: Option<u64>) -> Task<Message> {
     Task::perform(async move {
-        tokio::task::spawn_blocking(move || {
-            serde_json::from_value(request(Request::Snapshot { pane: id.to_string(), offset })?).map_err(|e| e.to_string())
-        }).await.map_err(|e| e.to_string())?
-    }, move |r| Message::Screen(id, r))
+        tokio::task::spawn_blocking(move || snapshot_request(id, offset, since)).await.map_err(|e| e.to_string())?
+    }, move |r| Message::Screen(id, offset, r))
+}
+
+/// Envía una petición que no es de teclado (crear, cerrar) fuera del hilo de la interfaz.
+fn send_request(req: Request, to: fn(Result<serde_json::Value, String>) -> Message) -> Task<Message> {
+    Task::perform(async move {
+        tokio::task::spawn_blocking(move || request(req)).await.map_err(|e| e.to_string())?
+    }, to)
+}
+
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+}
+
+fn login_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
 }
 
 fn send_text(app: &App, text: String) {
@@ -178,12 +282,35 @@ fn send_text(app: &App, text: String) {
     let _ = outbox().send(req);
 }
 
+/// Quita la selección y su copia congelada.
+fn clear_selection(app: &mut App) {
+    app.sel = None;
+    app.sel_snap = None;
+    app.dragging = false;
+}
+
 /// Vuelve a la pantalla en vivo y descarta la selección: el contenido mostrado cambia.
 fn back_to_live(app: &mut App) {
-    if app.scroll != 0 {
-        app.scroll = 0;
+    app.scroll = 0;
+    clear_selection(app);
+}
+
+/// Selecciona un panel. Mirarlo no cambia su tamaño y lo deja sin marca de "sin leer".
+fn select(app: &mut App, id: u32) -> Task<Message> {
+    app.selected = Some(id);
+    app.snap = None;
+    app.snap_gen = None;
+    app.snap_offset = 0;
+    app.scroll = 0;
+    app.confirm_close = false;
+    clear_selection(app);
+    app.attention.mark_read(id);
+    if app.loading {
+        Task::none()
+    } else {
+        app.loading = true;
+        load_screen(id, 0, None)
     }
-    app.sel = None;
 }
 
 /// Filas y columnas que caben en el área del terminal para el tamaño de ventana actual.
@@ -191,6 +318,11 @@ fn grid_for(window: (f32, f32)) -> (u16, u16) {
     let w = window.0 - SIDEBAR_W - 24.0 - 20.0;
     let h = window.1 - 24.0 - 44.0 - 20.0 - 10.0;
     (((h / LINE_H).floor().max(5.0)) as u16, ((w / CELL_W).floor().max(20.0)) as u16)
+}
+
+/// Pantalla que se muestra: la congelada si hay selección, si no la última recibida.
+fn shown(app: &App) -> Option<&Snapshot> {
+    app.sel_snap.as_ref().or(app.snap.as_ref())
 }
 
 /// Celda de la cuadrícula bajo el píxel (x, y), con el origen del terminal restado.
@@ -210,6 +342,24 @@ fn pixel_to_cell(x: f32, y: f32, grid: (u16, u16)) -> Option<Cell> {
     Some((row.min(rows - 1), col.min(cols - 1)))
 }
 
+/// Si el píxel cae dentro de la cuadrícula visible (no en el recorte de los bordes).
+fn inside_grid(x: f32, y: f32, grid: (u16, u16)) -> bool {
+    let (ox, oy) = TERM_ORIGIN;
+    x >= ox && y >= oy && x < ox + grid.1 as f32 * CELL_W && y < oy + grid.0 as f32 * LINE_H
+}
+
+fn pointer_in_grid(app: &App) -> bool {
+    match (app.pointer, shown(app)) {
+        (Some(p), Some(s)) => inside_grid(p.x, p.y, (s.rows, s.cols)),
+        _ => false,
+    }
+}
+
+fn grid_cell(app: &App, p: Point) -> Option<Cell> {
+    let snap = shown(app)?;
+    pixel_to_cell(p.x, p.y, (snap.rows, snap.cols))
+}
+
 /// Extremos de una selección en orden de lectura.
 fn ordered(sel: Selection) -> (Cell, Cell) {
     if sel.anchor <= sel.head { (sel.anchor, sel.head) } else { (sel.head, sel.anchor) }
@@ -226,23 +376,27 @@ fn selected_cols(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
     (start <= end).then_some((start, end))
 }
 
-/// Texto de la selección: sin relleno de espacios al final de cada línea.
+/// Texto de la selección. Las filas que continúan en la siguiente (soft wrap) se unen sin salto de
+/// línea; el resto termina en `\n` y sin espacios de relleno al final.
 fn selection_text(snap: &Snapshot, sel: Selection) -> String {
     let (s, e) = ordered(sel);
-    let mut lines = Vec::new();
+    let mut out = String::new();
     for row in s.0..=e.0 {
         let Some(runs) = snap.lines.get(row as usize) else { break };
         let Some((c0, c1)) = selected_cols(sel, row, snap.cols) else { continue };
         let chars: Vec<char> = runs.iter().flat_map(|r| r.t.chars()).collect();
         let part: String = chars.iter().skip(c0 as usize).take((c1 - c0 + 1) as usize).collect();
-        lines.push(part.trim_end().to_string());
+        let continues = row < e.0 && snap.wrapped.get(row as usize).copied().unwrap_or(false);
+        if continues {
+            out.push_str(&part);
+        } else {
+            out.push_str(part.trim_end());
+            if row < e.0 {
+                out.push('\n');
+            }
+        }
     }
-    lines.join("\n")
-}
-
-fn grid_cell(app: &App, p: Point) -> Option<Cell> {
-    let snap = app.snap.as_ref()?;
-    pixel_to_cell(p.x, p.y, (snap.rows, snap.cols))
+    out
 }
 
 /// Petición de `Resize` para el panel seleccionado, si la ventana cambió desde el último envío.
@@ -263,6 +417,23 @@ fn resize_if_needed(app: &mut App) {
     }
 }
 
+/// Avisa de las alertas nuevas con una notificación de macOS, si la ventana no tiene el foco.
+fn notify(alerts: &[Alert], focused: bool) {
+    if focused {
+        return;
+    }
+    for a in alerts {
+        let script = attention::notification_script(&a.name, a.status);
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("osascript").args(["-e", &script]).status();
+        });
+    }
+}
+
+fn app_title(app: &App) -> String {
+    attention::window_title(app.attention.count(&app.panes))
+}
+
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::TickScreen => {
@@ -270,7 +441,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.error = Some(format!("no se envió: {e}"));
             }
             match app.selected {
-                Some(id) if !app.loading => { app.loading = true; load_screen(id, app.scroll) }
+                Some(id) if !app.loading => {
+                    app.loading = true;
+                    // Solo se pide "lo que cambió" si la última respuesta completa es del mismo desplazamiento.
+                    let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
+                    load_screen(id, app.scroll, since)
+                }
                 _ => Task::none(),
             }
         }
@@ -283,45 +459,77 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.error = None;
                     app.panes = panes;
                     if app.selected.is_some_and(|id| !app.panes.iter().any(|p| p.id == id)) {
-                        app.selected = None; app.snap = None; app.sel = None; app.scroll = 0;
+                        app.selected = None;
+                        app.snap = None;
+                        app.snap_gen = None;
+                        app.scroll = 0;
+                        app.confirm_close = false;
+                        clear_selection(app);
                     }
                     if app.selected.is_none() {
-                        if let Some(p) = app.panes.first() { app.selected = Some(p.id); }
+                        if let Some(id) = app.panes.first().map(|p| p.id) {
+                            app.selected = Some(id);
+                        }
                     }
+                    let alerts = app.attention.observe(&app.panes, app.selected);
+                    notify(&alerts, app.focused);
                 }
                 Err(e) => app.error = Some(e),
             }
             Task::none()
         }
-        Message::Screen(id, result) => {
+        Message::Screen(id, offset, result) => {
             app.loading = false;
             if app.selected == Some(id) {
                 match result {
-                    Ok(snap) => {
+                    // Sin cambios: el estado de la pantalla ya es el correcto, no se toca nada.
+                    Ok(ScreenReply::Unchanged(gen)) => {
+                        app.error = None;
+                        app.snap_gen = Some(gen);
+                    }
+                    Ok(ScreenReply::Full(snap)) => {
                         app.error = None;
                         // El daemon puede haber recortado el desplazamiento al historial disponible.
                         app.scroll = app.scroll.min(snap.scrollback_max);
-                        if app.snap.as_ref() != Some(&snap) { app.snap = Some(snap); }
+                        app.snap_gen = Some(snap.gen);
+                        app.snap_offset = offset;
+                        app.snap = Some(snap);
                     }
                     Err(e) => app.error = Some(e),
                 }
             }
             Task::none()
         }
-        Message::Select(id) => {
-            app.selected = Some(id); app.snap = None; app.sel = None; app.scroll = 0;
-            if app.loading { Task::none() } else { app.loading = true; load_screen(id, 0) }
-        }
+        Message::Select(id) => select(app, id),
         Message::Event(Event::Window(iced::window::Event::Resized(size))) => {
-            app.window = (size.width, size.height); resize_if_needed(app); Task::none()
+            app.window = (size.width, size.height);
+            resize_if_needed(app);
+            Task::none()
+        }
+        Message::Event(Event::Window(iced::window::Event::Opened { size, .. })) => {
+            app.window = (size.width, size.height);
+            resize_if_needed(app);
+            Task::none()
+        }
+        Message::Event(Event::Window(iced::window::Event::Focused)) => {
+            app.focused = true;
+            Task::none()
+        }
+        Message::Event(Event::Window(iced::window::Event::Unfocused)) => {
+            app.focused = false;
+            Task::none()
         }
         Message::Event(Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })) => {
+            // Con el formulario abierto, el teclado es del formulario, no del panel.
+            if app.form.is_some() {
+                return Task::none();
+            }
             if modifiers.command() && matches!(&key, Key::Character(c) if c.as_str() == "v") {
                 app.paste_pending = true;
                 return iced::clipboard::read().map(Message::Paste);
             }
             if modifiers.command() && matches!(&key, Key::Character(c) if c.as_str() == "c") {
-                let copied = match (app.sel, app.snap.as_ref()) {
+                let copied = match (app.sel, shown(app)) {
                     (Some(sel), Some(snap)) => selection_text(snap, sel),
                     _ => String::new(),
                 };
@@ -337,10 +545,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::Event(Event::Window(iced::window::Event::Opened { size, .. })) => {
-            app.window = (size.width, size.height); resize_if_needed(app); Task::none()
-        }
         Message::Event(Event::Mouse(mouse::Event::WheelScrolled { delta })) => {
+            // Solo el historial del terminal: la rueda sobre la barra lateral no lo mueve.
+            if !pointer_in_grid(app) {
+                return Task::none();
+            }
             let lines = match delta {
                 mouse::ScrollDelta::Lines { y, .. } => y,
                 mouse::ScrollDelta::Pixels { y, .. } => y / LINE_H,
@@ -354,13 +563,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 let next = (app.scroll as i32 + steps * WHEEL_LINES).clamp(0, max);
                 if next as u16 != app.scroll {
                     app.scroll = next as u16;
-                    app.sel = None;
+                    clear_selection(app);
                 }
             }
             Task::none()
         }
         Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) => {
+            if !pointer_in_grid(app) {
+                return Task::none();
+            }
             if let Some(cell) = app.pointer.and_then(|p| grid_cell(app, p)) {
+                // Se congela la pantalla que el usuario ve en este momento.
+                app.sel_snap = app.snap.clone();
                 app.sel = Some(Selection { anchor: cell, head: cell });
                 app.dragging = true;
             }
@@ -379,7 +593,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.dragging = false;
             // Un clic sin arrastre no deja selección.
             if app.sel.is_some_and(|s| s.anchor == s.head) {
-                app.sel = None;
+                clear_selection(app);
             }
             Task::none()
         }
@@ -397,6 +611,95 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 send_text(app, bytes);
             }
             Task::none()
+        }
+
+        // ---- Formulario de nuevo panel ----
+        Message::OpenForm => {
+            app.form = Some(NewPane::default());
+            app.form_error = None;
+            Task::none()
+        }
+        Message::CancelForm => {
+            app.form = None;
+            app.form_error = None;
+            Task::none()
+        }
+        Message::FormName(v) => {
+            if let Some(f) = app.form.as_mut() { f.name = v; }
+            Task::none()
+        }
+        Message::FormPreset(label) => {
+            if let (Some(f), Some(p)) = (app.form.as_mut(), Preset::from_label(&label)) { f.preset = p; }
+            Task::none()
+        }
+        Message::FormCustom(v) => {
+            if let Some(f) = app.form.as_mut() { f.custom = v; }
+            Task::none()
+        }
+        Message::FormCwd(v) => {
+            if let Some(f) = app.form.as_mut() { f.cwd = v; }
+            Task::none()
+        }
+        Message::FormManager(name) => {
+            if let Some(f) = app.form.as_mut() {
+                f.manager = if name == NO_MANAGER { None } else { Some(name) };
+            }
+            Task::none()
+        }
+        Message::SubmitForm => {
+            let Some(form) = app.form.clone() else { return Task::none() };
+            let (rows, cols) = grid_for(app.window);
+            let (home, shell) = (home_dir(), login_shell());
+            match newpane::spawn_request(&form, rows, cols, &newpane::Env { home: &home, shell: &shell }) {
+                Ok(req) => {
+                    app.form_error = None;
+                    send_request(req, Message::Spawned)
+                }
+                Err(e) => {
+                    app.form_error = Some(e);
+                    Task::none()
+                }
+            }
+        }
+        Message::Spawned(Ok(data)) => {
+            app.form = None;
+            app.form_error = None;
+            match serde_json::from_value::<PaneInfo>(data) {
+                Ok(p) => {
+                    // El panel nace con el tamaño de la ventana: no hace falta otro Resize.
+                    app.size_sent = Some((p.id, grid_for(app.window).0, grid_for(app.window).1));
+                    app.panes.push(p.clone());
+                    let task = select(app, p.id);
+                    Task::batch([task, load_panes()])
+                }
+                Err(_) => load_panes(),
+            }
+        }
+        Message::Spawned(Err(e)) => {
+            app.form_error = Some(e);
+            Task::none()
+        }
+
+        // ---- Cerrar el panel seleccionado, con confirmación ----
+        Message::AskClose => {
+            app.confirm_close = app.selected.is_some();
+            Task::none()
+        }
+        Message::CancelClose => {
+            app.confirm_close = false;
+            Task::none()
+        }
+        Message::ConfirmClose => {
+            app.confirm_close = false;
+            match app.selected {
+                Some(id) => send_request(Request::Kill { pane: id.to_string() }, Message::Killed),
+                None => Task::none(),
+            }
+        }
+        Message::Killed(Ok(_)) => load_panes(),
+        Message::Killed(Err(e)) => {
+            app.error = Some(e);
+            load_panes()
         }
     }
 }
@@ -469,8 +772,53 @@ fn status_color(status: Status) -> Color {
     }
 }
 
+/// Texto y color de la insignia de atención de un panel.
+fn badge_look(b: Badge) -> (&'static str, Color) {
+    match b {
+        Badge::Blocked => ("necesita una decisión", status_color(Status::Blocked)),
+        Badge::DoneUnread => ("terminó · sin leer", status_color(Status::Done)),
+        Badge::Orphan => ("entrega sin confirmar", status_color(Status::Failed)),
+    }
+}
+
+fn form_view<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
+    let presets: Vec<String> = Preset::ALL.iter().map(|p| p.label().to_string()).collect();
+    let mut managers: Vec<String> = vec![NO_MANAGER.to_string()];
+    managers.extend(app.panes.iter().map(|p| p.name.clone()));
+    let manager_sel = f.manager.clone().unwrap_or_else(|| NO_MANAGER.to_string());
+
+    let mut form = column![
+        text("Nuevo panel").size(18),
+        text("Nombre").size(12).color(MUTED),
+        text_input("p. ej. worker-tests", &f.name).on_input(Message::FormName).padding(8),
+        text("Comando").size(12).color(MUTED),
+        pick_list(presets, Some(f.preset.label().to_string()), Message::FormPreset),
+    ]
+    .spacing(8)
+    .width(Length::Fixed(420.0));
+    if f.preset == Preset::Custom {
+        form = form.push(text_input("p. ej. bash --norc", &f.custom).on_input(Message::FormCustom).padding(8));
+    }
+    form = form
+        .push(text("Directorio").size(12).color(MUTED))
+        .push(text_input(&home_dir(), &f.cwd).on_input(Message::FormCwd).padding(8))
+        .push(text("Manager (recibe el resultado)").size(12).color(MUTED))
+        .push(pick_list(managers, Some(manager_sel), Message::FormManager))
+        .push(row![
+            button(text("Crear").size(14)).on_press(Message::SubmitForm),
+            button(text("Cancelar").size(14)).on_press(Message::CancelForm),
+        ].spacing(10));
+    if let Some(e) = &app.form_error {
+        form = form.push(text(e.clone()).size(12).color(status_color(Status::Failed)));
+    }
+    container(form).padding(16).into()
+}
+
 fn view(app: &App) -> Element<'_, Message> {
-    let mut list = column![row![text("PANELES").size(12).color(MUTED), Space::with_width(Length::Fill), text(app.panes.len()).size(12).color(MUTED)].padding([0, 4])].spacing(8);
+    let mut list = column![
+        row![text("PANELES").size(12).color(MUTED), Space::with_width(Length::Fill), text(app.panes.len()).size(12).color(MUTED)].padding([0, 4]),
+        button(text("+ Nuevo panel").size(13)).width(Length::Fill).on_press(Message::OpenForm),
+    ].spacing(8);
     if app.panes.is_empty() { list = list.push(text("No hay paneles todavía.").size(14).color(MUTED)); }
     for pane in &app.panes {
         let mut notes = Vec::new();
@@ -479,6 +827,10 @@ fn view(app: &App) -> Element<'_, Message> {
         if let Some(manager) = &pane.manager { notes.push(format!("reporta a {manager}")); }
         if let Some(waiting) = &pane.waiting_on { notes.push(format!("espera a {waiting}")); }
         let mut info = column![text(&pane.name).size(15), text(pane.status.as_str().to_uppercase()).size(11).color(status_color(pane.status))].spacing(5);
+        if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
+            let (label, color) = badge_look(b);
+            info = info.push(row![text("●").size(11).color(color), text(label).size(11).color(color)].spacing(6));
+        }
         if !notes.is_empty() { info = info.push(text(notes.join(" · ")).size(11).color(if pane.orphan { status_color(Status::Blocked) } else { MUTED })); }
         let selected = app.selected == Some(pane.id);
         list = list.push(button(container(info).width(Length::Fill).padding(10)).width(Length::Fill).on_press(Message::Select(pane.id)).style(move |_, status| {
@@ -491,40 +843,67 @@ fn view(app: &App) -> Element<'_, Message> {
     let title = selected_pane.map(|p| p.name.as_str()).unwrap_or("Sin paneles");
     let state = selected_pane.map(|p| p.status.as_str().to_uppercase()).unwrap_or_default();
     let state_color = selected_pane.map(|p| status_color(p.status)).unwrap_or(MUTED);
-    let screen: Element<'_, Message> = match &app.snap {
-        Some(snap) => screen_view(snap, app.sel),
-        None => text(if app.selected.is_none() { "Crea un panel con `galgo spawn`." } else { "Esperando salida…" }).size(14).color(MUTED).into(),
+
+    let body_content: Element<'_, Message> = if let Some(f) = &app.form {
+        form_view(app, f)
+    } else {
+        let screen: Element<'_, Message> = match shown(app) {
+            // Con `lazy`, el árbol de la pantalla solo se reconstruye cuando cambia lo que se muestra.
+            Some(snap) => {
+                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen));
+                let sel = app.sel;
+                lazy(key, move |_| screen_view(snap, sel)).into()
+            }
+            None => text(if app.selected.is_none() { "Crea un panel con «+ Nuevo panel» o con `galgo spawn`." } else { "Esperando salida…" }).size(14).color(MUTED).into(),
+        };
+        container(screen).width(Length::Fill).height(Length::Fill).padding(10).clip(true)
+            .style(|_| container::Style { background: Some(term::DEFAULT_BG.into()), border: iced::border::rounded(8), ..Default::default() })
+            .into()
     };
-    let terminal = container(screen).width(Length::Fill).height(Length::Fill).padding(10).clip(true)
-        .style(|_| container::Style { background: Some(term::DEFAULT_BG.into()), border: iced::border::rounded(8), ..Default::default() });
+
     let mut header = row![text(title).size(18), text(state).size(11).color(state_color), Space::with_width(Length::Fill)].spacing(12).align_y(iced::Alignment::Center).height(44);
-    if let Some(n) = app.snap.as_ref().map(|s| s.scrollback).filter(|&n| n > 0) {
+    if let Some(n) = shown(app).map(|s| s.scrollback).filter(|&n| n > 0) {
         header = header.push(text(format!("↑ {n}")).size(12).color(status_color(Status::Blocked)));
     }
+    if app.form.is_none() && app.selected.is_some() {
+        if app.confirm_close {
+            header = header.push(text(format!("¿Cerrar «{title}»?")).size(12).color(status_color(Status::Blocked)))
+                .push(button(text("Sí, cerrar").size(12)).on_press(Message::ConfirmClose))
+                .push(button(text("No").size(12)).on_press(Message::CancelClose));
+        } else {
+            header = header.push(button(text("Cerrar panel").size(12)).on_press(Message::AskClose));
+        }
+    }
     header = header.push(text("GALGO").size(11).color(MUTED));
-    let mut body = column![header, terminal].spacing(10).padding(12).width(Length::Fill).height(Length::Fill);
+    let mut body = column![header, body_content].spacing(10).padding(12).width(Length::Fill).height(Length::Fill);
     if let Some(error) = &app.error { body = body.push(text(format!("Error: {error}")).size(12).color(status_color(Status::Failed))); }
     container(row![sidebar, body]).width(Length::Fill).height(Length::Fill).style(|_| container::Style { background: Some(BG.into()), text_color: Some(TEXT), ..Default::default() }).into()
 }
 
 fn main() -> iced::Result {
-    iced::application("galgo", update, view)
+    iced::application(app_title, update, view)
         .theme(|_| Theme::Dark)
         .subscription(|_: &App| Subscription::batch([
             iced::time::every(Duration::from_millis(50)).map(|_| Message::TickScreen),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TickList),
-            iced::event::listen_with(|event, _status, _id| match event {
+            event::listen_with(|event, status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed { .. }) => Some(Message::Event(event)),
-                Event::Window(iced::window::Event::Resized(_)) | Event::Window(iced::window::Event::Opened { .. }) => Some(Message::Event(event)),
+                Event::Window(iced::window::Event::Resized(_))
+                | Event::Window(iced::window::Event::Opened { .. })
+                | Event::Window(iced::window::Event::Focused)
+                | Event::Window(iced::window::Event::Unfocused) => Some(Message::Event(event)),
+                // Lo que otro widget ya capturó (la lista, un botón, un campo) no llega al terminal.
+                // El soltar del botón siempre llega, para no dejar una selección arrastrándose.
                 Event::Mouse(mouse::Event::WheelScrolled { .. })
                 | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                | Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                    if status == event::Status::Ignored => Some(Message::Event(event)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
                 | Event::Mouse(mouse::Event::CursorMoved { .. }) => Some(Message::Event(event)),
                 _ => None,
             }),
         ]))
         .window_size(iced::Size::new(1100.0, 700.0))
-        .run_with(|| (App { window: (1100.0, 700.0), ..Default::default() }, load_panes()))
+        .run_with(|| (App { window: (1100.0, 700.0), focused: true, ..Default::default() }, load_panes()))
 }
 
 #[cfg(test)]
@@ -537,6 +916,7 @@ mod tests {
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
         Snapshot {
+            gen: 0,
             rows: lines.len() as u16,
             cols,
             cursor: (0, 0),
@@ -545,6 +925,7 @@ mod tests {
             scrollback: 0,
             scrollback_max: 0,
             bracketed_paste: false,
+            wrapped: vec![],
         }
     }
 
@@ -570,6 +951,15 @@ mod tests {
         assert_eq!(pixel_to_cell(TERM_ORIGIN.0, TERM_ORIGIN.1, (0, 80)), None);
     }
 
+    /// B3: la rueda y el clic solo cuentan dentro de la cuadrícula.
+    #[test]
+    fn dentro_de_la_cuadricula_solo() {
+        assert!(inside_grid(TERM_ORIGIN.0, TERM_ORIGIN.1, (10, 80)));
+        assert!(!inside_grid(TERM_ORIGIN.0 + 10_000.0, TERM_ORIGIN.1, (10, 80)));
+        assert!(!inside_grid(TERM_ORIGIN.0, TERM_ORIGIN.1 + 10.0 * LINE_H, (10, 80)));
+        assert!(!inside_grid(50.0, 300.0, (10, 80)));
+    }
+
     #[test]
     fn texto_de_una_fila_recorta_columnas_y_espacios_finales() {
         let s = snap(&["hola mundo    ", "segunda"], 14);
@@ -588,6 +978,36 @@ mod tests {
         assert_eq!(selection_text(&s, sel), "o\ndo");
         let sel = Selection { anchor: (0, 0), head: (2, 2) };
         assert_eq!(selection_text(&s, sel), "uno\ndos\ntre");
+    }
+
+    /// M2: una línea partida por el terminal se copia entera, sin salto de línea.
+    #[test]
+    fn copia_une_las_filas_con_soft_wrap() {
+        let mut s = snap(&["https://ej", "emplo.com", "abc"], 10);
+        s.wrapped = vec![true, true, false];
+        let sel = Selection { anchor: (0, 0), head: (2, 2) };
+        assert_eq!(selection_text(&s, sel), "https://ejemplo.comabc");
+        // Sin el marcador de soft wrap, cada fila es una línea.
+        s.wrapped = vec![false, false, false];
+        assert_eq!(selection_text(&s, sel), "https://ej\nemplo.com\nabc");
+    }
+
+    /// M1: la selección se resalta y se copia desde la pantalla que el usuario vio al empezarla,
+    /// aunque lleguen líneas nuevas.
+    #[test]
+    fn la_seleccion_no_se_mueve_con_la_salida_nueva() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        app.snap = Some(snap(&["aaaa", "bbbb"], 4));
+        app.pointer = Some(Point::new(center(0, 0).0, center(0, 0).1));
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))));
+        app.pointer = Some(Point::new(center(1, 1).0, center(1, 1).1));
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(center(1, 1).0, center(1, 1).1) })));
+        // Llega salida nueva: la pantalla cambia, la selección no.
+        app.snap = Some(snap(&["cccc", "dddd"], 4));
+        let sel = app.sel.unwrap();
+        assert_eq!(selection_text(shown(&app).unwrap(), sel), "aaaa\nbb");
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))));
+        assert!(app.sel_snap.is_some());
     }
 
     #[test]
@@ -649,5 +1069,73 @@ mod tests {
         assert_eq!(app.key_queue, vec!["x".to_string(), "y".to_string()]);
         app.paste_pending = false;
         assert_eq!(route_input(&mut app, "z".into()), Some("z".into()));
+    }
+
+    fn pane_info(id: u32, name: &str, status: Status) -> PaneInfo {
+        PaneInfo {
+            id,
+            name: name.into(),
+            status,
+            manager: None,
+            cmd: vec![],
+            unacked: 0,
+            oldest_unacked_secs: None,
+            orphan: false,
+            waiting_on: None,
+            waiting_secs: None,
+        }
+    }
+
+    /// C: la lista de paneles alimenta la atención; el panel seleccionado no queda sin leer.
+    #[test]
+    fn panes_actualiza_atencion_y_alertas() {
+        let mut app = App { focused: true, selected: Some(1), ..Default::default() };
+        app.panes = vec![pane_info(1, "a", Status::Working), pane_info(2, "b", Status::Working)];
+        let first = app.panes.clone();
+        let _ = update(&mut app, Message::Panes(Ok(first)));
+        let mut next = app.panes.clone();
+        next[0].status = Status::Done;
+        next[1].status = Status::Done;
+        let _ = update(&mut app, Message::Panes(Ok(next)));
+        assert!(!app.attention.is_unread(1), "el seleccionado no queda sin leer");
+        assert!(app.attention.is_unread(2));
+        assert_eq!(app_title(&app), "galgo (1)");
+        // Al seleccionarlo, se limpia.
+        let _ = update(&mut app, Message::Select(2));
+        assert_eq!(app_title(&app), "galgo");
+    }
+
+    /// C: el formulario bloquea el teclado del panel mientras está abierto.
+    #[test]
+    fn con_el_formulario_abierto_el_teclado_no_va_al_panel() {
+        let mut app = App { selected: Some(1), form: Some(NewPane::default()), ..Default::default() };
+        let key = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Character("a".into()),
+            modified_key: Key::Character("a".into()),
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("a".into()),
+        });
+        let _ = update(&mut app, Message::Event(key));
+        // Sin formulario, la tecla habría quedado pendiente tras un pegado; aquí no se toca nada.
+        assert!(app.key_queue.is_empty());
+        assert!(app.form.is_some());
+    }
+
+    /// Rendimiento: una respuesta `unchanged` no se trata como snapshot, y un snapshot completo sí.
+    #[test]
+    fn respuesta_unchanged_y_completa() {
+        match parse_snapshot_reply(r#"{"ok":true,"error":null,"data":{"unchanged":true,"gen":42}}"#) {
+            Ok(ScreenReply::Unchanged(g)) => assert_eq!(g, 42),
+            other => panic!("esperaba unchanged: {other:?}"),
+        }
+        let full = snap(&["hola"], 4);
+        let line = format!(r#"{{"ok":true,"error":null,"data":{}}}"#, serde_json::to_string(&full).unwrap());
+        match parse_snapshot_reply(&line) {
+            Ok(ScreenReply::Full(s)) => assert_eq!(s.rows, 1),
+            other => panic!("esperaba snapshot completo: {other:?}"),
+        }
+        assert_eq!(parse_snapshot_reply(r#"{"ok":false,"error":"panel no encontrado: x","data":null}"#).unwrap_err(), "panel no encontrado: x");
     }
 }

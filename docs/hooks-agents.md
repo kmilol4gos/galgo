@@ -1,12 +1,12 @@
 # Integración de hooks de PI, OpenCode y Codex
 
-Investigación: 21-11-2026. Localmente se consultaron `--help`, versiones y archivos de configuración/extensiones, sin modificar la configuración del usuario ni ejecutar una sesión de modelo. Versiones: **PI 1.5.2** (`@earendil-works/pi-coding-agent`), **OpenCode 1.18.33**, **codex-cli 0.167.0**. Las páginas oficiales pueden describir versiones posteriores; se distinguen de lo observado en la instalación. No se muestran valores privados de las configuraciones locales.
+Investigación: 21-11-2026. Localmente se consultaron `--help`, versiones y archivos de configuración/extensiones sin modificar la configuración del usuario; también se probaron sesiones aisladas, incluido Codex con un servidor de modelo simulado. Versiones: **PI 1.5.2** (`@earendil-works/pi-coding-agent`), **OpenCode 1.18.33**, **codex-cli 0.167.0**. Las páginas oficiales pueden describir versiones posteriores; se distinguen de lo observado en la instalación. No se muestran valores privados de las configuraciones locales.
 
 ## Punto de partida y límites
 
 `crates/galgo-proto/src/lib.rs` define `HookEvent`: `prompt_submitted`, `working`, `idle`, `blocked`, `turn_ended` y `failed`. El daemon los interpreta según el panel: `turn_ended` puede entregar un resultado al manager; no equivale simplemente a `idle`. Es importante no producir dos resultados por un `galgo done` explícito seguido de eventos de herramientas/finalización.
 
-**Implementados: `galgo hook claude` y `galgo hook pi`.** El instalador de Claude modifica settings de Claude; PI instala una extensión separada. Ambos leen JSON por stdin, buscan `GALGO_PANE`, conectan al socket sin arrancar el daemon, recortan resúmenes, no imprimen stdout y retornan 0. Los ejemplos `galgo hook opencode|codex` son **propuestas no implementadas**.
+**Implementados: `galgo hook claude`, `galgo hook pi` y `galgo hook codex`.** El instalador de Claude modifica settings de Claude; PI instala una extensión separada y Codex fusiona entradas en su `hooks.json`. Los tres leen JSON por stdin, buscan `GALGO_PANE`, conectan al socket sin arrancar el daemon, recortan resúmenes, no imprimen stdout y retornan 0. `galgo hook opencode` sigue **sin implementar**.
 
 Fuentes: [PI: extensiones](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md), también leída en la instalación 1.5.2; [OpenCode: plugins](https://opencode.ai/docs/plugins/), [construcción](https://opencode.ai/docs/build/plugins/) y [server](https://opencode.ai/docs/build/plugins/server/); [Codex: hooks](https://developers.openai.com/codex/hooks/) y [referencia de configuración](https://developers.openai.com/codex/config-reference/). La validez de cada integración en una sesión interactiva real queda **no verificada**.
 
@@ -45,6 +45,8 @@ printf '%s\\n' '{"type":"agent_start"}' | galgo hook pi
 
 ## OpenCode
 
+**Comprobación local adicional (21-11-2026).** Con `opencode 1.18.33 run`, HOME y XDG temporales, un plugin V1 de prueba se cargó y recibió `GALGO_PANE` y `GALGO_SOCKET`. Para un modelo inexistente observamos `session.created` con `properties.sessionID` e `info` sin `parentID`, `chat.message` con `sessionID`, `session.status` `busy`, `session.error`, `session.status` `idle` y `session.idle`. El constructor del plugin se invocó dos veces, aunque en esta prueba cada evento observado se registró una vez. Esto no demuestra cómo vincular una sesión raíz con un panel cuando hay varias sesiones, servidores compartidos o `attach`, ni verifica permisos, sesiones hijas o un turno exitoso. En particular, tras el error hubo eventos idle: **idle no demuestra éxito**. No se han implementado adaptador ni instalador OpenCode hasta resolver la identidad y esos casos.
+
 **Mecanismo y ubicación.** Plugin de servidor JS/TS. En la instalación local existe `~/.config/opencode/plugins/herdr-agent-state.js`; no editarlo. El lugar propuesto es `~/.config/opencode/plugins/galgo.js` o `.opencode/plugins/galgo.js` del proyecto, descubiertos automáticamente. En la documentación oficial actual, los directorios de plugin pueden configurarse mediante la propiedad JSON/JSONC `"plugins"` de `~/.config/opencode/opencode.json(c)`, `./opencode.json(c)` o `./.opencode/opencode.json(c)`; las rutas locales configuradas son **directorios**, no archivos sueltos. La versión local incluye una API de plugin V1 y tipos instalados `@opencode-ai/plugin`; la documentación actual también describe una API nueva `@opencode/plugin`/`Plugin.define`. **Compatibilidad exacta entre la documentación actual y el binario 1.18.33: no verificada**; fijar versión y probar antes de instalar.
 
 **Mapeo propuesto**, basado en el plugin local y tipos SDK locales `@opencode-ai/sdk/dist/v2/gen/types.gen.d.ts`:
@@ -78,29 +80,19 @@ El ejemplo no identifica la sesión ni limita la duración del hijo: es ilustrat
 
 ## Codex
 
+**Comprobación local adicional (21-11-2026).** Con `codex-cli 0.167.0 exec`, HOME y `CODEX_HOME` temporales, `hooks.json` aislado y `--dangerously-bypass-hook-trust` solo para la prueba, se capturaron por stdin `SessionStart` (`cwd`, `hook_event_name`, `model`, `permission_mode`, `session_id`, `source`, `transcript_path`) y `UserPromptSubmit` (los campos comunes, `prompt` y `turn_id`). Con un servidor Responses simulado en localhost se completó un turno y se capturó `Stop`, con los campos comunes más `turn_id`, `stop_hook_active=false` y `last_assistant_message` con el texto simulado. El comando de prueba devolvió `{}` y Codex finalizó correctamente. Esto verifica el formato para ese flujo, no la interacción con otros hooks que continúen el turno, aprobación, herramientas, subagentes ni cancelación. La opción que evita la revisión de confianza es peligrosa y no debe usarse automáticamente en la instalación.
+
 **Mecanismo y ubicación.** Hooks de comando, un objeto JSON por stdin. La documentación oficial describe `$CODEX_HOME/hooks.json` (por defecto `~/.codex/hooks.json`) y `.codex/hooks.json` de un proyecto confiable, o declaraciones `[hooks]` en el `config.toml` de la misma capa. También hay hooks de sistema y de plugins. En este Mac existe `~/.codex/hooks.json` con grupos `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `SubagentStart`, `SubagentStop` y `Stop`; `codex features list` muestra `hooks stable true`. Esto verifica presencia y configuración, no que se hayan disparado. Codex combina fuentes y exige revisar/confiar hooks no gestionados mediante `/hooks`; si se registran dos veces pueden ejecutarse dos veces. No sobrescribir el archivo ni las entradas existentes.
 
-**Mapeo propuesto:** `UserPromptSubmit` → `prompt_submitted`; `PostToolUse` → `working`; `PermissionRequest` → candidato a `blocked` (se ejecuta cuando va a pedir aprobación; verificar si la política o el hook evita el diálogo); `Stop` → candidato a `turn_ended` con `last_assistant_message`. El payload común incluye `hook_event_name`, `session_id`, `cwd` y `transcript_path`; `Stop` añade `turn_id`, `stop_hook_active` y `last_assistant_message`. `Stop` puede continuar el turno por otro hook: confirmar la semántica antes de reportar resultado. `PreToolUse` no demuestra por sí solo que el agente esté esperando. `SessionStart` puede inicializar `idle`; `SessionEnd` no implica éxito. No se verificó un evento de fallo final equivalente a `failed`, ni un evento fiable de cierre de aprobación que garantice `working` en todos los casos. No confundir `SubagentStop` con el turno del panel padre.
+**Implementación y límites:** `galgo hook codex` mapea `SessionStart` → `idle`, `UserPromptSubmit` → `prompt_submitted` y `Stop` → `turn_ended` con `last_assistant_message` recortado a 600 caracteres. El payload común incluye `hook_event_name`, `session_id`, `cwd` y `transcript_path`; `Stop` añade `turn_id`, `stop_hook_active` y `last_assistant_message`. No se emiten `blocked` ni `failed`: la semántica de aprobación, errores y reintentos no se ha verificado. Tampoco se traducen `PostToolUse` ni `SubagentStop`. La entrega en `Stop` se probó con un servidor simulado; **otro hook podría continuar el turno después de `Stop`**, caso aún no verificado y que podría ocasionar una entrega prematura.
 
-Ejemplo de **fragmento** para fusionar en `$CODEX_HOME/hooks.json`, no reemplazar el archivo. `galgo hook codex` aún no existe. Codex documenta que `Stop` espera JSON en stdout: el wrapper devuelve `{}` y no inyecta salida al contexto, incluso si galgo falla. Verificar en la versión instalada que stdout vacío/`{}` y el timeout se comportan como se espera:
+`galgo hooks install codex --yes` agrega tres grupos identificados en `$CODEX_HOME/hooks.json`, o `$HOME/.codex/hooks.json` si `CODEX_HOME` no está definido. Solo se admite `--scope user`; también existen `--dry-run`, `status` y `uninstall`. Conserva las entradas ajenas y crea `hooks.json.galgo-bak` si el archivo ya existía, sin sobrescribir un respaldo anterior. La desinstalación elimina solo los comandos marcados de galgo, conserva cambios posteriores del usuario y deja el respaldo intacto; no restaura una copia potencialmente obsoleta. Se rechazan symlinks y JSON inválido. Los cambios de formato al serializar JSON no alteran los valores ajenos. La ruta absoluta de galgo se fija al instalar; reinstalar si cambia. Revisar y confiar los hooks con `/hooks` si Codex lo solicita; el instalador nunca activa `--dangerously-bypass-hook-trust`.
 
-```json
-{
-  "hooks": {
-    "Stop": [
-      { "hooks": [
-        { "type": "command", "command": "galgo hook codex >/dev/null 2>&1; printf '{}'", "timeout": 3 }
-      ] }
-    ]
-  }
-}
-```
-
-El JSON original llega a stdin de `galgo hook codex` mediante el wrapper de shell; no se interpola en el comando. Instalar sin alterar otras entradas y presentar la revisión de confianza a la persona usuaria. Evitar imprimir texto de prompts o secretos en logs.
+Cada comando usa shell solo para una ruta de ejecutable citada y literales fijos; el JSON pasa por stdin directamente a `galgo hook codex`, sin interpolación. El wrapper devuelve `{}` a Codex incluso si galgo falla. **Riesgo de doble entrega con `galgo done`:** el daemon usa el flag `reported` para deduplicar un `Stop` posterior al `done` del mismo turno; un nuevo `UserPromptSubmit` reinicia ese flag. No garantiza deduplicación para casos no verificados como continuaciones de otro hook, por lo que conviene probar el flujo concreto antes de depender de ello.
 
 ## Orden y pruebas de aceptación propuestos
 
-1. **Codex:** estructura local de hooks ya presente y payload de `Stop` documentado. Probar instalación/desinstalación idempotente y confianza, prompt → trabajo → permiso real → reanudación → Stop, resumen, `galgo done` + PostToolUse + Stop sin duplicación, fallo/cancelación y daemon ausente. Verificar Stop continuado por otro hook y subagentes; no anunciar `failed` hasta identificarlo.
+1. **Codex:** el e2e cubre instalación/desinstalación idempotente, preservación de hooks ajenos, `galgo done` seguido de `Stop` y un `exec` real contra un servidor simulado. Faltan confianza interactiva, permiso real, reanudación, fallo/cancelación, `Stop` continuado por otro hook y subagentes; no anunciar `blocked` ni `failed` hasta identificarlos.
 2. **PI:** extensión aislada con `-e`, luego descubrimiento global/proyecto confiable; probar `agent_settled` con retries, compactación, abort y mensajes encolados; UI prompts anidados, resumen y errores, recarga y ausencia del daemon. Verificar que no se informe `turn_ended` prematuramente.
 3. **OpenCode:** primero resolver identidad de sesión/servidor por panel y escoger API/versiones; probar TUI local, `run`, `attach` y servidor compartido, sesiones hijas, permisos/preguntas simultáneos, `session.error` con retry y duplicados `idle/status`; solo después habilitar resultados automáticos.
 
