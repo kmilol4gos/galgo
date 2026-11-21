@@ -13,3 +13,4 @@ galgo-usage = { path = "../galgo-usage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["rt"] }
+rfd = "0.18.0"

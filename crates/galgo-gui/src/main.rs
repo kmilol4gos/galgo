@@ -11,7 +11,9 @@ const TEXT: Color = Color::from_rgb(0.906, 0.914, 0.937);
 const MUTED: Color = Color::from_rgb(0.60, 0.64, 0.70);
 
 mod attention;
+mod launch;
 mod newpane;
+mod recents;
 mod term;
 mod usage;
 
@@ -166,6 +168,11 @@ struct App {
     limits_error: Option<String>,
     /// La ventana tiene el foco: si no, las alertas van a notificación de macOS.
     focused: bool,
+    /// «Nuevo workspace» abierto, con el texto de búsqueda en recientes.
+    new_ws: Option<String>,
+    /// Carpetas abiertas recientemente (la más reciente primero) y dónde se guardan.
+    recents: Vec<String>,
+    recents_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +202,120 @@ enum Message {
     CancelClose,
     ConfirmClose,
     Killed(Result<serde_json::Value, String>),
+    OpenNewWorkspace,
+    CloseNewWorkspace,
+    NewWsQuery(String),
+    /// Abre la primera carpeta reciente que coincide con la búsqueda (Enter).
+    NewWsSubmit,
+    PickFolder,
+    FolderPicked(Option<String>),
+    /// Crea un workspace en esa carpeta: un shell, sin formulario.
+    OpenFolder(String),
+    WorkspaceOpened(String, Result<serde_json::Value, String>),
 }
+
+/// Atajos de la ventana con Cmd. Lo que no es atajo llega al panel seleccionado.
+fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
+    let Key::Character(c) = key else { return None };
+    match (c.as_str(), modifiers.shift()) {
+        ("n", false) => Some(Message::OpenNewWorkspace),
+        _ => None,
+    }
+}
+
+/// Qué ocupa el cuerpo de la ventana: bienvenida, «Nuevo workspace», formulario o el terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    Welcome,
+    NewWorkspace,
+    Form,
+    Screen,
+}
+
+fn body_mode(app: &App) -> Body {
+    if app.new_ws.is_some() {
+        Body::NewWorkspace
+    } else if app.form.is_some() {
+        Body::Form
+    } else if app.panes.is_empty() {
+        Body::Welcome
+    } else {
+        Body::Screen
+    }
+}
+
+/// Nombres de todos los paneles (vivos y restaurados): un nombre nuevo no puede repetirlos.
+fn names(app: &App) -> Vec<&str> {
+    app.panes.iter().map(|p| p.name.as_str()).collect()
+}
+
+/// Crea un workspace en `path`: un shell en esa carpeta, con nombre libre y sin formulario.
+fn open_folder(app: &mut App, path: String) -> Task<Message> {
+    let (rows, cols) = grid_for(app.window);
+    let name = launch::free_name("shell", &names(app));
+    app.spawn_size = Some((rows, cols));
+    let req = launch::shell_request(&name, &login_shell(), &path, rows, cols);
+    Task::perform(
+        async move {
+            let result = tokio::task::spawn_blocking(move || request(req)).await.map_err(|e| e.to_string()).and_then(|r| r);
+            (path, result)
+        },
+        |(path, result)| Message::WorkspaceOpened(path, result),
+    )
+}
+
+/// Primera carpeta reciente que coincide con la búsqueda, si la hay.
+fn first_match(app: &App) -> Option<String> {
+    let query = app.new_ws.as_deref().unwrap_or("");
+    recents::matching(&app.recents, query).first().map(|p| p.to_string())
+}
+
+fn welcome_view(app: &App) -> Element<'_, Message> {
+    let mut col = column![
+        text("Empieza un workspace").size(26),
+        text("Un workspace es una carpeta de trabajo: sus terminales y agentes viven en ella.").size(13).color(MUTED),
+        button(text("Abrir carpeta…   (Cmd+N)").size(15)).width(Length::Fill).padding(12).on_press(Message::PickFolder),
+        button(text("Nuevo terminal en el inicio").size(15)).width(Length::Fill).padding(12).on_press(Message::OpenFolder(home_dir())),
+    ]
+    .spacing(12)
+    .max_width(480);
+    if let Some(last) = app.recents.first() {
+        col = col.push(
+            button(text(format!("Reabrir lo último: {last}")).size(13)).width(Length::Fill).padding(10).on_press(Message::OpenFolder(last.clone())),
+        );
+    }
+    for p in app.recents.iter().skip(1).take(4) {
+        col = col.push(button(text(p.as_str()).size(12).color(MUTED)).width(Length::Fill).padding(8).on_press(Message::OpenFolder(p.clone())));
+    }
+    container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
+}
+
+fn new_workspace_view(app: &App) -> Element<'_, Message> {
+    let query = app.new_ws.as_deref().unwrap_or("");
+    let matches = recents::matching(&app.recents, query);
+    let mut list = column![].spacing(6);
+    for p in matches.iter().take(10) {
+        list = list.push(button(text(p.as_str()).size(13)).width(Length::Fill).padding(8).on_press(Message::OpenFolder((*p).clone())));
+    }
+    if matches.is_empty() {
+        list = list.push(text("Sin coincidencias entre las carpetas recientes.").size(12).color(MUTED));
+    }
+    column![
+        text("Nuevo workspace").size(20),
+        text("Elige una carpeta. Se abre un terminal en ella; el daemon deduce el proyecto y la rama del repo git.").size(12).color(MUTED),
+        text_input("Buscar en recientes…", query).on_input(Message::NewWsQuery).on_submit(Message::NewWsSubmit).padding(8),
+        scrollable(list).height(Length::Fill),
+        row![
+            button(text("Elegir carpeta…").size(13)).on_press(Message::PickFolder),
+            button(text("Cancelar").size(13)).on_press(Message::CloseNewWorkspace),
+        ]
+        .spacing(8),
+    ]
+    .spacing(12)
+    .max_width(560)
+    .into()
+}
+
 
 fn request(req: Request) -> Result<serde_json::Value, String> {
     let response = client::request(&req).map_err(|e| format!("{e:#}"))?;
@@ -481,6 +601,58 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::TickList if !app.listing => { app.listing = true; Task::batch([load_panes(), load_limits()]) }
         Message::TickList => Task::none(),
+        Message::OpenNewWorkspace => {
+            app.form = None;
+            app.new_ws = Some(String::new());
+            Task::none()
+        }
+        Message::CloseNewWorkspace => {
+            app.new_ws = None;
+            Task::none()
+        }
+        Message::NewWsQuery(query) => {
+            app.new_ws = Some(query);
+            Task::none()
+        }
+        Message::NewWsSubmit => match first_match(app) {
+            Some(path) => open_folder(app, path),
+            None => Task::none(),
+        },
+        Message::PickFolder => Task::perform(
+            async {
+                rfd::AsyncFileDialog::new()
+                    .set_title("Elegir la carpeta del workspace")
+                    .pick_folder()
+                    .await
+                    .map(|folder| folder.path().to_string_lossy().into_owned())
+            },
+            Message::FolderPicked,
+        ),
+        Message::FolderPicked(Some(path)) => open_folder(app, path),
+        Message::FolderPicked(None) => Task::none(),
+        Message::OpenFolder(path) => open_folder(app, path),
+        Message::WorkspaceOpened(path, Ok(data)) => {
+            app.new_ws = None;
+            app.error = None;
+            recents::push(&mut app.recents, &path);
+            if let Some(file) = &app.recents_path {
+                let _ = recents::save(file, &app.recents);
+            }
+            match serde_json::from_value::<PaneInfo>(data) {
+                Ok(p) => {
+                    let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
+                    app.size_sent = Some((p.id, rows, cols));
+                    app.panes.push(p.clone());
+                    let task = select(app, p.id);
+                    Task::batch([task, load_panes()])
+                }
+                Err(_) => load_panes(),
+            }
+        }
+        Message::WorkspaceOpened(_, Err(e)) => {
+            app.error = Some(e);
+            Task::none()
+        }
         Message::Limits(Ok(limits)) => {
             app.limits = limits;
             app.limits_error = None;
@@ -569,7 +741,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Event(Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })) => {
-            // Con el formulario abierto, el teclado es del formulario, no del panel.
+            // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
+            if modifiers.command() && app.new_ws.is_none() {
+                if let Some(message) = shortcut(&key, modifiers) {
+                    return update(app, message);
+                }
+            }
+            // Con «Nuevo workspace» o el formulario abiertos, el teclado es suyo, no del panel.
+            if app.new_ws.is_some() {
+                if matches!(&key, Key::Named(Named::Escape)) {
+                    app.new_ws = None;
+                }
+                return Task::none();
+            }
             if app.form.is_some() {
                 return Task::none();
             }
@@ -937,6 +1121,7 @@ fn limits_footer(app: &App) -> Element<'_, Message> {
 fn view(app: &App) -> Element<'_, Message> {
     let mut list = column![
         row![text("PANELES").size(12).color(MUTED), Space::with_width(Length::Fill), text(app.panes.len()).size(12).color(MUTED)].padding([0, 4]),
+        button(text("+ Nuevo workspace").size(13)).width(Length::Fill).on_press(Message::OpenNewWorkspace),
         button(text("+ Nuevo panel").size(13)).width(Length::Fill).on_press(Message::OpenForm),
     ].spacing(8);
     if app.panes.is_empty() { list = list.push(text("No hay paneles todavía.").size(14).color(MUTED)); }
@@ -963,7 +1148,11 @@ fn view(app: &App) -> Element<'_, Message> {
     let title = selected_pane.map(|p| p.name.as_str()).unwrap_or("Sin paneles");
     let state = selected_pane.map(|p| p.status.as_str().to_uppercase()).unwrap_or_default();
     let state_color = selected_pane.map(|p| status_color(p.status)).unwrap_or(MUTED);
-    let body_content: Element<'_, Message> = if let Some(f) = &app.form {
+    let body_content: Element<'_, Message> = if body_mode(app) == Body::NewWorkspace {
+        new_workspace_view(app)
+    } else if body_mode(app) == Body::Welcome {
+        welcome_view(app)
+    } else if let Some(f) = &app.form {
         form_view(app, f)
     } else {
         let screen: Element<'_, Message> = match shown(app) {
@@ -1029,7 +1218,11 @@ fn main() -> iced::Result {
             }),
         ]))
         .window_size(iced::Size::new(1100.0, 700.0))
-        .run_with(|| (App { window: (1100.0, 700.0), focused: true, ..Default::default() }, Task::batch([load_panes(), load_limits()])))
+        .run_with(|| {
+            let file = recents::file();
+            let app = App { window: (1100.0, 700.0), focused: true, recents: recents::load(&file), recents_path: Some(file), ..Default::default() };
+            (app, Task::batch([load_panes(), load_limits()]))
+        })
 }
 
 #[cfg(test)]
@@ -1361,5 +1554,45 @@ mod tests {
         let _ = update(&mut app, Message::Limits(Err("sin daemon".into())));
         assert_eq!(app.limits.len(), 1, "las últimas cuotas se conservan");
         assert_eq!(app.limits_error.as_deref(), Some("sin daemon"));
+    }
+
+    /// A: el cuerpo muestra la bienvenida sin paneles; «Nuevo workspace» tiene prioridad sobre el resto.
+    #[test]
+    fn cuerpo_sin_paneles_es_la_bienvenida() {
+        let mut app = App::default();
+        assert_eq!(body_mode(&app), Body::Welcome);
+        let _ = update(&mut app, Message::OpenNewWorkspace);
+        assert_eq!(body_mode(&app), Body::NewWorkspace);
+        let _ = update(&mut app, Message::CloseNewWorkspace);
+        assert_eq!(body_mode(&app), Body::Welcome);
+    }
+
+    /// A: Cmd+N abre «Nuevo workspace»; las demás teclas con Cmd siguen siendo de la ventana o del panel.
+    #[test]
+    fn cmd_n_es_nuevo_workspace() {
+        let n = Key::Character("n".into());
+        assert!(matches!(shortcut(&n, keyboard::Modifiers::COMMAND), Some(Message::OpenNewWorkspace)));
+        assert!(shortcut(&Key::Character("x".into()), keyboard::Modifiers::COMMAND).is_none());
+    }
+
+    /// A: una carpeta elegida crea (vía el daemon) un shell que queda seleccionado, y la carpeta pasa a recientes.
+    #[test]
+    fn carpeta_abierta_queda_seleccionada_y_reciente() {
+        let mut app = App { new_ws: Some(String::new()), ..Default::default() };
+        let pane = serde_json::to_value(pane_info(7, "shell", Status::Idle)).unwrap();
+        let _ = update(&mut app, Message::WorkspaceOpened("/Users/x/proyecto".into(), Ok(pane)));
+        assert_eq!(app.selected, Some(7));
+        assert!(app.new_ws.is_none());
+        assert_eq!(app.recents.first().map(String::as_str), Some("/Users/x/proyecto"));
+    }
+
+    /// A: si el daemon no puede crear el shell, el error se muestra y «Nuevo workspace» sigue abierto.
+    #[test]
+    fn error_al_abrir_carpeta_se_muestra() {
+        let mut app = App { new_ws: Some(String::new()), ..Default::default() };
+        let _ = update(&mut app, Message::WorkspaceOpened("/x".into(), Err("sin daemon".into())));
+        assert_eq!(app.error.as_deref(), Some("sin daemon"));
+        assert!(app.new_ws.is_some());
+        assert!(app.recents.is_empty());
     }
 }
