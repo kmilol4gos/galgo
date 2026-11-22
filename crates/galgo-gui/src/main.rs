@@ -917,6 +917,18 @@ fn resize_if_needed(app: &mut App) {
     }
 }
 
+/// Pide la pantalla del panel enfocado dentro de unos milisegundos (lo que tarda el PTY en hacer eco de una tecla),
+/// sin esperar al siguiente tick.
+fn echo_soon() -> Task<Message> {
+    Task::perform(
+        async { tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(ECHO_DELAY_MS))).await.ok() },
+        |_| Message::TickScreen,
+    )
+}
+
+/// Espera tras una tecla antes de pedir su eco.
+const ECHO_DELAY_MS: u64 = 8;
+
 /// Avisa de las alertas nuevas con una notificación de macOS, si la ventana no tiene el foco.
 fn notify(alerts: &[Alert], focused: bool) {
     if focused {
@@ -1409,6 +1421,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 resize_if_needed(app);
                 if let Some(bytes) = route_input(app, bytes) {
                     send_text(app, bytes);
+                    // Eco rápido: se pide la pantalla poco después de la tecla en vez de esperar al tick de 50 ms.
+                    return echo_soon();
                 }
             }
             Task::none()
