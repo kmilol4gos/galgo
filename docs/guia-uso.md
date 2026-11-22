@@ -136,15 +136,28 @@ galgo env list
 
 ## 6. Atajos y límites de la GUI
 
+La ventana tiene la barra lateral (proyectos, workspaces y paneles, con «Te necesitan» arriba y las cuotas abajo), las pestañas del workspace arriba y una barra de estado abajo (panel, carpeta, tamaño, errores, uso y la confirmación al cerrar). Paleta, lanzador, nuevo workspace y formulario flotan sobre el terminal; `Esc` o un clic fuera los cierra.
+
 | Acción | Cómo |
 |---|---|
+| Paleta de comandos | `Cmd+K` o `Cmd+Shift+P`; busca workspaces, paneles y acciones. |
+| Nuevo workspace / abrir carpeta | `Cmd+N` (recientes con búsqueda) / `Cmd+O` (selector de carpeta). |
+| Nueva pestaña · cerrar panel | `Cmd+T` · `Cmd+W` (pide confirmación en la barra de estado si el proceso sigue vivo). |
+| Lanzar agente | `Cmd+Shift+L`, luego `1`-`5` (Claude, Codex, PI, opencode, shell). |
+| Workspace n · pestaña anterior/siguiente | `Cmd+1`…`Cmd+9` · `Cmd+[` / `Cmd+]`. |
+| Dividir · mover el foco | `Cmd+D` (derecha), `Cmd+Shift+D` (abajo) · `Cmd+Opt+flechas`. |
+| Redimensionar un split | Arrastra el divisor. |
+| Maximizar el panel de un split | `Cmd+Shift+Enter` (otra vez, o enfocar otro panel, lo devuelve). |
+| Siguiente que necesita atención | `Cmd+Shift+U`. |
+| Tamaño de letra | `Cmd+=` / `Cmd+-` / `Cmd+0`. |
+| Editar la línea | `Opt+←/→` salta palabras, `Opt+Borrar` borra una palabra, `Cmd+←/→` va al inicio/fin, `Cmd+Borrar` borra hasta el inicio, `Shift+Enter` es un salto de línea (Claude Code). |
 | Seleccionar / copiar | Arrastra dentro de la cuadrícula; `Cmd+C` copia la selección. |
 | Pegar | `Cmd+V`; se respeta bracketed paste cuando el programa lo activa. |
 | Consultar historial | Rueda o trackpad sobre la cuadrícula; no sobre la barra lateral. |
-| Salir de una selección congelada | `Esc`; la vista muestra «vista congelada · Esc para volver». También vuelve al escribir o interactuar con la pantalla. |
+| Salir de una selección congelada | `Esc`. También vuelve al escribir o interactuar con la pantalla. |
 | Interrumpir el programa del panel | `Ctrl+C` se envía al panel; es distinto de copiar con `Cmd+C`. |
 
-La selección congela la imagen visible mientras está activa; el proceso puede seguir trabajando. Con caracteres anchos o combinados, la selección, el cursor y las columnas pueden no coincidir. En aplicaciones de pantalla alterna como `vim`, `less` o `htop`, el ratón y la rueda no se transmiten como en un emulador completo. La GUI sondea snapshots en lugar de suscribirse a eventos; no hay splits ni medición de latencia garantizada. Mirar un panel no lo redimensiona: se ajusta al escribir o al cambiar el tamaño de la ventana. Más contexto y límites históricos en [gui-plan.md](gui-plan.md).
+La selección congela la imagen visible mientras está activa; el proceso puede seguir trabajando. Con caracteres anchos o combinados, la selección, el cursor y las columnas pueden no coincidir. En aplicaciones de pantalla alterna como `vim`, `less` o `htop`, el ratón y la rueda no se transmiten como en un emulador completo. La GUI sondea snapshots en lugar de suscribirse a eventos. Los paneles visibles de la pestaña se redimensionan a su parte del split; los paneles de otras pestañas conservan su tamaño hasta que se muestran. Más contexto y límites históricos en [gui-plan.md](gui-plan.md).
 
 ## 7. Cuando algo se cuelga
 
