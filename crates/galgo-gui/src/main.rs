@@ -224,6 +224,11 @@ struct App {
     others_cursor: usize,
     /// Foco que toma el hermano o la pestaña vecina al cerrar el panel enfocado (M1).
     pending_focus: Option<u32>,
+    /// Panel maximizado dentro de su split (⌘⇧Enter): ocupa toda el área y los demás se ocultan.
+    maximized: Option<u32>,
+    /// Divisor de split que se está arrastrando, y el que está bajo el puntero (camino y orientación).
+    drag_divider: Option<layout::Divider>,
+    hover_divider: Option<(layout::Path, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +236,8 @@ enum Message {
     TickScreen,
     /// Zoom de la letra del terminal: +1 / -1 pasos, o 0 para volver al tamaño base.
     Zoom(i32),
+    /// Maximiza el panel enfocado dentro de su split, o lo devuelve al split.
+    ToggleMaximize,
     TickList,
     Panes(Result<Vec<PaneInfo>, String>),
     Limits(Result<Vec<Limits>, String>),
@@ -313,7 +320,7 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 19] = [
+    let commands: [(&str, &str, Message); 20] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
         ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
@@ -333,6 +340,7 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         ("Aumentar la letra", "Cmd+=", Message::Zoom(1)),
         ("Reducir la letra", "Cmd+-", Message::Zoom(-1)),
         ("Letra de tamaño normal", "Cmd+0", Message::Zoom(0)),
+        ("Maximizar o restaurar el panel", "Cmd+Shift+Enter", Message::ToggleMaximize),
     ];
     for (label, keys, message) in commands {
         items.push(PaletteItem { label: label.into(), detail: keys.into(), message });
@@ -730,11 +738,28 @@ fn terminal_area_for(app: &App) -> layout::Rect {
     terminal_area(app.window, 0.0, 0.0)
 }
 
+/// Panel maximizado de la pestaña visible (⌘⇧Enter), si lo hay y sigue en ella.
+fn maximized(app: &App) -> Option<u32> {
+    let id = app.maximized?;
+    let key = focus_key(app)?;
+    app.layouts.active_tab(&key).filter(|t| t.root.ids().len() > 1 && t.root.ids().contains(&id)).map(|_| id)
+}
+
+/// Rectángulos de los paneles que se ven en la pestaña activa del workspace `key`: todos los del split, o solo el
+/// maximizado ocupando el área entera.
+fn visible_rects(app: &App, key: &str) -> Vec<(u32, layout::Rect)> {
+    let Some(tab) = app.layouts.active_tab(key) else { return Vec::new() };
+    let area = terminal_area_for(app);
+    match maximized(app).filter(|id| tab.root.ids().contains(id)) {
+        Some(id) => vec![(id, area)],
+        None => tab.root.rects(area),
+    }
+}
+
 /// Rectángulo del panel `id` dentro de la pestaña visible de su workspace.
 fn pane_rect(app: &App, id: u32) -> Option<layout::Rect> {
     let key = app.layouts.key_of(id)?;
-    let tab = app.layouts.active_tab(&key)?;
-    tab.root.rects(terminal_area_for(app)).into_iter().find(|(p, _)| *p == id).map(|(_, r)| r)
+    visible_rects(app, &key).into_iter().find(|(p, _)| *p == id).map(|(_, r)| r)
 }
 
 /// Origen de la cuadrícula de un rectángulo de panel (su margen de 10 px).
@@ -753,8 +778,20 @@ fn leaf_at(app: &App, p: Point) -> Option<u32> {
         return None;
     }
     let key = app.selected.and_then(|id| app.layouts.key_of(id))?;
+    visible_rects(app, &key).into_iter().find(|(_, r)| p.x >= r.x && p.y >= r.y && p.x < r.x + r.w && p.y < r.y + r.h).map(|(id, _)| id)
+}
+
+/// Margen, en píxeles a cada lado de la línea, con el que se agarra un divisor.
+const DIVIDER_SLOP: f32 = 4.0;
+
+/// Divisor de la pestaña visible bajo el punto, si lo hay (no con un panel maximizado ni con capas abiertas).
+fn divider_under(app: &App, p: Point) -> Option<layout::Divider> {
+    if body_mode(app) != Body::Screen || maximized(app).is_some() {
+        return None;
+    }
+    let key = focus_key(app)?;
     let tab = app.layouts.active_tab(&key)?;
-    tab.root.rects(terminal_area_for(app)).into_iter().find(|(_, r)| p.x >= r.x && p.y >= r.y && p.x < r.x + r.w && p.y < r.y + r.h).map(|(id, _)| id)
+    layout::divider_at(&tab.root, terminal_area_for(app), p.x, p.y, DIVIDER_SLOP)
 }
 
 /// Clave de workspace del panel enfocado.
@@ -861,8 +898,7 @@ fn selection_text(snap: &Snapshot, sel: Selection) -> String {
 /// cambiaron desde el último envío. Un fantasma (sin PTY) rechaza el `Resize` en el daemon y esa respuesta se descarta.
 fn layout_resizes(app: &mut App) -> Vec<Request> {
     let Some(key) = focus_key(app) else { return Vec::new() };
-    let Some(tab) = app.layouts.active_tab(&key) else { return Vec::new() };
-    let rects = tab.root.rects(terminal_area_for(app));
+    let rects = visible_rects(app, &key);
     let mut out = Vec::new();
     for (id, rect) in rects {
         let grid = grid_in(rect);
@@ -908,6 +944,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 /// Invariante (G1): el panel seleccionado está en la pestaña activa de su workspace. Si no lo está, la pestaña
 /// activa pasa a ser la suya. Así lo que se teclea siempre va a un panel que se ve.
 fn keep_focus_visible(app: &mut App) {
+    // Un panel maximizado solo se mantiene mientras tiene el foco: si el foco pasa a otro (barra lateral, cierre,
+    // otra pestaña), el split vuelve a verse entero y el enfocado no queda oculto.
+    if app.maximized.is_some() && app.maximized != app.selected {
+        app.maximized = None;
+    }
     if let Some(id) = app.selected {
         if let Some(key) = app.layouts.key_of(id) {
             let visible = app.layouts.active_tab(&key).is_some_and(|t| t.root.ids().contains(&id));
@@ -920,6 +961,16 @@ fn keep_focus_visible(app: &mut App) {
 
 fn update_inner(app: &mut App, message: Message) -> Task<Message> {
     match message {
+        Message::ToggleMaximize => {
+            app.maximized = match (app.maximized, app.selected) {
+                (Some(_), _) => None,
+                (None, Some(id)) if app.layouts.key_of(id).and_then(|k| app.layouts.active_tab(&k).map(|t| t.root.ids().len())).unwrap_or(0) > 1 => Some(id),
+                _ => None,
+            };
+            // Cambia el área de los paneles visibles: se redimensionan a la nueva.
+            resize_if_needed(app);
+            Task::none()
+        }
         Message::Zoom(step) => {
             let next = if step == 0 { 0 } else { (zoom() + step).clamp(ZOOM_MIN, ZOOM_MAX) };
             ZOOM.store(next, std::sync::atomic::Ordering::Relaxed);
@@ -999,7 +1050,13 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 None => return Task::none(),
             };
             match layout::neighbor(&rects, from, dir) {
-                Some(id) => select(app, id),
+                Some(id) => {
+                    // Con un panel maximizado, moverse a otro lo maximiza en su lugar (como tmux con zoom).
+                    if app.maximized.is_some() {
+                        app.maximized = Some(id);
+                    }
+                    select(app, id)
+                }
                 None => Task::none(),
             }
         }
@@ -1301,6 +1358,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     return update(app, Message::FocusDir(dir));
                 }
             }
+            // Cmd+Shift+Enter: maximizar o restaurar el panel enfocado de un split.
+            if modifiers.command() && modifiers.shift() && matches!(&key, Key::Named(Named::Enter)) && body_mode(app) == Body::Screen {
+                return update(app, Message::ToggleMaximize);
+            }
             // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
             if modifiers.command() && app.new_ws.is_none() && !app.launcher {
                 if let Some(message) = shortcut_in_state(app, &key, modifiers) {
@@ -1375,6 +1436,11 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) if app.pointer.and_then(|p| divider_under(app, p)).is_some() => {
+            // Empieza a arrastrar un divisor de split: tiene prioridad sobre el foco y la selección.
+            app.drag_divider = app.pointer.and_then(|p| divider_under(app, p));
+            Task::none()
+        }
         Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) => {
             // M4: con una vista superpuesta (paleta, formulario, lanzador, nuevo workspace) el ratón no llega al terminal.
             if body_mode(app) != Body::Screen {
@@ -1399,11 +1465,24 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Event(Event::Mouse(mouse::Event::CursorMoved { position })) => {
             app.pointer = Some(position);
+            if let Some(d) = app.drag_divider.clone() {
+                if let Some(key) = focus_key(app) {
+                    app.layouts.set_ratio(&key, &d.path, d.ratio_at(position.x, position.y));
+                }
+                return Task::none();
+            }
+            app.hover_divider = divider_under(app, position).map(|d| (d.path, d.vertical));
             if app.dragging {
                 if let (Some(cell), Some(sel)) = (grid_cell(app, position), app.sel.as_mut()) {
                     sel.head = cell;
                 }
             }
+            Task::none()
+        }
+        Message::Event(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))) if app.drag_divider.is_some() => {
+            // Al soltar el divisor, los paneles toman su tamaño nuevo.
+            app.drag_divider = None;
+            resize_if_needed(app);
             Task::none()
         }
         Message::Event(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))) => {
@@ -1538,12 +1617,27 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
 }
 
 /// Un tramo de texto con el estilo de `r`; `invert` lo muestra invertido (cursor o selección).
-fn styled(text: String, r: &Run, invert: bool) -> Span<'static, Message> {
+/// Cómo se pinta una celda: normal, bajo el cursor (bloque invertido) o seleccionada (fondo de acento).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Normal,
+    Cursor,
+    Selected,
+}
+
+/// Fondo de la selección: el acento translúcido sobre el fondo del terminal, con el texto en su color.
+const SELECTION_BG: Color = Color::from_rgb(0.153, 0.243, 0.420);
+
+/// Un tramo de texto con el estilo de `r` y la marca de celda.
+fn styled(text: String, r: &Run, mark: Mark) -> Span<'static, Message> {
     let (mut fg, mut bg) = (term::color(r.fg), term::color(r.bg));
-    if r.inverse ^ invert {
+    if r.inverse ^ (mark == Mark::Cursor) {
         let (f, b) = (bg.unwrap_or(term::DEFAULT_BG), fg.unwrap_or(term::DEFAULT_FG));
         fg = Some(f);
         bg = Some(b);
+    }
+    if mark == Mark::Selected {
+        bg = Some(SELECTION_BG);
     }
     let mut sp: Span<'static, Message> = span(text).color(fg.unwrap_or(term::DEFAULT_FG)).underline(r.underline);
     if let Some(b) = bg { sp = sp.background(b); }
@@ -1562,18 +1656,24 @@ fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>
     let mut col: u16 = 0;
     for r in runs {
         let mut chunk = String::new();
-        let mut chunk_inv = false;
+        let mut chunk_mark = Mark::Normal;
         for ch in r.t.chars() {
-            let inv = cursor_col == Some(col) || sel.is_some_and(|(a, b)| (a..=b).contains(&col));
-            if !chunk.is_empty() && inv != chunk_inv {
-                out.push(styled(std::mem::take(&mut chunk), r, chunk_inv));
+            let mark = if cursor_col == Some(col) {
+                Mark::Cursor
+            } else if sel.is_some_and(|(a, b)| (a..=b).contains(&col)) {
+                Mark::Selected
+            } else {
+                Mark::Normal
+            };
+            if !chunk.is_empty() && mark != chunk_mark {
+                out.push(styled(std::mem::take(&mut chunk), r, chunk_mark));
             }
-            chunk_inv = inv;
+            chunk_mark = mark;
             chunk.push(ch);
             col += 1;
         }
         if !chunk.is_empty() {
-            out.push(styled(chunk, r, chunk_inv));
+            out.push(styled(chunk, r, chunk_mark));
         }
     }
     if out.is_empty() { out.push(span(" ".to_string())); }
@@ -2031,6 +2131,61 @@ mod tests {
         assert!(matches!(shortcut(&k("3"), cmd), Some(Message::SelectWorkspaceAt(2))));
         assert!(matches!(shortcut(&k("0"), cmd), Some(Message::Zoom(0))), "Cmd+0 vuelve al tamaño de letra normal");
         assert!(shortcut(&k("9"), cmd).is_some());
+    }
+
+    /// ⌘⇧Enter maximiza el enfocado de un split: ocupa toda el área y se redimensiona a ella; enfocar otro panel
+    /// (o pulsar de nuevo) devuelve el split. Con un solo panel no hace nada.
+    #[test]
+    fn maximizar_un_panel_del_split() {
+        let mut app = App { window: (1280.0, 800.0), ..Default::default() };
+        let mut a = pane_info(1, "a", Status::Idle);
+        a.workspace = Some("r/main".into());
+        let _ = update(&mut app, Message::Panes(Ok(vec![a.clone()])));
+        let _ = update(&mut app, Message::Select(1));
+        let _ = update(&mut app, Message::ToggleMaximize);
+        assert_eq!(app.maximized, None, "un panel solo no se maximiza");
+        let mut b = pane_info(2, "b", Status::Idle);
+        b.workspace = Some("r/main".into());
+        app.layouts.split(1, true, 2);
+        let _ = update(&mut app, Message::Panes(Ok(vec![a, b])));
+        let _ = update(&mut app, Message::Select(1));
+        let mitad = pane_rect(&app, 1).unwrap();
+        let _ = update(&mut app, Message::ToggleMaximize);
+        assert_eq!(app.maximized, Some(1));
+        assert_eq!(pane_rect(&app, 1), Some(terminal_area_for(&app)), "ocupa el área entera");
+        assert!(pane_rect(&app, 2).is_none(), "el otro no se ve");
+        assert_eq!(app.sizes.get(&1), Some(&grid_in(terminal_area_for(&app))), "y se redimensiona a ella");
+        let _ = update(&mut app, Message::Select(2));
+        assert_eq!(app.maximized, None, "enfocar otro devuelve el split");
+        assert_eq!(pane_rect(&app, 1), Some(mitad));
+    }
+
+    /// Arrastrar el divisor de un split lo mueve y, al soltar, los paneles se redimensionan a su parte.
+    #[test]
+    fn arrastrar_el_divisor_de_un_split() {
+        let mut app = App { window: (1280.0, 800.0), ..Default::default() };
+        let mut a = pane_info(1, "a", Status::Idle);
+        a.workspace = Some("r/main".into());
+        let mut b = pane_info(2, "b", Status::Idle);
+        b.workspace = Some("r/main".into());
+        let _ = update(&mut app, Message::Panes(Ok(vec![a.clone()])));
+        app.layouts.split(1, true, 2);
+        let _ = update(&mut app, Message::Panes(Ok(vec![a, b])));
+        let _ = update(&mut app, Message::Select(1));
+        let area = terminal_area_for(&app);
+        let mid = Point::new(area.x + area.w / 2.0 + 2.0, area.y + 100.0);
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::CursorMoved { position: mid })));
+        assert!(app.hover_divider.is_some(), "el puntero está sobre el divisor");
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))));
+        assert!(app.drag_divider.is_some());
+        assert!(app.sel.is_none(), "arrastrar un divisor no empieza una selección");
+        let to = Point::new(area.x + area.w * 0.3, area.y + 100.0);
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::CursorMoved { position: to })));
+        let _ = update(&mut app, Message::Event(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))));
+        assert!(app.drag_divider.is_none());
+        let r1 = pane_rect(&app, 1).unwrap();
+        assert!((r1.w - area.w * 0.3).abs() < 1.5, "el izquierdo ocupa el 30 %: {}", r1.w);
+        assert_eq!(app.sizes.get(&1), Some(&grid_in(r1)), "y se redimensiona a su parte");
     }
 
     /// El zoom escala la letra, la línea y la celda en proporción; Cmd+= / Cmd+- / Cmd+0 lo manejan.
@@ -2611,6 +2766,14 @@ mod render {
         let mut close = scene();
         close.confirm_close = true;
         render(&close, size, &dir.join("r-cerrar.png"));
+        let mut sel = scene();
+        sel.sel = Some(Selection { anchor: (4, 2), head: (5, 20) });
+        sel.layouts.set_ratio("nexo/main", &[], 0.62);
+        sel.hover_divider = Some((Vec::new(), true));
+        render(&sel, size, &dir.join("r-seleccion-y-divisor.png"));
+        let mut max = scene();
+        max.maximized = Some(1);
+        render(&max, size, &dir.join("r-maximizado.png"));
         let mut err = scene();
         err.error = Some("no se envió: el daemon no responde".into());
         render(&err, size, &dir.join("r-error.png"));

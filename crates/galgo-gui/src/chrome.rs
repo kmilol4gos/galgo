@@ -283,7 +283,8 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
             let n = tab.root.ids().len();
             let mut label = row![dot(color, 6.0), text(name).size(theme::BODY_SIZE)].spacing(7).align_y(Alignment::Center);
             if n > 1 {
-                label = label.push(text(format!("{n}")).size(10).color(theme::DIM));
+                let zoomed = active && maximized(app).is_some();
+                label = label.push(text(if zoomed { format!("1/{n}") } else { format!("{n}") }).size(10).color(if zoomed { theme::ACCENT } else { theme::DIM }));
             }
             if active {
                 // Cerrar el panel enfocado de la pestaña (con confirmación en la barra de estado si sigue vivo).
@@ -314,14 +315,26 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
     column![container(bar).width(Length::Fill).style(theme::surface(SIDEBAR)), theme::rule(false)].into()
 }
 
-/// El área de paneles: la pestaña visible del workspace enfocado, con sus splits.
+/// El área de paneles: la pestaña visible del workspace enfocado, con sus splits. Sobre un divisor (o arrastrándolo)
+/// el puntero muestra la flecha de redimensionar.
 pub fn layout_view(app: &App) -> Element<'_, Message> {
-    match focus_key(app).and_then(|k| app.layouts.active_tab(&k)) {
-        Some(tab) => {
-            let split = matches!(tab.root, layout::Node::Split { .. });
-            node_view(app, &tab.root, split)
-        }
+    let inner: Element<'_, Message> = match focus_key(app).and_then(|k| app.layouts.active_tab(&k)) {
+        Some(tab) => match maximized(app) {
+            // Maximizado: solo ese panel, sin marco de split.
+            Some(id) => leaf_view(app, id, false),
+            None => {
+                let split = matches!(tab.root, layout::Node::Split { .. });
+                node_view(app, &tab.root, split, &mut Vec::new())
+            }
+        },
         None => placeholder("Esperando salida…"),
+    };
+    let active = app.drag_divider.as_ref().map(|d| d.vertical).or(app.hover_divider.as_ref().map(|(_, v)| *v));
+    match active {
+        Some(vertical) => mouse_area(inner)
+            .interaction(if vertical { iced::mouse::Interaction::ResizingHorizontally } else { iced::mouse::Interaction::ResizingVertically })
+            .into(),
+        None => inner,
     }
 }
 
@@ -329,17 +342,45 @@ fn placeholder<'a>(msg: &'a str) -> Element<'a, Message> {
     container(text(msg).size(theme::BODY_SIZE).color(theme::DIM)).center(Length::Fill).into()
 }
 
-/// Un nodo del layout: una hoja es un panel; un split reparte su área en dos mitades, con un divisor de 1 px.
-fn node_view<'a>(app: &'a App, node: &'a layout::Node, split: bool) -> Element<'a, Message> {
+/// Divisor de 1 px; con el puntero encima o arrastrándolo, del color de acento.
+fn divider<'a>(app: &App, path: &layout::Path, vertical: bool) -> Element<'a, Message> {
+    let hot = app.drag_divider.as_ref().is_some_and(|d| &d.path == path) || app.hover_divider.as_ref().is_some_and(|(p, _)| p == path);
+    let (w, h) = if vertical { (Length::Fixed(1.0), Length::Fill) } else { (Length::Fill, Length::Fixed(1.0)) };
+    container(Space::new(w, h)).style(theme::surface(if hot { theme::ACCENT } else { theme::BORDER })).into()
+}
+
+/// Un nodo del layout: una hoja es un panel; un split reparte su área según su fracción, con un divisor de 1 px.
+fn node_view<'a>(app: &'a App, node: &'a layout::Node, split: bool, path: &mut layout::Path) -> Element<'a, Message> {
     match node {
         layout::Node::Leaf(id) => leaf_view(app, *id, split),
-        layout::Node::Split { vertical, a, b } => {
-            let first = container(node_view(app, a, split)).width(Length::FillPortion(1)).height(Length::FillPortion(1));
-            let second = container(node_view(app, b, split)).width(Length::FillPortion(1)).height(Length::FillPortion(1));
+        layout::Node::Split { vertical, ratio, a, b } => {
+            let pa = (ratio * 1000.0).round().clamp(1.0, 999.0) as u16;
+            let pb = 1000 - pa;
+            path.push(false);
+            let first = node_view(app, a, split, path);
+            path.pop();
+            path.push(true);
+            let second = node_view(app, b, split, path);
+            path.pop();
+            let line = divider(app, path, *vertical);
             if *vertical {
-                row![first, theme::rule(true), second].width(Length::Fill).height(Length::Fill).into()
+                row![
+                    container(first).width(Length::FillPortion(pa)).height(Length::Fill),
+                    line,
+                    container(second).width(Length::FillPortion(pb)).height(Length::Fill),
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
             } else {
-                column![first, theme::rule(false), second].width(Length::Fill).height(Length::Fill).into()
+                column![
+                    container(first).height(Length::FillPortion(pa)).width(Length::Fill),
+                    line,
+                    container(second).height(Length::FillPortion(pb)).width(Length::Fill),
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
             }
         }
     }

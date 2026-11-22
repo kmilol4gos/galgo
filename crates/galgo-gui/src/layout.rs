@@ -21,12 +21,28 @@ pub enum Dir {
     Down,
 }
 
-/// Árbol de una pestaña: una hoja es un panel; un split reparte su área en dos mitades iguales. `vertical` = lado a
-/// lado (a la izquierda y a la derecha); si no, uno encima del otro.
+/// Árbol de una pestaña: una hoja es un panel; un split reparte su área en dos partes. `vertical` = lado a lado (a la
+/// izquierda y a la derecha); si no, uno encima del otro. `ratio` es la fracción que ocupa `a` (0,5 al crear;
+/// se cambia arrastrando el divisor).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Leaf(u32),
-    Split { vertical: bool, a: Box<Node>, b: Box<Node> },
+    Split { vertical: bool, ratio: f32, a: Box<Node>, b: Box<Node> },
+}
+
+/// Límites de la fracción de un split: ningún lado baja del 12 % del área.
+pub const RATIO_MIN: f32 = 0.12;
+pub const RATIO_MAX: f32 = 0.88;
+
+/// Camino hasta un split dentro del árbol: `false` = bajar por `a`, `true` = por `b`.
+pub type Path = Vec<bool>;
+
+/// Un divisor visible: el camino de su split, su orientación y el área que reparte.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Divider {
+    pub path: Path,
+    pub vertical: bool,
+    pub area: Rect,
 }
 
 impl Node {
@@ -45,7 +61,7 @@ impl Node {
     pub fn split_leaf(&mut self, id: u32, vertical: bool, new: u32) -> bool {
         match self {
             Node::Leaf(x) if *x == id => {
-                *self = Node::Split { vertical, a: Box::new(Node::Leaf(id)), b: Box::new(Node::Leaf(new)) };
+                *self = Node::Split { vertical, ratio: 0.5, a: Box::new(Node::Leaf(id)), b: Box::new(Node::Leaf(new)) };
                 true
             }
             Node::Leaf(_) => false,
@@ -58,10 +74,10 @@ impl Node {
         match self {
             Node::Leaf(x) if x == id => None,
             Node::Leaf(x) => Some(Node::Leaf(x)),
-            Node::Split { vertical, a, b } => match (a.without(id), b.without(id)) {
+            Node::Split { vertical, ratio, a, b } => match (a.without(id), b.without(id)) {
                 (None, None) => None,
                 (Some(n), None) | (None, Some(n)) => Some(n),
-                (Some(a), Some(b)) => Some(Node::Split { vertical, a: Box::new(a), b: Box::new(b) }),
+                (Some(a), Some(b)) => Some(Node::Split { vertical, ratio, a: Box::new(a), b: Box::new(b) }),
             },
         }
     }
@@ -70,25 +86,101 @@ impl Node {
     pub fn rects(&self, area: Rect) -> Vec<(u32, Rect)> {
         match self {
             Node::Leaf(id) => vec![(*id, area)],
-            Node::Split { vertical, a, b } => {
-                let (ra, rb) = halves(area, *vertical);
+            Node::Split { vertical, ratio, a, b } => {
+                let (ra, rb) = split_at(area, *vertical, *ratio);
                 let mut v = a.rects(ra);
                 v.extend(b.rects(rb));
                 v
             }
         }
     }
+
+    /// Divisores del árbol dentro de `area`, con el camino de cada split.
+    pub fn dividers(&self, area: Rect) -> Vec<Divider> {
+        let mut out = Vec::new();
+        self.collect_dividers(area, &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn collect_dividers(&self, area: Rect, path: &mut Path, out: &mut Vec<Divider>) {
+        if let Node::Split { vertical, ratio, a, b } = self {
+            out.push(Divider { path: path.clone(), vertical: *vertical, area });
+            let (ra, rb) = split_at(area, *vertical, *ratio);
+            path.push(false);
+            a.collect_dividers(ra, path, out);
+            path.pop();
+            path.push(true);
+            b.collect_dividers(rb, path, out);
+            path.pop();
+        }
+    }
+
+    /// Cambia la fracción del split en `path`, recortada a los límites. `false` si el camino no lleva a un split.
+    pub fn set_ratio(&mut self, path: &[bool], value: f32) -> bool {
+        match (self, path.split_first()) {
+            (Node::Split { ratio, .. }, None) => {
+                *ratio = value.clamp(RATIO_MIN, RATIO_MAX);
+                true
+            }
+            (Node::Split { a, b, .. }, Some((&side, rest))) => if side { b.set_ratio(rest, value) } else { a.set_ratio(rest, value) },
+            _ => false,
+        }
+    }
+}
+
+impl Divider {
+    /// Posición (x o y) de la línea del divisor.
+    pub fn line(&self, ratio: f32) -> f32 {
+        if self.vertical { self.area.x + self.area.w * ratio } else { self.area.y + self.area.h * ratio }
+    }
+
+    /// Fracción que corresponde a un punto del puntero arrastrando este divisor.
+    pub fn ratio_at(&self, x: f32, y: f32) -> f32 {
+        let r = if self.vertical { (x - self.area.x) / self.area.w.max(1.0) } else { (y - self.area.y) / self.area.h.max(1.0) };
+        r.clamp(RATIO_MIN, RATIO_MAX)
+    }
+}
+
+/// Divisor bajo el punto (x, y), con `slop` píxeles de margen a cada lado de la línea: el más profundo gana.
+pub fn divider_at(root: &Node, area: Rect, x: f32, y: f32, slop: f32) -> Option<Divider> {
+    root.dividers(area)
+        .into_iter()
+        .filter(|d| {
+            let ratio = ratio_of(root, &d.path).unwrap_or(0.5);
+            let line = d.line(ratio);
+            let a = d.area;
+            if d.vertical {
+                (x - line).abs() <= slop && y >= a.y && y <= a.y + a.h
+            } else {
+                (y - line).abs() <= slop && x >= a.x && x <= a.x + a.w
+            }
+        })
+        .max_by_key(|d| d.path.len())
+}
+
+/// Fracción del split en `path`.
+pub fn ratio_of(root: &Node, path: &[bool]) -> Option<f32> {
+    match (root, path.split_first()) {
+        (Node::Split { ratio, .. }, None) => Some(*ratio),
+        (Node::Split { a, b, .. }, Some((&side, rest))) => ratio_of(if side { b } else { a }, rest),
+        _ => None,
+    }
+}
+
+/// Las dos partes de un área según la fracción `ratio` de la primera: lado a lado o apiladas.
+pub fn split_at(area: Rect, vertical: bool, ratio: f32) -> (Rect, Rect) {
+    if vertical {
+        let w = (area.w * ratio).round();
+        (Rect { w, ..area }, Rect { x: area.x + w, w: area.w - w, ..area })
+    } else {
+        let h = (area.h * ratio).round();
+        (Rect { h, ..area }, Rect { y: area.y + h, h: area.h - h, ..area })
+    }
 }
 
 /// Las dos mitades de un área: lado a lado o apiladas.
 pub fn halves(area: Rect, vertical: bool) -> (Rect, Rect) {
-    if vertical {
-        let w = area.w / 2.0;
-        (Rect { w, ..area }, Rect { x: area.x + w, w: area.w - w, ..area })
-    } else {
-        let h = area.h / 2.0;
-        (Rect { h, ..area }, Rect { y: area.y + h, h: area.h - h, ..area })
-    }
+    split_at(area, vertical, 0.5)
 }
 
 /// Vecino en una dirección: el panel cuyo centro está en esa dirección y más cerca (primero por el eje, luego por el
@@ -223,6 +315,14 @@ impl Layouts {
         }
     }
 
+    /// Cambia la fracción de un split de la pestaña visible de `key`.
+    pub fn set_ratio(&mut self, key: &str, path: &[bool], value: f32) -> bool {
+        match self.by_key.get_mut(key).and_then(|ws| ws.tabs.get_mut(ws.active)) {
+            Some(tab) => tab.root.set_ratio(path, value),
+            None => false,
+        }
+    }
+
     /// Clave del workspace que contiene `id`.
     pub fn key_of(&self, id: u32) -> Option<String> {
         self.by_key.iter().find(|(_, ws)| ws.tabs.iter().any(|t| t.root.ids().contains(&id))).map(|(k, _)| k.clone())
@@ -322,5 +422,26 @@ mod tests {
         l.sync(&[(1, "w".into())]);
         assert_eq!(l.active_tab("w").unwrap().focus, 1);
         assert_eq!(l.active_tab("w").unwrap().root, Node::Leaf(1));
+    }
+
+    /// Arrastrar un divisor cambia la fracción de su split (con límites) y el reparto de los rectángulos; el divisor
+    /// se encuentra con unos píxeles de margen, y el más profundo gana.
+    #[test]
+    fn divisores_arrastrables() {
+        let mut n = Node::Leaf(1);
+        n.split_leaf(1, true, 2);
+        n.split_leaf(2, false, 3);
+        let area = area();
+        let d = divider_at(&n, area, 51.0, 10.0, 3.0).expect("divisor vertical en x=50");
+        assert_eq!(d.path, Vec::<bool>::new());
+        assert!(d.vertical);
+        let h = divider_at(&n, area, 75.0, 24.0, 3.0).expect("divisor horizontal del lado derecho");
+        assert_eq!(h.path, vec![true]);
+        assert!(divider_at(&n, area, 20.0, 24.0, 3.0).is_none(), "a la izquierda no hay divisor horizontal");
+        assert!(n.set_ratio(&[], d.ratio_at(30.0, 0.0)));
+        assert_eq!(n.rects(area)[0].1.w, 30.0);
+        n.set_ratio(&[], 0.01);
+        assert_eq!(ratio_of(&n, &[]), Some(RATIO_MIN), "con límite");
+        assert!(!n.set_ratio(&[false], 0.5), "el lado a es una hoja");
     }
 }
