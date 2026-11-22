@@ -90,8 +90,20 @@ pub fn encode(key: &Key, mods: Modifiers, text: Option<&str>) -> Option<String> 
             Named::F12 => tilde(24),
             _ => return None,
         };
-        // Alt delante de una tecla con nombre (salvo que la secuencia ya lleve el modificador).
-        let alt_prefix = mods.alt() && m == 1 && !matches!(n, Named::Space);
+        // Edición de texto al estilo macOS: Option+flechas salta palabras (Meta-b / Meta-f, como iTerm2 y
+        // Terminal.app), Option+Borrar borra la palabra anterior y Shift+Enter es un salto de línea sin enviar
+        // (ESC CR: Claude Code y zsh lo entienden así).
+        let only_alt = mods.alt() && !mods.shift() && !mods.control();
+        match n {
+            Named::ArrowLeft if only_alt => return Some("\x1bb".into()),
+            Named::ArrowRight if only_alt => return Some("\x1bf".into()),
+            Named::Enter if mods.shift() && !mods.alt() && !mods.control() => return Some("\x1b\r".into()),
+            _ => {}
+        }
+        // Alt delante de una tecla con nombre (salvo que la secuencia ya lleve el modificador). Enter, Borrar,
+        // Tab y Esc no llevan parámetro xterm: con Alt van siempre con ESC delante.
+        let plain = matches!(n, Named::Enter | Named::Backspace | Named::Tab | Named::Escape);
+        let alt_prefix = mods.alt() && (m == 1 || plain) && !matches!(n, Named::Space);
         return Some(if alt_prefix { format!("\x1b{seq}") } else { seq });
     }
     if mods.control() {
@@ -121,6 +133,20 @@ pub fn encode(key: &Key, mods: Modifiers, text: Option<&str>) -> Option<String> 
         }
     }
     Some(t.to_string())
+}
+
+/// Cmd+tecla con significado de edición en los terminales de macOS: Cmd+← / Cmd+→ van al inicio y al final de la
+/// línea (Ctrl-A / Ctrl-E) y Cmd+Borrar borra hasta el inicio (Ctrl-U). El resto de Cmd es de la aplicación.
+pub fn encode_cmd(key: &Key, mods: Modifiers) -> Option<String> {
+    if !mods.command() || mods.alt() || mods.control() || mods.shift() {
+        return None;
+    }
+    match key {
+        Key::Named(Named::ArrowLeft) => Some("\x01".into()),
+        Key::Named(Named::ArrowRight) => Some("\x05".into()),
+        Key::Named(Named::Backspace) => Some("\x15".into()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -210,8 +236,22 @@ mod tests {
     fn flechas_con_modificadores() {
         assert_eq!(encode(&named(Named::ArrowUp), Modifiers::CTRL, None).as_deref(), Some("\x1b[1;5A"));
         assert_eq!(encode(&named(Named::ArrowLeft), Modifiers::SHIFT, None).as_deref(), Some("\x1b[1;2D"));
-        assert_eq!(encode(&named(Named::ArrowRight), Modifiers::ALT, None).as_deref(), Some("\x1b[1;3C"));
+        assert_eq!(encode(&named(Named::ArrowRight), Modifiers::ALT | Modifiers::SHIFT, None).as_deref(), Some("\x1b[1;4C"));
         assert_eq!(encode(&named(Named::Home), Modifiers::CTRL | Modifiers::SHIFT, None).as_deref(), Some("\x1b[1;6H"));
         assert_eq!(encode(&named(Named::Delete), Modifiers::CTRL, None).as_deref(), Some("\x1b[3;5~"));
+    }
+
+    /// Edición al estilo macOS: Option salta y borra palabras, Shift+Enter es salto de línea, Cmd va a los extremos.
+    #[test]
+    fn edicion_al_estilo_macos() {
+        assert_eq!(encode(&named(Named::ArrowLeft), Modifiers::ALT, None).as_deref(), Some("\x1bb"));
+        assert_eq!(encode(&named(Named::ArrowRight), Modifiers::ALT, None).as_deref(), Some("\x1bf"));
+        assert_eq!(encode(&named(Named::Backspace), Modifiers::ALT, None).as_deref(), Some("\x1b\x7f"));
+        assert_eq!(encode(&named(Named::Enter), Modifiers::SHIFT, None).as_deref(), Some("\x1b\r"));
+        assert_eq!(encode_cmd(&named(Named::ArrowLeft), Modifiers::LOGO).as_deref(), Some("\x01"));
+        assert_eq!(encode_cmd(&named(Named::ArrowRight), Modifiers::LOGO).as_deref(), Some("\x05"));
+        assert_eq!(encode_cmd(&named(Named::Backspace), Modifiers::LOGO).as_deref(), Some("\x15"));
+        assert_eq!(encode_cmd(&named(Named::ArrowLeft), Modifiers::LOGO | Modifiers::ALT), None, "Cmd+Opt es foco de split");
+        assert_eq!(encode_cmd(&ch("v"), Modifiers::LOGO), None);
     }
 }

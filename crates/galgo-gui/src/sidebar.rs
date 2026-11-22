@@ -1,6 +1,6 @@
 //! Árbol de la barra lateral: Proyecto > Workspace > paneles, y la lista «Te necesitan». Lógica pura.
 
-use galgo_proto::{PaneInfo, Status};
+use galgo_proto::PaneInfo;
 use std::collections::BTreeMap;
 
 /// Un workspace de la barra: su etiqueta completa ("repo/rama", o `None`) y el nombre que se muestra.
@@ -58,26 +58,10 @@ pub fn needs_attention<'a>(panes: &'a [PaneInfo], unread: impl Fn(u32) -> bool) 
     panes.iter().filter(|p| crate::attention::badge(p, unread(p.id)).is_some()).collect()
 }
 
-/// Recuento por estado de un grupo de paneles: «2 trabajando · 1 bloqueado». Vacío si no hay paneles.
-pub fn status_summary(panes: &[&PaneInfo]) -> String {
-    let count = |s: Status| panes.iter().filter(|p| p.status == s).count();
-    let parts: Vec<String> = [
-        (count(Status::Working), "trabajando"),
-        (count(Status::Blocked), "bloqueado"),
-        (count(Status::Done), "terminado"),
-        (count(Status::Failed), "falló"),
-        (count(Status::Idle), "parado"),
-    ]
-    .into_iter()
-    .filter(|(n, _)| *n > 0)
-    .map(|(n, word)| format!("{n} {word}"))
-    .collect();
-    parts.join(" · ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use galgo_proto::Status;
 
     fn pane(id: u32, ws: Option<&str>, status: Status) -> PaneInfo {
         PaneInfo {
@@ -128,13 +112,5 @@ mod tests {
         let panes = vec![pane(1, None, Status::Idle), pane(2, None, Status::Blocked), pane(3, None, Status::Done)];
         let ids: Vec<u32> = needs_attention(&panes, |id| id == 3).iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![2, 3]);
-    }
-
-    #[test]
-    fn resumen_de_estados() {
-        let panes = vec![pane(1, None, Status::Working), pane(2, None, Status::Working), pane(3, None, Status::Blocked)];
-        let refs: Vec<&PaneInfo> = panes.iter().collect();
-        assert_eq!(status_summary(&refs), "2 trabajando · 1 bloqueado");
-        assert_eq!(status_summary(&[]), "");
     }
 }

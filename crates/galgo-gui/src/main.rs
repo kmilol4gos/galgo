@@ -1,13 +1,14 @@
 use galgo_proto::{client, PaneInfo, Request, Status};
-use iced::{widget::{column, container, lazy, pick_list, progress_bar, row, scrollable, text, text_input, Space}, Color, Element, Font, Length, Task};
+use iced::{widget::{column, container, row}, Color, Element, Font, Length, Task};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use theme::{status_color, BG, MUTED, SIDEBAR, TEXT};
+use theme::{BG, MUTED, SIDEBAR, TEXT};
 
 mod attention;
+mod chrome;
 mod launch;
 mod layout;
 mod newpane;
@@ -32,17 +33,42 @@ use std::sync::{mpsc, OnceLock};
 const FONT_SIZE: f32 = 14.0;
 const LINE_H: f32 = 18.0;
 const CELL_W: f32 = 8.43; // Menlo: 0,602 em
-const SIDEBAR_W: f32 = 260.0;
+const SIDEBAR_W: f32 = 248.0;
+
+/// Paso de zoom de la fuente del terminal (Cmd+= / Cmd+- / Cmd+0): 0 es el tamaño base. Global porque la geometría
+/// (celdas, filas, ratón) se calcula en funciones puras que no reciben la app.
+static ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+const ZOOM_MIN: i32 = -5;
+const ZOOM_MAX: i32 = 12;
+
+/// (tamaño de letra, alto de línea, ancho de celda) para un paso de zoom: proporcionales a los de base.
+fn metrics_for(zoom: i32) -> (f32, f32, f32) {
+    let size = FONT_SIZE + zoom as f32;
+    (size, (size * LINE_H / FONT_SIZE).round(), size * CELL_W / FONT_SIZE)
+}
+
+fn zoom() -> i32 {
+    ZOOM.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn font_size() -> f32 {
+    metrics_for(zoom()).0
+}
+fn line_h() -> f32 {
+    metrics_for(zoom()).1
+}
+fn cell_w() -> f32 {
+    metrics_for(zoom()).2
+}
 /// Líneas de historial por cada paso de la rueda.
 const WHEEL_LINES: i32 = 3;
-/// Origen (esquina superior izquierda) de la cuadrícula dentro de la ventana: sidebar, padding del
-/// cuerpo (12), padding del contenedor del terminal (10), cabecera (44) y espacios (10).
-/// Altura de la barra de pestañas (debajo de la cabecera).
-const TABS_H: f32 = 28.0;
-/// Altura de la línea de detalle de uso, cuando el panel enfocado tiene datos (con su separación).
-const DETAIL_H: f32 = 26.0;
+/// Altura de la barra de pestañas (arriba del área de terminales, con su divisor de 1 px).
+const TABS_H: f32 = 36.0;
+/// Altura de la barra de estado (abajo, con su divisor de 1 px).
+const STATUS_H: f32 = 26.0;
+/// Margen interior de cada panel de terminal.
+const LEAF_PAD: f32 = 8.0;
 /// Origen de la cuadrícula de un panel único (referencia de las pruebas); un split usa el de su rectángulo.
-const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + 12.0 + 10.0, 12.0 + 44.0 + 10.0 + TABS_H + 10.0 + 10.0);
+const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + LEAF_PAD, TABS_H + LEAF_PAD);
 /// Primera opción del desplegable de manager del formulario: ningún manager.
 const NO_MANAGER: &str = "(ninguno)";
 
@@ -203,6 +229,8 @@ struct App {
 #[derive(Debug, Clone)]
 enum Message {
     TickScreen,
+    /// Zoom de la letra del terminal: +1 / -1 pasos, o 0 para volver al tamaño base.
+    Zoom(i32),
     TickList,
     Panes(Result<Vec<PaneInfo>, String>),
     Limits(Result<Vec<Limits>, String>),
@@ -285,8 +313,9 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 15] = [
+    let commands: [(&str, &str, Message); 19] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
+        ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
         ("Lanzar agente…", "Cmd+Shift+L", Message::OpenLauncher),
         ("Cerrar panel", "Cmd+W", Message::CloseFocused),
@@ -301,6 +330,9 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         ("Pestaña anterior", "Cmd+[", Message::NextTab(-1)),
         ("Lanzar opencode aquí", "", Message::Launch(launch::Agent::OpenCode)),
         ("Lanzar shell aquí", "", Message::Launch(launch::Agent::Shell)),
+        ("Aumentar la letra", "Cmd+=", Message::Zoom(1)),
+        ("Reducir la letra", "Cmd+-", Message::Zoom(-1)),
+        ("Letra de tamaño normal", "Cmd+0", Message::Zoom(0)),
     ];
     for (label, keys, message) in commands {
         items.push(PaletteItem { label: label.into(), detail: keys.into(), message });
@@ -323,6 +355,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     match (lower.as_str(), modifiers.shift()) {
         ("k", false) | ("p", true) => Some(Message::OpenPalette),
         ("n", false) => Some(Message::OpenNewWorkspace),
+        ("o", false) => Some(Message::PickFolder),
         ("t", false) => Some(Message::NewTab),
         ("w", false) => Some(Message::CloseFocused),
         ("[", false) => Some(Message::NextTab(-1)),
@@ -331,6 +364,9 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("d", true) => Some(Message::SplitFocused(false)),
         ("l", true) => Some(Message::OpenLauncher),
         ("u", true) => Some(Message::NextAttention),
+        ("=", _) | ("+", _) => Some(Message::Zoom(1)),
+        ("-", false) => Some(Message::Zoom(-1)),
+        ("0", false) => Some(Message::Zoom(0)),
         (d, false) => match d.parse::<usize>() {
             Ok(n @ 1..=9) => Some(Message::SelectWorkspaceAt(n - 1)),
             _ => None,
@@ -483,134 +519,6 @@ fn first_match(app: &App) -> Option<String> {
     recents::matching(&app.recents, query).first().map(|p| p.to_string())
 }
 
-fn welcome_view(app: &App) -> Element<'_, Message> {
-    let mut col = column![
-        text("Empieza un workspace").size(22).color(TEXT),
-        text("Un workspace es una carpeta de trabajo: sus terminales y agentes viven en ella.").size(theme::BODY_SIZE).color(MUTED),
-        theme::btn_primary(text("Abrir carpeta…   (Cmd+N)").size(theme::BODY_SIZE)).width(Length::Fill).padding([10, 12]).on_press(Message::PickFolder),
-        theme::btn_secondary(text("Nuevo terminal en el inicio").size(theme::BODY_SIZE)).width(Length::Fill).padding([10, 12]).on_press(Message::OpenFolder(home_dir())),
-    ]
-    .spacing(theme::GAP)
-    .max_width(480);
-    if let Some(last) = app.recents.first() {
-        col = col.push(
-            theme::btn_secondary(text(format!("Reabrir lo último: {last}")).size(theme::SMALL_SIZE)).width(Length::Fill).padding([8, 12]).on_press(Message::OpenFolder(last.clone())),
-        );
-    }
-    for p in app.recents.iter().skip(1).take(4) {
-        col = col.push(theme::btn(text(p.as_str()).size(theme::SMALL_SIZE).color(MUTED)).width(Length::Fill).padding([6, 10]).on_press(Message::OpenFolder(p.clone())));
-    }
-    container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
-}
-
-/// Barra lateral: «Te necesitan» arriba, luego Proyecto > Workspace > paneles. Cada workspace se pliega.
-fn sidebar_tree_view<'a>(app: &'a App, mut list: iced::widget::Column<'a, Message>) -> iced::widget::Column<'a, Message> {
-    let needs = sidebar::needs_attention(&app.panes, |id| app.attention.is_unread(id));
-    if !needs.is_empty() {
-        list = list.push(text(format!("TE NECESITAN · {}", needs.len())).size(11).color(status_color(Status::Blocked)));
-        for pane in needs {
-            list = list.push(pane_button(app, pane));
-        }
-    }
-    for project in sidebar::tree(&app.panes) {
-        list = list.push(text(project.name.to_uppercase()).size(theme::SMALL_SIZE).color(theme::DIM));
-        for ws in project.workspaces {
-            let key = ws.label.clone().unwrap_or_default();
-            let folded = app.collapsed.contains(&key);
-            let arrow = if folded { "▸" } else { "▾" };
-            // Estados y atención del workspace; luego el coste total, si hay uso medido.
-            let mut detail = sidebar::status_summary(&ws.panes);
-            if let Some(total) = usage::group_total(&ws.panes) {
-                detail = if detail.is_empty() { total } else { format!("{detail} · {total}") };
-            }
-            let head = column![text(format!("{arrow} {}", ws.name)).size(13), text(detail).size(11).color(MUTED)].spacing(2);
-            list = list.push(
-                theme::btn(container(head).width(Length::Fill).padding([6, 8]))
-                    .width(Length::Fill)
-                    .on_press(Message::ToggleGroup(key))
-                    .style(theme::row(false)),
-            );
-            if !folded {
-                for pane in ws.panes {
-                    list = list.push(row![Space::with_width(12), pane_button(app, pane)]);
-                }
-            }
-        }
-    }
-    list
-}
-
-/// Barra de pestañas del workspace enfocado: planas, con la activa subrayada; y los botones de dividir.
-fn tabs_bar(app: &App) -> Element<'_, Message> {
-    let mut bar = row![].spacing(theme::GAP).align_y(iced::Alignment::Center).height(TABS_H);
-    if let Some(ws) = focus_key(app).and_then(|k| app.layouts.by_key.get(&k)) {
-        for (i, tab) in ws.tabs.iter().enumerate() {
-            let name = app.panes.iter().find(|p| p.id == tab.focus).map_or("?", |p| p.name.as_str());
-            let active = i == ws.active;
-            let label = text(format!("{}  {name}", i + 1)).size(theme::BODY_SIZE).color(if active { TEXT } else { MUTED });
-            let underline = container(Space::new(Length::Fill, Length::Fixed(2.0))).width(Length::Fill).style(theme::tab_underline(active));
-            bar = bar.push(column![theme::btn(label).padding([4, 8]).on_press(Message::SelectTab(i)), underline].width(Length::Shrink));
-        }
-    }
-    bar = bar.push(theme::btn(text("+").size(theme::BODY_SIZE).color(MUTED)).padding([4, 8]).on_press(Message::NewTab));
-    bar = bar.push(theme::btn(text("Dividir →").size(theme::SMALL_SIZE).color(MUTED)).padding([4, 8]).on_press(Message::SplitFocused(true)));
-    bar = bar.push(theme::btn(text("Dividir ↓").size(theme::SMALL_SIZE).color(MUTED)).padding([4, 8]).on_press(Message::SplitFocused(false)));
-    bar.into()
-}
-
-/// El área de paneles: la pestaña visible del workspace enfocado, con sus splits.
-fn layout_view(app: &App) -> Element<'_, Message> {
-    match focus_key(app).and_then(|k| app.layouts.active_tab(&k)) {
-        Some(tab) => node_view(app, &tab.root),
-        None => text("Esperando salida…").size(14).color(MUTED).into(),
-    }
-}
-
-/// Un nodo del layout: una hoja es un panel; un split reparte su área en dos mitades iguales.
-fn node_view<'a>(app: &'a App, node: &'a layout::Node) -> Element<'a, Message> {
-    match node {
-        layout::Node::Leaf(id) => leaf_view(app, *id),
-        layout::Node::Split { vertical, a, b } => {
-            let first = container(node_view(app, a)).width(Length::FillPortion(1)).height(Length::Fill);
-            let second = container(node_view(app, b)).width(Length::FillPortion(1)).height(Length::Fill);
-            if *vertical {
-                row![first, second].width(Length::Fill).height(Length::Fill).into()
-            } else {
-                column![first, second].width(Length::Fill).height(Length::Fill).into()
-            }
-        }
-    }
-}
-
-/// Un panel: el enfocado con su vista congelada y su cursor; los demás, con la última pantalla que llegó. El borde
-/// fino es el divisor del split; con el foco, del color de acento.
-fn leaf_view(app: &App, id: u32) -> Element<'_, Message> {
-    let focused = app.selected == Some(id);
-    let inner: Element<'_, Message> = if focused {
-        match shown(app) {
-            // Con `lazy`, el árbol de la pantalla solo se reconstruye cuando cambia lo que se muestra.
-            Some(snap) => {
-                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen));
-                let sel = app.sel;
-                lazy(key, move |_| screen_view(snap, sel)).into()
-            }
-            None => text(if app.selected.is_none() { "Crea un panel con «+ Nuevo panel» o con `galgo spawn`." } else { "Esperando salida…" }).size(14).color(MUTED).into(),
-        }
-    } else {
-        match app.others.get(&id) {
-            Some(snap) => screen_view(snap, None),
-            None => text("Esperando salida…").size(14).color(MUTED).into(),
-        }
-    };
-    container(inner)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(10)
-        .clip(true)
-        .style(theme::leaf(focused))
-        .into()
-}
-
 /// Siguiente panel visible sin el foco que hay que sondear, por turnos. `None` si no hay ninguno libre.
 fn next_other(app: &mut App) -> Option<u32> {
     let key = focus_key(app)?;
@@ -642,85 +550,6 @@ const PALETTE_VISIBLE: usize = 12;
 /// Identificador del campo de búsqueda de la paleta: para darle el foco al abrirla.
 fn palette_input_id() -> iced::widget::text_input::Id {
     iced::widget::text_input::Id::new("paleta")
-}
-
-/// Paleta: búsqueda arriba y resultados debajo. El resaltado es una fila con fondo y una marca de acento; los atajos
-/// van a la derecha, en gris.
-fn palette_view(app: &App) -> Element<'_, Message> {
-    let query = app.palette.as_deref().unwrap_or("");
-    let results = palette_results(app);
-    let mut list = column![].spacing(2);
-    for (i, item) in results.iter().enumerate().take(PALETTE_VISIBLE) {
-        let cursor = i == app.palette_cursor;
-        let marca = text(if cursor { "▸" } else { " " }).size(theme::BODY_SIZE).color(theme::ACCENT);
-        let keys = item.detail.starts_with("Cmd");
-        let line = row![
-            marca,
-            text(item.label.clone()).size(theme::BODY_SIZE).color(TEXT),
-            Space::with_width(Length::Fill),
-            text(item.detail.clone()).size(theme::SMALL_SIZE).color(if keys { theme::DIM } else { MUTED }),
-        ]
-        .spacing(theme::GAP)
-        .align_y(iced::Alignment::Center);
-        list = list.push(theme::btn(line).width(Length::Fill).padding([7, 10]).on_press(Message::PaletteRun(i)).style(theme::row(cursor)));
-    }
-    if results.is_empty() {
-        list = list.push(text("Sin resultados.").size(theme::SMALL_SIZE).color(MUTED));
-    }
-    column![
-        text_input("Buscar workspace, panel o acción…", query)
-            .id(palette_input_id())
-            .on_input(Message::PaletteQuery)
-            .on_submit(Message::PaletteRun(app.palette_cursor))
-            .padding(10),
-        scrollable(list).height(Length::Fill),
-        text("↑ ↓ mover · Enter ejecutar · Esc cerrar").size(theme::SMALL_SIZE).color(theme::DIM),
-    ]
-    .spacing(theme::GAP)
-    .max_width(640)
-    .into()
-}
-
-/// Lanzador: una fila por agente, en el workspace y la carpeta del panel enfocado.
-fn launcher_view(app: &App) -> Element<'_, Message> {
-    let (workspace, cwd) = focus_context(app);
-    let target = format!(
-        "Workspace: {} · carpeta: {}",
-        workspace.as_deref().unwrap_or("sin workspace"),
-        cwd.as_deref().unwrap_or("inicio")
-    );
-    let mut col = column![text("Lanzar agente").size(18).color(TEXT), text(target).size(theme::SMALL_SIZE).color(MUTED)].spacing(theme::GAP).max_width(480);
-    for agent in launch::Agent::ALL {
-        col = col.push(theme::btn_secondary(text(agent.label()).size(theme::BODY_SIZE)).width(Length::Fill).padding([8, 12]).on_press(Message::Launch(agent)));
-    }
-    col = col.push(theme::btn_secondary(text("Cancelar").size(theme::BODY_SIZE)).on_press(Message::CloseLauncher));
-    container(col).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center).into()
-}
-
-fn new_workspace_view(app: &App) -> Element<'_, Message> {
-    let query = app.new_ws.as_deref().unwrap_or("");
-    let matches = recents::matching(&app.recents, query);
-    let mut list = column![].spacing(2);
-    for p in matches.iter().take(10) {
-        list = list.push(theme::btn(text(p.as_str()).size(theme::BODY_SIZE)).width(Length::Fill).padding([6, 10]).on_press(Message::OpenFolder((*p).clone())));
-    }
-    if matches.is_empty() {
-        list = list.push(text("Sin coincidencias entre las carpetas recientes.").size(theme::SMALL_SIZE).color(MUTED));
-    }
-    column![
-        text("Nuevo workspace").size(18).color(TEXT),
-        text("Elige una carpeta. Se abre un terminal en ella; el daemon deduce el proyecto y la rama del repo git.").size(theme::SMALL_SIZE).color(MUTED),
-        text_input("Buscar en recientes…", query).id(new_ws_input_id()).on_input(Message::NewWsQuery).on_submit(Message::NewWsSubmit).padding(8),
-        scrollable(list).height(Length::Fill),
-        row![
-            theme::btn_primary(text("Elegir carpeta…").size(theme::BODY_SIZE)).on_press(Message::PickFolder),
-            theme::btn_secondary(text("Cancelar").size(theme::BODY_SIZE)).on_press(Message::CloseNewWorkspace),
-        ]
-        .spacing(theme::GAP),
-    ]
-    .spacing(theme::GAP)
-    .max_width(560)
-    .into()
 }
 
 
@@ -877,21 +706,18 @@ fn select(app: &mut App, id: u32) -> Task<Message> {
     }
 }
 
-/// Filas y columnas que caben en el área del terminal para el tamaño de ventana actual.
-/// Área donde viven los paneles: a la derecha de la barra lateral, debajo de la cabecera, las pestañas y, si lo hay,
-/// la línea de detalle de uso (`extra_top`).
+/// Área donde viven los paneles: a la derecha de la barra lateral, entre la barra de pestañas y la de estado.
+/// `extra_top` y `extra_bottom` quedan para franjas futuras; hoy nada cambia la geometría (errores, uso y
+/// confirmaciones van en la barra de estado), así el terminal no salta de tamaño.
 fn terminal_area(window: (f32, f32), extra_top: f32, extra_bottom: f32) -> layout::Rect {
-    let x = SIDEBAR_W + 12.0;
-    let y = 12.0 + 44.0 + 10.0 + TABS_H + 10.0 + extra_top;
-    layout::Rect { x, y, w: (window.0 - x - 12.0).max(0.0), h: (window.1 - y - 12.0 - extra_bottom).max(0.0) }
+    let x = SIDEBAR_W;
+    let y = TABS_H + extra_top;
+    layout::Rect { x, y, w: (window.0 - x).max(0.0), h: (window.1 - y - STATUS_H - extra_bottom).max(0.0) }
 }
 
-/// Altura de la línea de error que se pinta debajo del cuerpo, con su separación (B5).
-const ERROR_H: f32 = 26.0;
-
-/// Cuadrícula de texto que cabe en un rectángulo de panel (con el margen de 10 px del terminal).
+/// Cuadrícula de texto que cabe en un rectángulo de panel (con su margen interior).
 fn grid_in(rect: layout::Rect) -> (u16, u16) {
-    (((rect.h - 20.0) / LINE_H).floor().max(5.0) as u16, ((rect.w - 20.0) / CELL_W).floor().max(20.0) as u16)
+    (((rect.h - 2.0 * LEAF_PAD) / line_h()).floor().max(5.0) as u16, ((rect.w - 2.0 * LEAF_PAD) / cell_w()).floor().max(20.0) as u16)
 }
 
 /// Cuadrícula de la ventana entera (un panel nuevo sin split).
@@ -899,17 +725,9 @@ fn grid_for(window: (f32, f32)) -> (u16, u16) {
     grid_in(terminal_area(window, 0.0, 0.0))
 }
 
-/// Altura extra por la línea de detalle de uso, si el panel enfocado la muestra.
-fn detail_extra(app: &App) -> f32 {
-    let has = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).is_some_and(|p| p.usage.is_some());
-    if has { DETAIL_H } else { 0.0 }
-}
-
-/// Área de los paneles con la altura real de la ventana y de la columna del cuerpo.
+/// Área de los paneles para la ventana actual.
 fn terminal_area_for(app: &App) -> layout::Rect {
-    // B5: la línea de error ocupa altura bajo el terminal; no se descuenta, los paneles se pedirían demasiadas filas.
-    let error = if app.error.is_some() { ERROR_H } else { 0.0 };
-    terminal_area(app.window, detail_extra(app), error)
+    terminal_area(app.window, 0.0, 0.0)
 }
 
 /// Rectángulo del panel `id` dentro de la pestaña visible de su workspace.
@@ -921,7 +739,7 @@ fn pane_rect(app: &App, id: u32) -> Option<layout::Rect> {
 
 /// Origen de la cuadrícula de un rectángulo de panel (su margen de 10 px).
 fn origin_in(rect: layout::Rect) -> (f32, f32) {
-    (rect.x + 10.0, rect.y + 10.0)
+    (rect.x + LEAF_PAD, rect.y + LEAF_PAD)
 }
 
 /// Origen de la cuadrícula del panel enfocado; sin rectángulo conocido, el de referencia.
@@ -966,15 +784,15 @@ fn pixel_to_cell(origin: (f32, f32), x: f32, y: f32, grid: (u16, u16)) -> Option
     if x < ox || y < oy {
         return None;
     }
-    let col = ((x - ox) / CELL_W).floor() as u16;
-    let row = ((y - oy) / LINE_H).floor() as u16;
+    let col = ((x - ox) / cell_w()).floor() as u16;
+    let row = ((y - oy) / line_h()).floor() as u16;
     Some((row.min(rows - 1), col.min(cols - 1)))
 }
 
 /// Si el píxel cae dentro de la cuadrícula visible (no en el recorte de los bordes).
 fn inside_grid(origin: (f32, f32), x: f32, y: f32, grid: (u16, u16)) -> bool {
     let (ox, oy) = origin;
-    x >= ox && y >= oy && x < ox + grid.1 as f32 * CELL_W && y < oy + grid.0 as f32 * LINE_H
+    x >= ox && y >= oy && x < ox + grid.1 as f32 * cell_w() && y < oy + grid.0 as f32 * line_h()
 }
 
 /// M4: el puntero cuenta para el terminal solo si está dentro del rectángulo del panel enfocado (y de su cuadrícula),
@@ -1102,6 +920,14 @@ fn keep_focus_visible(app: &mut App) {
 
 fn update_inner(app: &mut App, message: Message) -> Task<Message> {
     match message {
+        Message::Zoom(step) => {
+            let next = if step == 0 { 0 } else { (zoom() + step).clamp(ZOOM_MIN, ZOOM_MAX) };
+            ZOOM.store(next, std::sync::atomic::Ordering::Relaxed);
+            // Con otra letra caben otras filas y columnas: todos los paneles visibles se redimensionan.
+            app.sizes.clear();
+            resize_if_needed(app);
+            Task::none()
+        }
         Message::TickScreen => {
             if let Some(e) = outbox_error().lock().unwrap().take() {
                 app.error = Some(format!("no se envió: {e}"));
@@ -1481,6 +1307,14 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     return update(app, message);
                 }
             }
+            // En el lanzador, 1-5 lanza el agente de esa fila.
+            if app.launcher && !modifiers.command() {
+                if let Key::Character(c) = &key {
+                    if let Ok(n @ 1..=5) = c.as_str().parse::<usize>() {
+                        return update(app, Message::Launch(launch::Agent::ALL[n - 1]));
+                    }
+                }
+            }
             // Con «Nuevo workspace» o el lanzador abiertos, el teclado es suyo, no del panel.
             if app.new_ws.is_some() || app.launcher {
                 if matches!(&key, Key::Named(Named::Escape)) {
@@ -1508,7 +1342,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 };
                 return if copied.is_empty() { Task::none() } else { iced::clipboard::write(copied) };
             }
-            if let Some(bytes) = term::encode(&key, modifiers, text.as_deref()) {
+            if let Some(bytes) = term::encode_cmd(&key, modifiers).or_else(|| term::encode(&key, modifiers, text.as_deref())) {
                 back_to_live(app);
                 // Escribir en un panel lo redimensiona a la ventana, si hace falta.
                 resize_if_needed(app);
@@ -1525,7 +1359,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             let lines = match delta {
                 mouse::ScrollDelta::Lines { y, .. } => y,
-                mouse::ScrollDelta::Pixels { y, .. } => y / LINE_H,
+                mouse::ScrollDelta::Pixels { y, .. } => y / line_h(),
             };
             // Un trackpad envía fracciones de línea: se acumulan hasta sumar un paso completo.
             app.wheel_acc += lines;
@@ -1746,173 +1580,40 @@ fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>
     out
 }
 
-fn screen_view(snap: &Snapshot, sel: Option<Selection>) -> Element<'static, Message> {
+/// Pantalla de un panel. `cursor`: se dibuja el cursor (solo el panel enfocado, con la ventana activa).
+fn screen_view(snap: &Snapshot, sel: Option<Selection>, cursor: bool) -> Element<'static, Message> {
     let mut lines = column![].spacing(0);
     // El cursor solo se dibuja en la pantalla en vivo.
-    let live = snap.scrollback == 0;
+    let live = cursor && snap.scrollback == 0;
     for (r, runs) in snap.lines.iter().enumerate() {
         let cursor = (live && !snap.cursor_hidden && snap.cursor.0 as usize == r).then_some(snap.cursor.1);
         let selected = sel.and_then(|s| selected_cols(s, r as u16, snap.cols));
         let spans = spans_for_line(runs, cursor, selected);
         lines = lines.push(
-            rich_text(spans).size(FONT_SIZE).font(terminal_font()).line_height(iced::widget::text::LineHeight::Absolute(LINE_H.into())).wrapping(iced::widget::text::Wrapping::None),
+            rich_text(spans).size(font_size()).font(terminal_font()).line_height(iced::widget::text::LineHeight::Absolute(line_h().into())).wrapping(iced::widget::text::Wrapping::None),
         );
     }
     lines.into()
 }
 
 
-/// Texto y color de la insignia de atención de un panel.
-fn badge_look(b: Badge) -> (&'static str, Color) {
-    match b {
-        Badge::Blocked => ("necesita una decisión", status_color(Status::Blocked)),
-        Badge::DoneUnread => ("terminó · sin leer", status_color(Status::Done)),
-        Badge::Orphan => ("entrega sin confirmar", status_color(Status::Failed)),
-    }
-}
-
-fn form_view<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
-    let presets: Vec<String> = Preset::ALL.iter().map(|p| p.label().to_string()).collect();
-    let mut managers: Vec<String> = vec![NO_MANAGER.to_string()];
-    managers.extend(app.panes.iter().map(|p| p.name.clone()));
-    let manager_sel = f.manager.clone().unwrap_or_else(|| NO_MANAGER.to_string());
-
-    let mut form = column![
-        text("Nuevo panel").size(18),
-        text("Nombre").size(12).color(MUTED),
-        text_input("p. ej. worker-tests", &f.name).on_input(Message::FormName).padding(8),
-        text("Workspace").size(12).color(MUTED),
-        text_input("p. ej. inventia/cotizacion (vacío = el del repo git)", &f.workspace).on_input(Message::FormWorkspace).padding(8),
-        text("Comando").size(12).color(MUTED),
-        pick_list(presets, Some(f.preset.label().to_string()), Message::FormPreset),
-    ]
-    .spacing(8)
-    .width(Length::Fixed(420.0));
-    if f.preset == Preset::Custom {
-        form = form.push(text_input("p. ej. bash --norc", &f.custom).on_input(Message::FormCustom).padding(8));
-    }
-    form = form
-        .push(text("Directorio").size(12).color(MUTED))
-        .push(text_input(&home_dir(), &f.cwd).on_input(Message::FormCwd).padding(8))
-        .push(text("Manager (recibe el resultado)").size(12).color(MUTED))
-        .push(pick_list(managers, Some(manager_sel), Message::FormManager))
-        .push(row![
-            theme::btn(text("Crear").size(14)).on_press(Message::SubmitForm),
-            theme::btn(text("Cancelar").size(14)).on_press(Message::CancelForm),
-        ].spacing(10));
-    if let Some(e) = &app.form_error {
-        form = form.push(text(e.clone()).size(12).color(status_color(Status::Failed)));
-    }
-    container(form).padding(16).into()
-}
-
-/// Fila de un panel en la barra lateral: punto de estado, nombre y estado; el uso, la atención y las notas debajo.
-fn pane_button<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
-    let mut notes = Vec::new();
-    if pane.orphan { notes.push("ENTREGA SIN CONFIRMAR".to_string()); }
-    else if pane.unacked > 0 { notes.push(format!("{} pendientes", pane.unacked)); }
-    if let Some(manager) = &pane.manager { notes.push(format!("reporta a {manager}")); }
-    if let Some(waiting) = &pane.waiting_on { notes.push(format!("espera a {waiting}")); }
-    let dot = text("●").size(theme::SMALL_SIZE + 1.0).color(theme::status_color(pane.status));
-    let name = row![dot, text(&pane.name).size(theme::BODY_SIZE).color(TEXT)].spacing(8).align_y(iced::Alignment::Center);
-    let mut info = column![name, text(pane.status.as_str()).size(theme::SMALL_SIZE).color(MUTED)].spacing(2);
-    if let Some((line, color)) = pane.usage.as_ref().and_then(usage::pane_line) {
-        info = info.push(text(line).size(theme::SMALL_SIZE).color(color.unwrap_or(MUTED)));
-    }
-    if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
-        let (label, color) = badge_look(b);
-        info = info.push(text(label).size(theme::SMALL_SIZE).color(color));
-    }
-    if !notes.is_empty() { info = info.push(text(notes.join(" · ")).size(theme::SMALL_SIZE).color(if pane.orphan { theme::BLOCKED } else { MUTED })); }
-    let selected = app.selected == Some(pane.id);
-    theme::btn(container(info).width(Length::Fill).padding([6, 10]))
-        .width(Length::Fill)
-        .on_press(Message::Select(pane.id))
-        .style(theme::row(selected))
-        .into()
-}
-
-/// Pie de la barra lateral: cuotas por agente, con barras de 5 h y 7 d, reinicio y edad del dato.
-fn limits_footer(app: &App) -> Element<'_, Message> {
-    let now = now_secs();
-    let mut col = column![text("CUOTAS").size(12).color(MUTED)].spacing(6);
-    if app.limits.is_empty() {
-        let msg = match &app.limits_error {
-            Some(e) => format!("cuotas no disponibles: {e}"),
-            None => "sin cuotas observadas".to_string(),
-        };
-        col = col.push(text(msg).size(11).color(MUTED));
-    }
-    for l in &app.limits {
-        col = col.push(text(l.agent.clone()).size(12));
-        for r in usage::limit_rows(l, now) {
-            let bar = row![
-                text(r.label).size(11).width(40),
-                progress_bar(0.0..=100.0, r.pct).height(6),
-                text(format!("{:.0} %", r.pct)).size(11).width(44),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
-            col = col.push(bar).push(text(r.detail).size(10).color(MUTED));
-        }
-    }
-    col.into()
-}
-
 fn view(app: &App) -> Element<'_, Message> {
-    let mut list = column![
-        row![text("PANELES").size(12).color(MUTED), Space::with_width(Length::Fill), text(app.panes.len()).size(12).color(MUTED)].padding([0, 4]),
-        theme::btn_secondary(text("+ Nuevo workspace").size(theme::BODY_SIZE)).width(Length::Fill).on_press(Message::OpenNewWorkspace),
-        theme::btn_secondary(text("+ Nuevo panel").size(theme::BODY_SIZE)).width(Length::Fill).on_press(Message::OpenForm),
-    ].spacing(8);
-    if app.panes.is_empty() { list = list.push(text("No hay paneles todavía.").size(14).color(MUTED)); }
-    let list = sidebar_tree_view(app, list);
-    let sidebar = container(column![scrollable(list).height(Length::Fill), limits_footer(app)].spacing(theme::PAD)).width(260).height(Length::Fill).padding(theme::PAD).style(theme::surface(SIDEBAR));
-    let selected_pane = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id));
-    let title = selected_pane.map(|p| p.name.as_str()).unwrap_or("Sin paneles");
-    let state = selected_pane.map(|p| p.status.as_str().to_uppercase()).unwrap_or_default();
-    let state_color = selected_pane.map(|p| status_color(p.status)).unwrap_or(MUTED);
-    let body_content: Element<'_, Message> = if body_mode(app) == Body::NewWorkspace {
-        new_workspace_view(app)
-    } else if body_mode(app) == Body::Palette {
-        palette_view(app)
-    } else if body_mode(app) == Body::Launcher {
-        launcher_view(app)
-    } else if body_mode(app) == Body::Welcome {
-        welcome_view(app)
-    } else if let Some(f) = &app.form {
-        form_view(app, f)
+    let main: Element<'_, Message> = if app.panes.is_empty() {
+        chrome::welcome_view(app)
     } else {
-        layout_view(app)
+        column![chrome::tabs_bar(app), container(chrome::layout_view(app)).width(Length::Fill).height(Length::Fill).style(theme::surface(theme::TERM_BG)), chrome::status_bar(app)].into()
     };
-
-    let mut header = row![text(title).size(theme::TITLE_SIZE).color(TEXT), text(state).size(theme::SMALL_SIZE).color(state_color), Space::with_width(Length::Fill)].spacing(12).align_y(iced::Alignment::Center).height(44);
-    if let Some(n) = shown(app).map(|s| s.scrollback).filter(|&n| n > 0) {
-        header = header.push(text(format!("↑ {n}")).size(12).color(status_color(Status::Blocked)));
+    let base: Element<'_, Message> = container(row![chrome::sidebar_view(app), main]).width(Length::Fill).height(Length::Fill).style(theme::surface(BG)).into();
+    match body_mode(app) {
+        Body::Palette => chrome::floating(base, chrome::palette_panel(app), 600.0, Message::ClosePalette),
+        Body::NewWorkspace => chrome::floating(base, chrome::new_workspace_panel(app), 560.0, Message::CloseNewWorkspace),
+        Body::Launcher => chrome::floating(base, chrome::launcher_panel(app), 440.0, Message::CloseLauncher),
+        Body::Form => match &app.form {
+            Some(f) => chrome::floating(base, chrome::form_panel(app, f), 460.0, Message::CancelForm),
+            None => base,
+        },
+        Body::Welcome | Body::Screen => base,
     }
-    if app.form.is_none() && app.selected.is_some() {
-        if app.confirm_close {
-            header = header.push(text(format!("¿Cerrar «{title}»?")).size(12).color(status_color(Status::Blocked)))
-                .push(theme::btn(text("Sí, cerrar").size(12)).on_press(Message::ConfirmClose))
-                .push(theme::btn(text("No").size(12)).on_press(Message::CancelClose));
-        } else {
-            header = header.push(theme::btn_secondary(text("Cerrar panel").size(theme::SMALL_SIZE)).on_press(Message::AskClose));
-        }
-    }
-    if app.sel_snap.is_some() {
-        header = header.push(text("vista congelada · Esc para volver").size(11).color(MUTED));
-    }
-    header = header.push(text("GALGO").size(11).color(MUTED));
-    let mut body = column![header].spacing(10).padding(12).width(Length::Fill).height(Length::Fill);
-    if body_mode(app) == Body::Screen {
-        body = body.push(tabs_bar(app));
-    }
-    if let Some(u) = selected_pane.and_then(|p| p.usage.as_ref()) {
-        body = body.push(text(usage::detail_line(u)).size(11).color(MUTED));
-    }
-    body = body.push(body_content);
-    if let Some(error) = &app.error { body = body.push(text(format!("Error: {error}")).size(12).color(status_color(Status::Failed))); }
-    container(row![sidebar, body]).width(Length::Fill).height(Length::Fill).style(theme::surface(BG)).into()
 }
 
 fn main() -> iced::Result {
@@ -2328,8 +2029,21 @@ mod tests {
         assert!(matches!(shortcut(&k("U"), shift), Some(Message::NextAttention)));
         assert!(matches!(shortcut(&k("l"), shift), Some(Message::OpenLauncher)));
         assert!(matches!(shortcut(&k("3"), cmd), Some(Message::SelectWorkspaceAt(2))));
-        assert!(shortcut(&k("0"), cmd).is_none());
+        assert!(matches!(shortcut(&k("0"), cmd), Some(Message::Zoom(0))), "Cmd+0 vuelve al tamaño de letra normal");
         assert!(shortcut(&k("9"), cmd).is_some());
+    }
+
+    /// El zoom escala la letra, la línea y la celda en proporción; Cmd+= / Cmd+- / Cmd+0 lo manejan.
+    #[test]
+    fn zoom_de_la_letra() {
+        assert_eq!(metrics_for(0), (FONT_SIZE, LINE_H, CELL_W));
+        let (size, line, cell) = metrics_for(4);
+        assert_eq!(size, FONT_SIZE + 4.0);
+        assert!(line > LINE_H && cell > CELL_W);
+        let cmd = keyboard::Modifiers::COMMAND;
+        assert!(matches!(shortcut(&Key::Character("=".into()), cmd), Some(Message::Zoom(1))));
+        assert!(matches!(shortcut(&Key::Character("+".into()), cmd | keyboard::Modifiers::SHIFT), Some(Message::Zoom(1))));
+        assert!(matches!(shortcut(&Key::Character("-".into()), cmd), Some(Message::Zoom(-1))));
     }
 
     /// B: Cmd+1..9 selecciona el workspace n-ésimo en el orden de la barra lateral.
@@ -2743,14 +2457,14 @@ mod tests {
         assert!(app.recents.is_empty());
     }
 
-    /// r13 B5: con una línea de error visible, el área de paneles es más baja que sin ella (no se pide una fila de más).
+    /// r13 B5: el error va en la barra de estado, de altura fija: mostrarlo no cambia el área de los paneles (ni
+    /// pide un `Resize`).
     #[test]
-    fn r13_error_reserva_altura_bajo_el_terminal() {
+    fn r13_error_no_mueve_el_terminal() {
         let mut app = App { window: (1100.0, 700.0), panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
         let sin = terminal_area_for(&app);
         app.error = Some("no se envió".into());
-        let con = terminal_area_for(&app);
-        assert!((sin.h - con.h - ERROR_H).abs() < 0.5, "sin {} con {}", sin.h, con.h);
+        assert_eq!(terminal_area_for(&app), sin);
     }
 }
 
@@ -2791,33 +2505,115 @@ mod render {
         pixmap.save_png(path).expect("guardar png");
     }
 
+    fn colored(parts: &[(&str, galgo_proto::Color, bool)]) -> Vec<Run> {
+        parts.iter().map(|(t, fg, bold)| Run { t: (*t).into(), fg: *fg, bg: galgo_proto::Color::Default, bold: *bold, italic: false, underline: false, inverse: false }).collect()
+    }
+
+    /// Pantalla de ejemplo con colores, como la de un agente trabajando.
+    fn rich_snap(cols: u16) -> Snapshot {
+        use galgo_proto::Color::{Default as D, Idx};
+        let lines = vec![
+            colored(&[("╭─", Idx(8), false), (" claude ", Idx(13), true), ("· sonnet · ~/Development/nexo", Idx(8), false)]),
+            colored(&[("│ ", Idx(8), false), ("> ", Idx(12), true), ("arregla el test de recientes y corre cargo test", D, false)]),
+            colored(&[("╰─", Idx(8), false)]),
+            colored(&[("", D, false)]),
+            colored(&[("● ", Idx(10), false), ("Read", D, true), ("(crates/galgo-gui/src/recents.rs)", Idx(8), false)]),
+            colored(&[("  ⎿ ", Idx(8), false), ("Read 92 lines", Idx(8), false)]),
+            colored(&[("● ", Idx(10), false), ("Bash", D, true), ("(cargo test -p galgo-gui)", Idx(8), false)]),
+            colored(&[("  ⎿ ", Idx(8), false), ("   Compiling galgo-gui v0.1.0", Idx(2), false)]),
+            colored(&[("     ", D, false), ("test recents::tests::la_lista_se_recorta ... ", D, false), ("ok", Idx(2), true)]),
+            colored(&[("     ", D, false), ("test result: ", D, false), ("ok", Idx(2), true), (". 110 passed; 0 failed", D, false)]),
+            colored(&[("", D, false)]),
+            colored(&[("✻ ", Idx(3), false), ("Pensando… ", Idx(3), false), ("(12s · ↓ 1.2k tokens · esc para interrumpir)", Idx(8), false)]),
+        ];
+        let rows = 40u16;
+        let mut all = lines;
+        while all.len() < rows as usize { all.push(vec![]); }
+        Snapshot { gen: 1, rows, cols, cursor: (1, 52), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![] }
+    }
+
+    fn shell_snap(cols: u16) -> Snapshot {
+        use galgo_proto::Color::{Default as D, Idx};
+        let lines = vec![
+            colored(&[("~/Development/nexo ", Idx(4), true), ("main ", Idx(5), false), ("❯ ", Idx(2), true), ("git status --short", D, false)]),
+            colored(&[(" M ", Idx(1), false), ("crates/galgo-gui/src/main.rs", D, false)]),
+            colored(&[("?? ", Idx(1), false), ("crates/galgo-gui/src/chrome.rs", D, false)]),
+            colored(&[("~/Development/nexo ", Idx(4), true), ("main ", Idx(5), false), ("❯ ", Idx(2), true)]),
+        ];
+        let rows = 40u16;
+        let mut all = lines;
+        while all.len() < rows as usize { all.push(vec![]); }
+        Snapshot { gen: 1, rows, cols, cursor: (3, 23), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![] }
+    }
+
+    fn usage(agent: &str, ctx: f32, cost: f64) -> galgo_usage::PaneUsage {
+        galgo_usage::PaneUsage { agent: agent.into(), model: Some("claude-sonnet-4-5".into()), input: 120_000, cache_read: 900_000, cache_write: 40_000, cache_write_5m: 40_000, cache_write_1h: 0, output: 18_000, reasoning: 0, cost_usd: Some(cost), cost_source: galgo_usage::CostSource::Unknown, context_tokens: Some((ctx * 2000.0) as u64), context_window: Some(200_000), context_pct: Some(ctx), updated_secs: 4, partial: false }
+    }
+
+    /// Estado rico: dos proyectos, un workspace con split, atención, uso y cuotas.
+    fn scene() -> App {
+        let mut app = App { window: (1280.0, 800.0), focused: true, ..Default::default() };
+        let mut ws = |id: u32, name: &str, ws: &str, st: Status| {
+            let mut p = pane_info(id, name, st);
+            p.workspace = Some(ws.into());
+            p.cwd = Some(format!("{}/Development/nexo", home_dir()));
+            p
+        };
+        let mut c = ws(1, "claude", "nexo/main", Status::Working);
+        c.usage = Some(usage("claude", 34.0, 1.42));
+        let s = ws(2, "shell", "nexo/main", Status::Idle);
+        let mut w = ws(3, "worker-tests", "nexo/main", Status::Blocked);
+        w.manager = Some("claude".into());
+        let mut x = ws(4, "codex", "inventia/cotizacion", Status::Done);
+        x.usage = Some(usage("codex", 71.0, 0.38));
+        let y = ws(5, "shell", "inventia/cotizacion", Status::Idle);
+        let _ = &mut ws;
+        app.panes = vec![c, s, w, x, y];
+        app.layouts.sync(&pane_keys(&app));
+        // nexo/main: pestaña 1 = claude | shell (split), pestaña 2 = worker-tests.
+        let mut l = layout::Layouts::default();
+        l.new_tab("nexo/main", 1);
+        l.split(1, true, 2);
+        l.new_tab("nexo/main", 3);
+        l.new_tab("inventia/cotizacion", 4);
+        l.new_tab("inventia/cotizacion", 5);
+        app.layouts = l;
+        app.layouts.focus(1);
+        app.selected = Some(1);
+        app.snap = Some(rich_snap(70));
+        app.others.insert(2, shell_snap(70));
+        app.attention.observe(&app.panes, app.selected);
+        app.limits = vec![galgo_usage::Limits { agent: "claude".into(), plan: Some("max".into()), windows: vec![galgo_usage::LimitWindow { minutes: 300, used_pct: 42.0, resets_at: Some(now_secs() + 7200) }, galgo_usage::LimitWindow { minutes: 10080, used_pct: 76.0, resets_at: Some(now_secs() + 3 * 86400) }], observed_at: now_secs() - 30 }];
+        app
+    }
+
     #[test]
     #[ignore]
     fn render_capturas() {
         let dir = std::path::PathBuf::from(std::env::var("GALGO_UX_DIR").unwrap_or_else(|_| "/tmp/galgo-ux".into()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut welcome = App { window: (1100.0, 700.0), ..Default::default() };
-        render(&welcome, (1100, 700), &dir.join("r-bienvenida.png"));
-        let mut p = pane_info(1, "claude", Status::Working);
-        p.workspace = Some("repo/main".into());
-        let mut q = pane_info(2, "shell", Status::Blocked);
-        q.workspace = Some("repo/main".into());
-        let mut d = pane_info(3, "codex", Status::Done);
-        d.workspace = Some("otro/dev".into());
-        welcome.panes = vec![p, q, d];
-        welcome.selected = Some(1);
-        welcome.layouts.sync(&pane_keys(&welcome));
-        welcome.snap = Some(snap(&["$ cargo test", "   Compiling galgo-gui", "test result: ok"], 60));
-        render(&welcome, (1100, 700), &dir.join("r-paneles.png"));
-        let mut palette = welcome.clone_for_render();
+        let size = (1280, 800);
+        let mut welcome = App { window: (1280.0, 800.0), recents: vec![format!("{}/Development/nexo", home_dir()), format!("{}/Development/inventia", home_dir()), "/tmp/demo".into()], ..Default::default() };
+        render(&welcome, size, &dir.join("r-bienvenida.png"));
+        welcome.new_ws = Some(String::new());
+        render(&welcome, size, &dir.join("r-nuevo-workspace.png"));
+        let app = scene();
+        render(&app, size, &dir.join("r-paneles.png"));
+        let mut palette = scene();
         palette.palette = Some("cla".into());
-        render(&palette, (1100, 700), &dir.join("r-paleta.png"));
-        let mut nuevo = welcome.clone_for_render();
-        nuevo.new_ws = Some(String::new());
-        render(&nuevo, (1100, 700), &dir.join("r-nuevo-workspace.png"));
-        let mut lanz = welcome.clone_for_render();
+        render(&palette, size, &dir.join("r-paleta.png"));
+        let mut lanz = scene();
         lanz.launcher = true;
-        render(&lanz, (1100, 700), &dir.join("r-lanzador.png"));
+        render(&lanz, size, &dir.join("r-lanzador.png"));
+        let mut form = scene();
+        form.form = Some(NewPane::default());
+        render(&form, size, &dir.join("r-formulario.png"));
+        let mut close = scene();
+        close.confirm_close = true;
+        render(&close, size, &dir.join("r-cerrar.png"));
+        let mut err = scene();
+        err.error = Some("no se envió: el daemon no responde".into());
+        render(&err, size, &dir.join("r-error.png"));
     }
 }
 

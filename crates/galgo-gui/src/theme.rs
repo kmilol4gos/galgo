@@ -16,6 +16,8 @@ pub const HOVER: Color = Color::from_rgb(0.102, 0.110, 0.129);
 pub const SELECTED: Color = Color::from_rgb(0.129, 0.141, 0.169);
 pub const BORDER: Color = Color::from_rgb(0.149, 0.165, 0.192);
 pub const TEXT: Color = Color::from_rgb(0.894, 0.902, 0.918);
+/// Texto de las filas no seleccionadas: un punto más apagado que `TEXT`.
+pub const TEXT_SOFT: Color = Color::from_rgb(0.776, 0.788, 0.812);
 pub const MUTED: Color = Color::from_rgb(0.541, 0.565, 0.600);
 pub const DIM: Color = Color::from_rgb(0.357, 0.380, 0.420);
 pub const ACCENT: Color = Color::from_rgb(0.357, 0.553, 0.937);
@@ -29,10 +31,6 @@ pub const IDLE: Color = Color::from_rgb(0.357, 0.380, 0.420);
 pub const RADIUS: f32 = 3.0;
 /// Grosor de los bordes finos (divisores de splits, foco).
 pub const LINE: f32 = 1.0;
-/// Espaciado entre elementos de una columna o fila.
-pub const GAP: f32 = 8.0;
-/// Margen interior de paneles y barras.
-pub const PAD: f32 = 12.0;
 /// Tamaños de letra: título, cuerpo y texto secundario.
 pub const TITLE_SIZE: f32 = 16.0;
 pub const BODY_SIZE: f32 = 13.0;
@@ -128,15 +126,6 @@ pub fn row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
-/// Panel de terminal: borde fino; con el foco, del color de acento. Así también se ven los divisores de los splits.
-pub fn leaf(focused: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| container::Style {
-        background: Some(term::DEFAULT_BG.into()),
-        border: Border { color: if focused { ACCENT } else { BORDER }, width: LINE, radius: RADIUS.into() },
-        ..Default::default()
-    }
-}
-
 /// Fondo sólido de un contenedor (barra lateral, cabecera, ventana).
 pub fn surface(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style { background: Some(color.into()), text_color: Some(TEXT), ..Default::default() }
@@ -147,5 +136,127 @@ pub fn tab_underline(active: bool) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
         background: Some(Background::Color(if active { ACCENT } else { Color::TRANSPARENT })),
         ..Default::default()
+    }
+}
+
+/// Fondo del área de terminales (igual que el del terminal: el panel no se distingue de su marco).
+pub const TERM_BG: Color = term::DEFAULT_BG;
+/// Superficie elevada: paleta, lanzador y diálogos que flotan sobre el terminal.
+pub const ELEVATED: Color = Color::from_rgb(0.090, 0.096, 0.114);
+/// Velo bajo una capa flotante.
+pub const SCRIM: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.55 };
+/// Esquina de las capas flotantes.
+pub const RADIUS_LG: f32 = 8.0;
+
+/// Atajo en el formato de macOS: «Cmd+Shift+U» → «⌘⇧U».
+pub fn keys(spec: &str) -> String {
+    spec.split('+')
+        .map(|k| match k {
+            "Cmd" => "⌘".to_string(),
+            "Shift" => "⇧".to_string(),
+            "Opt" | "Alt" => "⌥".to_string(),
+            "Ctrl" => "⌃".to_string(),
+            "Enter" => "enter".to_string(),
+            "Esc" => "esc".to_string(),
+            other => other.to_uppercase(),
+        })
+        .collect()
+}
+
+/// Tecla dibujada: texto pequeño en una caja de borde fino.
+pub fn keycap<'a, M: 'a>(spec: &str) -> Element<'a, M> {
+    container(iced::widget::text(keys(spec)).size(SMALL_SIZE).color(MUTED))
+        .padding([1, 6])
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color { a: 0.04, ..Color::WHITE })),
+            border: Border { color: BORDER, width: LINE, radius: RADIUS.into() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Línea de 1 px (divisor) del color de borde. `vertical` = línea vertical.
+pub fn rule<'a, M: 'a>(vertical: bool) -> Element<'a, M> {
+    use iced::Length;
+    let (w, h) = if vertical { (Length::Fixed(LINE), Length::Fill) } else { (Length::Fill, Length::Fixed(LINE)) };
+    container(iced::widget::Space::new(w, h)).style(surface(BORDER)).into()
+}
+
+/// Capa flotante: superficie elevada, borde fino, esquinas amplias y sombra.
+pub fn overlay(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(ELEVATED)),
+        text_color: Some(TEXT),
+        border: Border { color: BORDER, width: LINE, radius: RADIUS_LG.into() },
+        shadow: Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 12.0), blur_radius: 32.0 },
+    }
+}
+
+/// Pestaña de la barra superior: la activa toma el fondo del terminal (se funde con él) y el texto claro.
+pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let background = if active {
+            Some(Background::Color(TERM_BG))
+        } else if hover {
+            Some(Background::Color(HOVER))
+        } else {
+            None
+        };
+        button::Style {
+            background,
+            text_color: if active { TEXT } else { MUTED },
+            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 0.0.into() },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// Campo de búsqueda grande y sin borde (paleta, nuevo workspace): el foco no necesita marco, el cursor basta.
+pub fn search_input(_: &Theme, status: iced::widget::text_input::Status) -> iced::widget::text_input::Style {
+    let _ = status;
+    iced::widget::text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 0.0.into() },
+        icon: MUTED,
+        placeholder: DIM,
+        value: TEXT,
+        selection: Color { a: 0.35, ..ACCENT },
+    }
+}
+
+/// Campo de formulario: superficie del terminal con borde fino; con el foco, borde de acento.
+pub fn field(_: &Theme, status: iced::widget::text_input::Status) -> iced::widget::text_input::Style {
+    let focused = matches!(status, iced::widget::text_input::Status::Focused);
+    iced::widget::text_input::Style {
+        background: Background::Color(TERM_BG),
+        border: Border { color: if focused { ACCENT } else { BORDER }, width: LINE, radius: RADIUS.into() },
+        icon: MUTED,
+        placeholder: DIM,
+        value: TEXT,
+        selection: Color { a: 0.35, ..ACCENT },
+    }
+}
+
+/// Desplegable de formulario: como un campo, con la flecha apagada.
+pub fn select(_: &Theme, status: iced::widget::pick_list::Status) -> iced::widget::pick_list::Style {
+    let open = matches!(status, iced::widget::pick_list::Status::Opened | iced::widget::pick_list::Status::Hovered);
+    iced::widget::pick_list::Style {
+        text_color: TEXT,
+        placeholder_color: DIM,
+        handle_color: MUTED,
+        background: Background::Color(TERM_BG),
+        border: Border { color: if open { MUTED } else { BORDER }, width: LINE, radius: RADIUS.into() },
+    }
+}
+
+/// Menú de un desplegable: superficie elevada, la opción bajo el puntero con el acento.
+pub fn menu(_: &Theme) -> iced::overlay::menu::Style {
+    iced::overlay::menu::Style {
+        background: Background::Color(ELEVATED),
+        border: Border { color: BORDER, width: LINE, radius: RADIUS.into() },
+        text_color: TEXT,
+        selected_text_color: TEXT,
+        selected_background: Background::Color(Color { a: 0.35, ..ACCENT }),
     }
 }
