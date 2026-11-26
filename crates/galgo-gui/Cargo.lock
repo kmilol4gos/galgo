@@ -1174,6 +1174,7 @@ dependencies = [
  "iced_graphics",
  "iced_runtime",
  "iced_tiny_skia",
+ "libc",
  "rfd",
  "serde",
  "serde_json",

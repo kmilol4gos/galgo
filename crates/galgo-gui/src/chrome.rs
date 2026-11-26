@@ -194,15 +194,40 @@ fn limits_footer(app: &App) -> Element<'_, Message> {
     column![theme::rule(false), container(col).padding([10, 14])].into()
 }
 
+/// Barra superior de sesiones, dentro de la barra de título (Rex): una sesión por workspace, la activa resaltada,
+/// y a la derecha las acciones. El hueco de la izquierda deja sitio a los semáforos de macOS.
+pub fn session_bar(app: &App) -> Element<'_, Message> {
+    let current = focus_key(app);
+    let mut bar = row![Space::with_width(78.0), text("galgo").size(theme::BODY_SIZE).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT), Space::with_width(12.0)]
+        .align_y(Alignment::Center)
+        .height(TABS_H);
+    for (i, ws) in sidebar::workspaces(&app.panes).into_iter().enumerate() {
+        let key = ws.label.clone().unwrap_or_default();
+        let active = current.as_deref().is_some_and(|k| k == key);
+        let state = ws.panes.iter().map(|p| p.status).min_by_key(|s| sidebar::priority(*s)).unwrap_or(Status::Idle);
+        let label = row![dot(theme::status_color(state), 6.0), text(ws.label.clone().unwrap_or_else(|| "sin workspace".into())).size(theme::SMALL_SIZE + 1.0).color(if active { TEXT } else { MUTED }).wrapping(iced::widget::text::Wrapping::None)]
+            .spacing(7)
+            .align_y(Alignment::Center);
+        bar = bar.push(theme::btn(container(label).padding([4, 12])).padding(0).on_press(Message::SelectWorkspaceAt(i)).style(theme::tab(active)));
+    }
+    bar = bar.push(icon_button(text("+").size(16).color(MUTED).into(), "Nuevo workspace  ⌘N", Message::OpenNewWorkspace));
+    bar = bar
+        .push(Space::with_width(Length::Fill))
+        .push(icon_button(text("⌘").size(14).color(MUTED).into(), "Buscar o ejecutar  ⌘K", Message::OpenPalette))
+        .push(Space::with_width(8));
+    container(bar).width(Length::Fill).style(theme::surface(SIDEBAR)).into()
+}
+
+/// Hora local HH:MM, sin dependencias de fecha: `localtime_r` de libc.
+pub fn clock_hm() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as libc::time_t).unwrap_or(0);
+    // SAFETY: `tm` es un registro de salida de `localtime_r`, que lo rellena por completo.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&now, &mut tm) };
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
 pub fn sidebar_view(app: &App) -> Element<'_, Message> {
-    let header = row![
-        text("galgo").size(15).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT),
-        Space::with_width(Length::Fill),
-        icon_button(text("+").size(16).color(MUTED).into(), "Nuevo workspace  ⌘N", Message::OpenNewWorkspace),
-    ]
-    .align_y(Alignment::Center)
-    .padding(iced::Padding { top: 0.0, bottom: 0.0, left: 14.0, right: 6.0 })
-    .height(TABS_H - 1.0);
     let search = theme::btn(
         row![text("Buscar o ejecutar…").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), Space::with_width(Length::Fill), theme::keycap("Cmd+K")]
             .align_y(Alignment::Center),
@@ -220,8 +245,6 @@ pub fn sidebar_view(app: &App) -> Element<'_, Message> {
         }
     });
     let body = column![
-        header,
-        theme::rule(false),
         container(search).padding(iced::Padding { top: 10.0, bottom: 2.0, left: 10.0, right: 10.0 }),
         scrollable(sidebar_list(app)).height(Length::Fill),
         limits_footer(app),
@@ -282,7 +305,8 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
         )
         .push(icon_button(split_icon(true), "Dividir a la derecha  ⌘D", Message::SplitFocused(true)))
         .push(icon_button(split_icon(false), "Dividir hacia abajo  ⌘⇧D", Message::SplitFocused(false)))
-        .push(Space::with_width(6));
+        .push(text(clock_hm()).size(theme::SMALL_SIZE + 1.0).color(theme::DIM))
+        .push(Space::with_width(10));
     column![container(bar).width(Length::Fill).style(theme::surface(SIDEBAR)), theme::rule(false)].into()
 }
 

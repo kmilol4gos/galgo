@@ -7,6 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
+libc = "0.2"
 iced = { version = "0.13", features = ["tokio", "lazy"] }
 galgo-proto = { path = "../galgo-proto" }
 galgo-usage = { path = "../galgo-usage" }

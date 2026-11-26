@@ -68,7 +68,7 @@ const STATUS_H: f32 = 26.0;
 /// Margen interior de cada panel de terminal.
 const LEAF_PAD: f32 = 8.0;
 /// Origen de la cuadrícula de un panel único (referencia de las pruebas); un split usa el de su rectángulo.
-const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + LEAF_PAD, TABS_H + LEAF_PAD);
+const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + LEAF_PAD, 2.0 * TABS_H + LEAF_PAD);
 /// Primera opción del desplegable de manager del formulario: ningún manager.
 const NO_MANAGER: &str = "(ninguno)";
 
@@ -716,7 +716,7 @@ fn select(app: &mut App, id: u32) -> Task<Message> {
 /// confirmaciones van en la barra de estado), así el terminal no salta de tamaño.
 fn terminal_area(window: (f32, f32), extra_top: f32, extra_bottom: f32) -> layout::Rect {
     let x = SIDEBAR_W;
-    let y = TABS_H + extra_top;
+    let y = 2.0 * TABS_H + extra_top;
     layout::Rect { x, y, w: (window.0 - x).max(0.0), h: (window.1 - y - STATUS_H - extra_bottom).max(0.0) }
 }
 
@@ -1708,7 +1708,15 @@ fn view(app: &App) -> Element<'_, Message> {
     } else {
         column![chrome::tabs_bar(app), container(chrome::layout_view(app)).width(Length::Fill).height(Length::Fill).style(theme::surface(theme::TERM_BG)), chrome::status_bar(app)].into()
     };
-    let base: Element<'_, Message> = container(row![chrome::sidebar_view(app), main]).width(Length::Fill).height(Length::Fill).style(theme::surface(BG)).into();
+    // Rex: la barra de sesiones va arriba del todo, sobre la barra lateral y el cuerpo.
+    let base: Element<'_, Message> = container(column![
+        chrome::session_bar(app),
+        row![chrome::sidebar_view(app), main],
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(theme::surface(BG))
+    .into();
     match body_mode(app) {
         Body::Palette => chrome::floating(base, chrome::palette_panel(app), 600.0, Message::ClosePalette),
         Body::NewWorkspace => chrome::floating(base, chrome::new_workspace_panel(app), 560.0, Message::CloseNewWorkspace),
@@ -1745,7 +1753,16 @@ fn main() -> iced::Result {
                 _ => None,
             }),
         ]))
-        .window_size(iced::Size::new(1100.0, 700.0))
+        // Barra de título integrada: transparente y sin título, con el contenido bajo ella (Rex).
+        .window(iced::window::Settings {
+            size: iced::Size::new(1100.0, 700.0),
+            platform_specific: iced::window::settings::PlatformSpecific {
+                title_hidden: true,
+                titlebar_transparent: true,
+                fullsize_content_view: true,
+            },
+            ..Default::default()
+        })
         .run_with(|| {
             let file = recents::file();
             let app = App { window: (1100.0, 700.0), focused: true, recents: recents::load(&file), recents_path: Some(file), ..Default::default() };
