@@ -119,6 +119,7 @@ mod tests {
             workspace: None,
             cwd: None,
             usage: None,
+            title: None,
         }
     }
 

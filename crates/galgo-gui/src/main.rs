@@ -19,7 +19,7 @@ mod term;
 mod theme;
 mod usage;
 
-use attention::{Alert, Attention, Badge};
+use attention::{Alert, Attention};
 use galgo_proto::{Run, Snapshot};
 use galgo_usage::Limits;
 use iced::keyboard::{self, key::Named, Key};
@@ -188,8 +188,6 @@ struct App {
     key_queue: Vec<String>,
     /// Tamaño con el que se pidió el último `Spawn`: es el tamaño del panel que nace.
     spawn_size: Option<(u16, u16)>,
-    /// Grupos de workspace plegados.
-    collapsed: std::collections::BTreeSet<String>,
     attention: Attention,
     /// Formulario de "Nuevo panel", abierto mientras existe.
     form: Option<NewPane>,
@@ -247,7 +245,6 @@ enum Message {
     Event(Event),
     Paste(Option<String>),
     /// Pliega o despliega un grupo de workspace (la clave es el nombre; vacío = sin workspace).
-    ToggleGroup(String),
     FormWorkspace(String),
     OpenForm,
     CancelForm,
@@ -1524,12 +1521,6 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
 
         // ---- Formulario de nuevo panel ----
-        Message::ToggleGroup(key) => {
-            if !app.collapsed.remove(&key) {
-                app.collapsed.insert(key);
-            }
-            Task::none()
-        }
         Message::FormWorkspace(v) => {
             if let Some(f) = app.form.as_mut() { f.workspace = v; }
             Task::none()
@@ -1943,6 +1934,7 @@ mod tests {
             workspace: None,
             cwd: None,
             usage: None,
+            title: None,
         }
     }
 
@@ -2073,15 +2065,6 @@ mod tests {
     }
 
     /// Grupos: plegar y desplegar alterna la clave del grupo.
-    #[test]
-    fn plegar_y_desplegar_un_grupo() {
-        let mut app = App::default();
-        let _ = update(&mut app, Message::ToggleGroup("inventia/cotizacion".into()));
-        assert!(app.collapsed.contains("inventia/cotizacion"));
-        let _ = update(&mut app, Message::ToggleGroup("inventia/cotizacion".into()));
-        assert!(!app.collapsed.contains("inventia/cotizacion"));
-    }
-
     /// Las cuotas llegan al estado; un error de lectura se guarda aparte y no borra las últimas cuotas.
     #[test]
     fn cuotas_llegan_y_un_error_no_las_borra() {
@@ -2647,7 +2630,7 @@ mod render {
     use iced_runtime::user_interface::{Cache, UserInterface};
 
     fn pane_info(id: u32, name: &str, status: Status) -> PaneInfo {
-        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None }
+        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None }
     }
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {

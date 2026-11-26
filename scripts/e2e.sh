@@ -1329,5 +1329,23 @@ galgo usage --by model | grep -qF "claude-sonnet-5-5"; check "galgo usage --by m
 galgo stop >/dev/null 2>&1; sleep 0.3
 export GALGO_SOCKET="$TMP/galgo.sock"
 
+echo "138. título de la tarea: galgo title llega a ls; vacío lo borra; caracteres de control se rechazan"
+mkdir -p "$TMPDIR/c138" 2>/dev/null; mkdir -p "$TMP/c138" && chmod 700 "$TMP/c138"
+export GALGO_SOCKET="$TMP/c138/g.sock"
+galgo spawn t138 -- bash --norc >/dev/null
+galgo title "bug de ventas" --pane t138 >/dev/null; check "galgo title acepta un título" $?
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="t138"][0]
+assert p["title"]=="bug de ventas", p.get("title")'
+check "el título aparece en ls" $?
+galgo title "" --pane t138 >/dev/null
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="t138"][0]
+assert p.get("title") is None'
+check "un título vacío lo borra" $?
+galgo title $'x\e[31m' --pane t138 >/dev/null 2>&1; [ $? -ne 0 ]; check "un título con caracteres de control se rechaza" $?
+galgo stop >/dev/null 2>&1; sleep 0.3
+export GALGO_SOCKET="$TMP/galgo.sock"
+
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

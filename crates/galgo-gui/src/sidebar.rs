@@ -1,6 +1,6 @@
 //! Árbol de la barra lateral: Proyecto > Workspace > paneles, y la lista «Te necesitan». Lógica pura.
 
-use galgo_proto::PaneInfo;
+use galgo_proto::{PaneInfo, Status};
 use std::collections::BTreeMap;
 
 /// Un workspace de la barra: su etiqueta completa ("repo/rama", o `None`) y el nombre que se muestra.
@@ -53,9 +53,41 @@ pub fn workspaces(panes: &[PaneInfo]) -> Vec<Workspace<'_>> {
     tree(panes).into_iter().flat_map(|p| p.workspaces).collect()
 }
 
-/// Paneles que piden atención (insignia visible), en orden de la lista.
-pub fn needs_attention<'a>(panes: &'a [PaneInfo], unread: impl Fn(u32) -> bool) -> Vec<&'a PaneInfo> {
-    panes.iter().filter(|p| crate::attention::badge(p, unread(p.id)).is_some()).collect()
+
+/// Prioridad de un agente en la lista «agents»: bloqueado primero, luego error, trabajando, terminado e inactivo.
+pub fn priority(status: Status) -> u8 {
+    match status {
+        Status::Blocked => 0,
+        Status::Failed | Status::Exited => 1,
+        Status::Working => 2,
+        Status::Done => 3,
+        Status::Idle => 4,
+    }
+}
+
+/// Todos los paneles en el orden de «agents»: por prioridad y, a igual prioridad, por id.
+pub fn agents_sorted(panes: &[PaneInfo]) -> Vec<&PaneInfo> {
+    let mut v: Vec<&PaneInfo> = panes.iter().collect();
+    v.sort_by_key(|p| (priority(p.status), p.id));
+    v
+}
+
+/// Proveedor del agente: el que midió el uso si lo hay; si no, el nombre del programa que lanza el panel.
+pub fn provider(p: &PaneInfo) -> String {
+    if let Some(u) = &p.usage {
+        return u.agent.clone();
+    }
+    let program = p.cmd.first().map(String::as_str).unwrap_or("");
+    let base = program.rsplit('/').next().unwrap_or("");
+    match base {
+        "claude" | "codex" | "pi" | "opencode" => base.to_string(),
+        _ => "shell".to_string(),
+    }
+}
+
+/// Modelo del agente, si se conoce (lo da el uso medido).
+pub fn model(p: &PaneInfo) -> Option<String> {
+    p.usage.as_ref().and_then(|u| u.model.clone())
 }
 
 #[cfg(test)]
@@ -78,6 +110,7 @@ mod tests {
             workspace: ws.map(str::to_string),
             cwd: None,
             usage: None,
+            title: None,
         }
     }
 
@@ -107,10 +140,21 @@ mod tests {
         assert_eq!(orden, vec![4, 1, 3, 2]);
     }
 
+
     #[test]
-    fn te_necesitan_son_los_que_tienen_insignia() {
-        let panes = vec![pane(1, None, Status::Idle), pane(2, None, Status::Blocked), pane(3, None, Status::Done)];
-        let ids: Vec<u32> = needs_attention(&panes, |id| id == 3).iter().map(|p| p.id).collect();
-        assert_eq!(ids, vec![2, 3]);
+    fn agentes_por_prioridad() {
+        let panes = vec![pane(1, None, Status::Idle), pane(2, None, Status::Working), pane(3, None, Status::Blocked), pane(4, None, Status::Done)];
+        let ids: Vec<u32> = agents_sorted(&panes).iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![3, 2, 4, 1], "bloqueado, trabajando, terminado, inactivo");
+    }
+
+    #[test]
+    fn proveedor_desde_el_comando_o_el_uso() {
+        let mut p = pane(1, None, Status::Idle);
+        p.cmd = vec!["/usr/local/bin/codex".into(), "--x".into()];
+        assert_eq!(provider(&p), "codex");
+        p.cmd = vec!["/bin/zsh".into()];
+        assert_eq!(provider(&p), "shell");
+        assert_eq!(model(&p), None);
     }
 }

@@ -121,6 +121,13 @@ enum Cmd {
     },
     /// Uso vivo de los paneles (tokens, contexto, coste) y cuotas por agente.
     Usage(usage_cmd::UsageArgs),
+    /// Título de la tarea del panel: lo muestra la barra lateral. Sin texto lo borra.
+    Title {
+        #[arg(default_value = "")]
+        text: String,
+        #[arg(long, env = "GALGO_PANE")]
+        pane: String,
+    },
 }
 
 fn main() {
@@ -176,6 +183,7 @@ fn run() -> Result<()> {
         Cmd::Ack { msg, pane } => Request::Ack { pane: pane.clone(), msg: *msg },
         Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
         Cmd::Stop => Request::Shutdown,
+        Cmd::Title { text, pane } => Request::SetTitle { pane: pane.clone(), title: text.clone() },
         Cmd::Hook { .. } | Cmd::Statusline { .. } | Cmd::Hooks { .. } | Cmd::Env { .. } | Cmd::Skill { .. } | Cmd::Usage(_) => unreachable!("se atienden antes"),
     };
 

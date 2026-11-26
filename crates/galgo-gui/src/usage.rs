@@ -6,7 +6,9 @@ use galgo_proto::PaneInfo;
 use galgo_usage::{CostSource, Limits, PaneUsage};
 use iced::Color;
 
+#[allow(dead_code)] // reservado para la barra de contexto de los agentes
 pub const AMBER: Color = crate::theme::BLOCKED;
+#[allow(dead_code)] // reservado para la barra de contexto de los agentes
 pub const RED: Color = crate::theme::FAILED;
 
 /// Cifras con coma decimal: 598000 → "598k", 1400000 → "1,4M".
@@ -42,6 +44,7 @@ pub fn age(secs: u64) -> String {
 }
 
 /// Color del contexto: ámbar desde el 80 %, rojo desde el 95 %. Sin dato o por debajo, ninguno.
+#[allow(dead_code)] // umbral de contexto (80 %/95 %): lo usan la línea de uso y sus pruebas
 pub fn ctx_color(pct: f32) -> Option<Color> {
     if pct >= 95.0 {
         Some(RED)
@@ -62,6 +65,7 @@ fn origin(src: CostSource) -> &'static str {
 }
 
 /// Línea bajo el panel: «ctx 60 % · 7,07 $». Sin contexto ni coste, no hay línea.
+#[allow(dead_code)] // resumen de uso por panel: lo reutiliza la fila del agente
 pub fn pane_line(u: &PaneUsage) -> Option<(String, Option<Color>)> {
     let mut parts = Vec::new();
     let mut color = None;
@@ -103,6 +107,7 @@ pub fn detail_line(u: &PaneUsage) -> String {
 
 /// Total de un workspace para su cabecera: coste de los paneles con precio y tokens totales.
 /// Sin ningún panel con uso, no hay total.
+#[allow(dead_code)] // total por workspace: reservado para la cabecera del proyecto
 pub fn group_total(panes: &[&PaneInfo]) -> Option<String> {
     let usages: Vec<&PaneUsage> = panes.iter().filter_map(|p| p.usage.as_ref()).collect();
     if usages.is_empty() {
@@ -290,6 +295,7 @@ mod tests {
             workspace: None,
             cwd: None,
             usage: None,
+            title: None,
         }
     }
 }

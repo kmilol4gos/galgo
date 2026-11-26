@@ -181,6 +181,11 @@ pub enum Request {
         #[serde(default)]
         group_by: Option<String>,
     },
+    /// Título de la tarea de un panel (vacío lo borra). Solo en memoria del daemon.
+    SetTitle {
+        pane: String,
+        title: String,
+    },
     Inbox {
         pane: String,
     },
@@ -316,6 +321,9 @@ pub struct PaneInfo {
     /// Uso vivo del panel (tokens, contexto, coste). Ausente si el panel no tiene fuente de uso.
     #[serde(default)]
     pub usage: Option<galgo_usage::PaneUsage>,
+    /// Título de la tarea que el agente declara (`galgo title`). Ausente si nunca lo declaró.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +412,7 @@ mod tests_grupos {
             workspace: ws.map(String::from),
             cwd: None,
             usage: None,
+            title: None,
         }
     }
 

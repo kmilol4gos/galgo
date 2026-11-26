@@ -281,6 +281,7 @@ mod tests {
             workspace: Some("inventia/cotizacion".into()),
             cwd: Some("/Users/alguien/secreto".into()),
             usage,
+            title: None,
         }
     }
 

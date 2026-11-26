@@ -102,6 +102,8 @@ struct Pane {
     usage_report: Option<usage::ReportData>,
     inbox: Vec<InboxMsg>,
     last_summary: Option<String>,
+    /// Título de la tarea que declara el agente (solo en memoria).
+    title: Option<String>,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
     last_blocked: Option<String>,
     /// Procesos que seguían en la sesión del panel cuando el líder salió (el líder aún sin recolectar,
@@ -162,6 +164,7 @@ impl Pane {
             usage_report: None,
             inbox,
             last_summary: None,
+            title: None,
             last_blocked: None,
             orphans: Vec::new(),
             waiting_on: None,
@@ -303,6 +306,7 @@ impl State {
             workspace: p.workspace.clone(),
             cwd: p.cwd.clone(),
             usage: usage::merged(p.usage.as_ref(), p.usage_report.as_ref()),
+            title: p.title.clone(),
         }
     }
 }
@@ -656,6 +660,7 @@ impl Daemon {
             usage_report: None,
             inbox: Vec::new(),
             last_summary: None,
+            title: None,
             last_blocked: None,
             orphans: Vec::new(),
             waiting_on: None,
@@ -1185,6 +1190,14 @@ impl Daemon {
                 Ok(json!({}))
             }
             Request::Usage { group_by } => self.usage_view(group_by.as_deref()),
+            Request::SetTitle { pane, title } => {
+                check_text("el título", &title, MAX_LABEL)?;
+                let mut st = self.state.lock().unwrap();
+                let id = st.resolve(&pane)?;
+                let title = title.trim().to_string();
+                st.panes.get_mut(&id).unwrap().title = (!title.is_empty()).then_some(title);
+                Ok(json!({}))
+            }
             Request::Wait { .. } => unreachable!("se atiende en dispatch"),
             Request::Inbox { pane } => {
                 let st = self.state.lock().unwrap();
@@ -1921,5 +1934,30 @@ mod tests_fantasmas {
         let mut st = State { epoch: 3, ..State::default() };
         st.panes.insert(2, fantasma(2, "m", None));
         assert!(st.ghost_plan("m", Some(2)).is_err());
+    }
+
+    /// Paso 2 (rex): el título de la tarea llega a la lista de paneles; uno vacío lo borra; un título con caracteres
+    /// de control se rechaza.
+    #[test]
+    fn titulo_de_la_tarea_llega_a_la_lista() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let mut p = fantasma(1, "claude", None);
+        p.ghost = false;
+        st.panes.insert(1, p);
+        let d = daemon_con(st);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(d.handle(Request::SetTitle { pane: "claude".into(), title: "  bug de ventas  ".into() })).unwrap();
+        let v = {
+            let st = d.state.lock().unwrap();
+            st.info(&st.panes[&1], 30)
+        };
+        assert_eq!(v.title.as_deref(), Some("bug de ventas"));
+        rt.block_on(d.handle(Request::SetTitle { pane: "1".into(), title: "  ".into() })).unwrap();
+        let v = {
+            let st = d.state.lock().unwrap();
+            st.info(&st.panes[&1], 30)
+        };
+        assert!(v.title.is_none(), "un título vacío lo borra");
+        assert!(rt.block_on(d.handle(Request::SetTitle { pane: "1".into(), title: "x\u{1b}[31m".into() })).is_err());
     }
 }

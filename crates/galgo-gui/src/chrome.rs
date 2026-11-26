@@ -67,54 +67,44 @@ fn split_path(path: &str) -> (String, String) {
 // ---------------------------------------------------------------------------------------------------------------
 
 /// Etiqueta corta de la insignia de atención, para la columna derecha de una fila.
-fn badge_short(b: Badge) -> (&'static str, Color) {
-    match b {
-        Badge::Blocked => ("decisión", theme::BLOCKED),
-        Badge::DoneUnread => ("sin leer", theme::DONE),
-        Badge::Orphan => ("sin confirmar", theme::FAILED),
+
+/// Cabecera de sección en minúsculas, como Rex («machines», «agents»), con un texto opcional a la derecha.
+fn lower_section<'a>(label: &'a str, right: Option<&'a str>) -> Element<'a, Message> {
+    let mut r = row![text(label).size(theme::BODY_SIZE).color(theme::MUTED)].align_y(Alignment::Center);
+    if let Some(t) = right {
+        r = r.push(Space::with_width(Length::Fill)).push(text(t).size(theme::SMALL_SIZE).color(theme::DIM));
     }
+    container(r).padding(iced::Padding { top: 10.0, bottom: 4.0, left: 8.0, right: 8.0 }).into()
 }
 
-/// Fila de un panel: punto de estado, nombre y, a la derecha, lo más útil (atención, uso o estado). Las relaciones
-/// (manager, espera, pendientes) van en una segunda línea solo si existen.
-fn pane_row<'a>(app: &'a App, pane: &'a PaneInfo, indent: f32) -> Element<'a, Message> {
+/// Estado más urgente de un grupo de paneles (el que decide el punto del proyecto).
+fn worst(panes: &[&PaneInfo]) -> Status {
+    panes.iter().map(|p| p.status).min_by_key(|s| sidebar::priority(*s)).unwrap_or(Status::Idle)
+}
+
+/// Fila de un agente en «agents»: punto de estado, nombre, título de la tarea debajo y proveedor·modelo a la derecha.
+fn agent_row<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
     let selected = app.selected == Some(pane.id);
-    let right: Element<'a, Message> = if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
-        let (label, color) = badge_short(b);
-        text(label).size(theme::SMALL_SIZE).color(color).into()
-    } else if let Some((line, color)) = pane.usage.as_ref().and_then(usage::pane_line) {
-        text(line).size(theme::SMALL_SIZE).color(color.unwrap_or(theme::DIM)).into()
-    } else if pane.status != Status::Idle {
-        text(pane.status.as_str()).size(theme::SMALL_SIZE).color(theme::DIM).into()
-    } else {
-        Space::with_width(0).into()
+    let provider = sidebar::provider(pane);
+    let who = match sidebar::model(pane) {
+        Some(m) => format!("{provider} · {m}"),
+        None => provider,
     };
-    let name_color = if selected { TEXT } else { theme::TEXT_SOFT };
+    let title = pane.title.clone().unwrap_or_else(|| pane.status.as_str().to_string());
+    let body = column![
+        text(&pane.name).size(theme::BODY_SIZE).color(if selected { TEXT } else { theme::TEXT_SOFT }).wrapping(iced::widget::text::Wrapping::None),
+        text(title).size(theme::SMALL_SIZE).color(MUTED).wrapping(iced::widget::text::Wrapping::None),
+    ]
+    .spacing(1);
     let line = row![
         dot(theme::status_color(pane.status), 7.0),
-        text(&pane.name).size(theme::BODY_SIZE).color(name_color).wrapping(iced::widget::text::Wrapping::None),
+        body,
         Space::with_width(Length::Fill),
-        right,
+        text(who).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
-    let mut notes = Vec::new();
-    if pane.orphan {
-        notes.push("entrega sin confirmar".to_string());
-    } else if pane.unacked > 0 {
-        notes.push(format!("{} pendientes", pane.unacked));
-    }
-    if let Some(manager) = &pane.manager {
-        notes.push(format!("→ {manager}"));
-    }
-    if let Some(waiting) = &pane.waiting_on {
-        notes.push(format!("espera a {waiting}"));
-    }
-    let mut content = column![line].spacing(2);
-    if !notes.is_empty() {
-        content = content.push(row![Space::with_width(15), text(notes.join(" · ")).size(10).color(theme::DIM)]);
-    }
-    theme::btn(container(content).width(Length::Fill).padding(iced::Padding { top: 5.0, bottom: 5.0, left: 8.0 + indent, right: 8.0 }).clip(true))
+    theme::btn(container(line).width(Length::Fill).padding([5, 8]).clip(true))
         .padding(0)
         .width(Length::Fill)
         .on_press(Message::Select(pane.id))
@@ -122,71 +112,52 @@ fn pane_row<'a>(app: &'a App, pane: &'a PaneInfo, indent: f32) -> Element<'a, Me
         .into()
 }
 
-/// Recuento compacto por estado: un punto de color y el número, solo de los estados presentes.
-fn status_counts<'a>(panes: &[&PaneInfo]) -> Element<'a, Message> {
-    let mut r = row![].spacing(8).align_y(Alignment::Center);
-    for s in [Status::Working, Status::Blocked, Status::Done, Status::Failed] {
-        let n = panes.iter().filter(|p| p.status == s || (s == Status::Failed && p.status == Status::Exited)).count();
-        if n > 0 {
-            r = r.push(row![dot(theme::status_color(s), 6.0), text(n.to_string()).size(theme::SMALL_SIZE).color(theme::DIM)].spacing(4).align_y(Alignment::Center));
-        }
-    }
-    r.into()
-}
-
-/// Cabecera de sección de la barra: mayúsculas pequeñas y apagadas, con un contador opcional a la derecha.
-fn section<'a>(label: String, color: Color, count: Option<usize>) -> Element<'a, Message> {
-    let mut r = row![text(label).size(10).color(color)].align_y(Alignment::Center);
-    if let Some(n) = count {
-        r = r.push(Space::with_width(Length::Fill)).push(text(n.to_string()).size(10).color(color));
-    }
-    container(r).padding(iced::Padding { top: 12.0, bottom: 4.0, left: 8.0, right: 8.0 }).into()
-}
-
 fn sidebar_list(app: &App) -> Element<'_, Message> {
     let mut list = column![].spacing(1);
-    if app.panes.is_empty() {
-        list = list.push(container(text("Sin paneles. Abre una carpeta con ⌘N.").size(theme::SMALL_SIZE).color(theme::DIM)).padding([12, 8]));
-    }
-    let needs = sidebar::needs_attention(&app.panes, |id| app.attention.is_unread(id));
-    if !needs.is_empty() {
-        list = list.push(section("TE NECESITAN".into(), theme::BLOCKED, Some(needs.len())));
-        for pane in needs {
-            list = list.push(pane_row(app, pane, 0.0));
-        }
-    }
+    // machines: Local > proyecto > rama. Un clic en la rama selecciona su primer panel.
+    list = list.push(lower_section("machines", None));
+    list = list.push(container(text("▾ Local").size(theme::BODY_SIZE).color(TEXT)).padding([3, 8]));
     for project in sidebar::tree(&app.panes) {
-        list = list.push(section(project.name.to_uppercase(), theme::DIM, None));
+        list = list.push(container(text(project.name.clone()).size(theme::BODY_SIZE).color(theme::TEXT_SOFT)).padding(iced::Padding { top: 4.0, bottom: 0.0, left: 16.0, right: 8.0 }));
         for ws in project.workspaces {
-            let key = ws.label.clone().unwrap_or_default();
-            let folded = app.collapsed.contains(&key);
-            let arrow = text(if folded { "▸" } else { "▾" }).size(12).color(MUTED).width(10);
-            let mut right = row![status_counts(&ws.panes)].spacing(8).align_y(Alignment::Center);
-            if let Some(total) = usage::group_total(&ws.panes) {
-                right = right.push(text(total).size(theme::SMALL_SIZE).color(theme::DIM));
-            }
-            let current = focus_key(app).is_some_and(|k| k == key);
+            let state = worst(&ws.panes);
+            let first = ws.panes.first().map(|p| p.id);
             let head = row![
-                arrow,
-                text(ws.name.clone()).size(theme::BODY_SIZE).color(if current { TEXT } else { theme::TEXT_SOFT }).wrapping(iced::widget::text::Wrapping::None),
-                Space::with_width(Length::Fill),
-                right,
+                dot(theme::status_color(state), 7.0),
+                text(ws.name.clone()).size(theme::SMALL_SIZE + 1.0).color(MUTED).wrapping(iced::widget::text::Wrapping::None),
             ]
-            .spacing(6)
+            .spacing(8)
             .align_y(Alignment::Center);
-            list = list.push(
-                theme::btn(container(head).width(Length::Fill).padding([5, 8]).clip(true))
-                    .padding(0)
-                    .width(Length::Fill)
-                    .on_press(Message::ToggleGroup(key))
-                    .style(theme::row(false)),
-            );
-            if !folded {
-                for pane in ws.panes {
-                    list = list.push(pane_row(app, pane, 16.0));
-                }
+            let mut item = theme::btn(container(head).width(Length::Fill).padding(iced::Padding { top: 2.0, bottom: 2.0, left: 30.0, right: 8.0 }).clip(true))
+                .padding(0)
+                .width(Length::Fill)
+                .style(theme::row(false));
+            if let Some(id) = first {
+                item = item.on_press(Message::Select(id));
             }
+            list = list.push(item);
         }
+    }
+    // Pie de «machines», como Rex: crear y menú.
+    list = list.push(
+        container(
+            row![
+                theme::btn(text("new").size(theme::SMALL_SIZE).color(MUTED)).padding([2, 6]).on_press(Message::OpenNewWorkspace),
+                text("· Local").size(theme::SMALL_SIZE).color(theme::DIM),
+                Space::with_width(Length::Fill),
+                theme::btn(text("menu").size(theme::SMALL_SIZE).color(MUTED)).padding([2, 6]).on_press(Message::OpenPalette),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .padding([4, 8]),
+    );
+    // agents · priority: todos los agentes, por prioridad.
+    list = list.push(lower_section("agents", Some("priority")));
+    if app.panes.is_empty() {
+        list = list.push(container(text("Sin agentes. Abre una carpeta con ⌘N.").size(theme::SMALL_SIZE).color(theme::DIM)).padding([8, 8]));
+    }
+    for pane in sidebar::agents_sorted(&app.panes) {
+        list = list.push(agent_row(app, pane));
     }
     container(list).padding([0, 6]).into()
 }
