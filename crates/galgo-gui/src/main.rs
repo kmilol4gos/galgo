@@ -14,6 +14,7 @@ mod layout;
 mod newpane;
 mod palette;
 mod recents;
+mod settings;
 mod sidebar;
 mod term;
 mod theme;
@@ -206,6 +207,9 @@ struct App {
     recents_path: Option<std::path::PathBuf>,
     /// Lanzador de agentes abierto.
     launcher: bool,
+    /// Ajustes abiertos: la sección elegida, y la salida de la CLI por agente (estado de hooks y planes).
+    settings: Option<settings::Section>,
+    hooks_output: std::collections::HashMap<String, String>,
     /// Paleta de comandos abierta: texto de búsqueda y resultado resaltado.
     palette: Option<String>,
     palette_cursor: usize,
@@ -297,6 +301,13 @@ enum Message {
     PaletteQuery(String),
     PaletteMove(isize),
     PaletteRun(usize),
+    /// Ajustes (Cmd+,): abrir, cerrar, elegir sección; estado o plan/instalación de hooks de un agente.
+    OpenSettings,
+    CloseSettings,
+    SettingsSection(settings::Section),
+    HooksStatus(String),
+    HooksInstall(String, bool),
+    HooksOutput(String, Result<String, String>),
 }
 
 /// Un resultado de la paleta: lo que muestra, lo que busca y lo que hace al elegirlo.
@@ -359,6 +370,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     let lower = c.as_str().to_lowercase();
     match (lower.as_str(), modifiers.shift()) {
         ("k", false) | ("p", true) => Some(Message::OpenPalette),
+        (",", false) => Some(Message::OpenSettings),
         ("n", false) => Some(Message::OpenNewWorkspace),
         ("o", false) => Some(Message::PickFolder),
         ("t", false) => Some(Message::NewTab),
@@ -952,6 +964,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 
 /// Invariante (G1): el panel seleccionado está en la pestaña activa de su workspace. Si no lo está, la pestaña
 /// activa pasa a ser la suya. Así lo que se teclea siempre va a un panel que se ve.
+/// Ejecuta `galgo` con `args` en segundo plano (no bloquea la ventana) y devuelve la salida al agente `agent`.
+fn hooks_task(agent: &str, args: Vec<String>) -> Task<Message> {
+    let agent = agent.to_string();
+    Task::perform(
+        async move {
+            let out = tokio::task::spawn_blocking(move || settings::run_galgo(&args)).await.map_err(|e| e.to_string()).and_then(|r| r);
+            (agent, out)
+        },
+        |(agent, out)| Message::HooksOutput(agent, out),
+    )
+}
+
 fn keep_focus_visible(app: &mut App) {
     // Un panel maximizado solo se mantiene mientras tiene el foco: si el foco pasa a otro (barra lateral, cierre,
     // otra pestaña), el split vuelve a verse entero y el enfocado no queda oculto.
@@ -1156,6 +1180,31 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             if n > 0 {
                 app.palette_cursor = (app.palette_cursor as isize + delta).rem_euclid(n as isize) as usize;
             }
+            Task::none()
+        }
+        Message::OpenSettings => {
+            app.settings = Some(settings::Section::General);
+            Task::none()
+        }
+        Message::CloseSettings => {
+            app.settings = None;
+            Task::none()
+        }
+        Message::SettingsSection(section) => {
+            app.settings = Some(section);
+            if section == settings::Section::Integrations {
+                return Task::batch(settings::AGENTS.iter().map(|a| hooks_task(a, settings::status_args(a))));
+            }
+            Task::none()
+        }
+        Message::HooksStatus(agent) => hooks_task(&agent, settings::status_args(&agent)),
+        Message::HooksInstall(agent, apply) => hooks_task(&agent, settings::install_args(&agent, apply)),
+        Message::HooksOutput(agent, result) => {
+            let text = match result {
+                Ok(t) => t,
+                Err(e) => format!("error: {e}"),
+            };
+            app.hooks_output.insert(agent, text);
             Task::none()
         }
         Message::PaletteRun(index) => {
@@ -1372,7 +1421,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 return update(app, Message::ToggleMaximize);
             }
             // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
-            if modifiers.command() && app.new_ws.is_none() && !app.launcher {
+            if modifiers.command() && app.new_ws.is_none() && !app.launcher && app.settings.is_none() {
                 if let Some(message) = shortcut_in_state(app, &key, modifiers) {
                     return update(app, message);
                 }
@@ -1386,10 +1435,11 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
             // Con «Nuevo workspace» o el lanzador abiertos, el teclado es suyo, no del panel.
-            if app.new_ws.is_some() || app.launcher {
+            if app.new_ws.is_some() || app.launcher || app.settings.is_some() {
                 if matches!(&key, Key::Named(Named::Escape)) {
                     app.new_ws = None;
                     app.launcher = false;
+                    app.settings = None;
                 }
                 return Task::none();
             }
@@ -1717,6 +1767,9 @@ fn view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill)
     .style(theme::surface(BG))
     .into();
+    if app.settings.is_some() {
+        return chrome::floating(base, chrome::settings_panel(app), 820.0, Message::CloseSettings);
+    }
     match body_mode(app) {
         Body::Palette => chrome::floating(base, chrome::palette_panel(app), 600.0, Message::ClosePalette),
         Body::NewWorkspace => chrome::floating(base, chrome::new_workspace_panel(app), 560.0, Message::CloseNewWorkspace),
@@ -2637,6 +2690,7 @@ mod tests {
         app.error = Some("no se envió".into());
         assert_eq!(terminal_area_for(&app), sin);
     }
+
 }
 
 /// Render headless: dibuja `view(app)` a un pixmap con el renderer de tiny-skia y guarda un PNG. No abre ventanas ni
@@ -2776,6 +2830,11 @@ mod render {
         let mut lanz = scene();
         lanz.launcher = true;
         render(&lanz, size, &dir.join("r-lanzador.png"));
+        let mut ajustes = scene();
+        ajustes.settings = Some(settings::Section::Integrations);
+        ajustes.hooks_output.insert("claude".into(), "claude: hooks de galgo instalados (3 eventos)".into());
+        ajustes.hooks_output.insert("codex".into(), "codex: no instalados".into());
+        render(&ajustes, size, &dir.join("r-ajustes.png"));
         let mut form = scene();
         form.form = Some(NewPane::default());
         render(&form, size, &dir.join("r-formulario.png"));
@@ -2808,5 +2867,24 @@ impl App {
             layouts: self.layouts.clone(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod ajustes_tests {
+    use super::*;
+
+    /// Paso 4 (rex): Cmd+, abre ajustes en la sección General; elegir otra sección la muestra; cerrar la quita.
+    #[test]
+    fn cmd_coma_abre_ajustes() {
+        let coma = Key::Character(",".into());
+        assert!(matches!(shortcut(&coma, keyboard::Modifiers::COMMAND), Some(Message::OpenSettings)));
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        let _ = update(&mut app, Message::OpenSettings);
+        assert_eq!(app.settings, Some(settings::Section::General));
+        let _ = update(&mut app, Message::SettingsSection(settings::Section::Shortcuts));
+        assert_eq!(app.settings, Some(settings::Section::Shortcuts));
+        let _ = update(&mut app, Message::CloseSettings);
+        assert!(app.settings.is_none());
     }
 }

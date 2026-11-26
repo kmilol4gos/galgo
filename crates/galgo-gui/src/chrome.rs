@@ -684,3 +684,138 @@ pub fn form_panel<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
     ]
     .into()
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Ajustes (Cmd+,)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Una fila «etiqueta: valor» de la sección de ajustes.
+fn kv<'a>(label: String, value: String) -> Element<'a, Message> {
+    row![
+        container(text(label).size(theme::SMALL_SIZE + 1.0).color(theme::DIM)).width(Length::Fixed(150.0)),
+        text(value).size(theme::SMALL_SIZE + 1.0).color(TEXT),
+    ]
+    .spacing(8)
+    .into()
+}
+
+/// Contenido de una sección de ajustes.
+fn settings_content(app: &App, section: settings::Section) -> Element<'_, Message> {
+    let mut col = column![text(section.label()).size(theme::BODY_SIZE + 1.0).color(TEXT)].spacing(8.0);
+    match section {
+        settings::Section::General => {
+            let estado = match &app.error {
+                None => "conectado al daemon".to_string(),
+                Some(e) => format!("sin conexión: {e}"),
+            };
+            col = col
+                .push(kv("Servidor".into(), estado))
+                .push(kv("Socket".into(), galgo_proto::socket_path().display().to_string()))
+                .push(kv("Recientes".into(), "junto al socket (gui-recientes.json)".into()));
+        }
+        settings::Section::Interface => {
+            col = col
+                .push(kv("Tema".into(), "cálido, oscuro".into()))
+                .push(kv("Fuente".into(), "monoespaciada en toda la interfaz".into()))
+                .push(kv("Barra de título".into(), "transparente; sesiones arriba".into()));
+        }
+        settings::Section::Terminal => {
+            col = col
+                .push(kv("Fuente del terminal".into(), "Menlo".into()))
+                .push(kv("Historial".into(), "el del daemon (scrollback)".into()))
+                .push(kv("Selección".into(), "por celda, con copia en el portapapeles".into()));
+        }
+        settings::Section::Shortcuts => {
+            for (keys, what) in settings::SHORTCUTS {
+                col = col.push(row![
+                    container(text(keys).size(theme::SMALL_SIZE + 1.0).color(theme::DIM)).width(Length::Fixed(190.0)),
+                    text(what).size(theme::SMALL_SIZE + 1.0).color(TEXT),
+                ]
+                .spacing(8));
+            }
+        }
+        settings::Section::Integrations => {
+            col = col.push(text("Hooks de cada agente: el plan se muestra antes de escribir nada.").size(theme::SMALL_SIZE).color(MUTED));
+            for agent in settings::AGENTS {
+                let salida = app.hooks_output.get(agent).cloned().unwrap_or_else(|| "consultando…".into());
+                col = col.push(
+                    column![
+                        text(agent).size(theme::BODY_SIZE).color(TEXT),
+                        text(salida).size(theme::SMALL_SIZE).color(MUTED),
+                        row![
+                            theme::btn_secondary(text("Estado").size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::HooksStatus(agent.into())),
+                            theme::btn_secondary(text("Ver plan").size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::HooksInstall(agent.into(), false)),
+                            theme::btn_secondary(text("Instalar").size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::HooksInstall(agent.into(), true)),
+                        ]
+                        .spacing(8.0),
+                    ]
+                    .spacing(4),
+                );
+            }
+        }
+        settings::Section::Notifications => {
+            col = col.push(text("Aviso de macOS cuando un agente se bloquea o termina y la ventana no tiene el foco.").size(theme::SMALL_SIZE).color(MUTED));
+        }
+        settings::Section::Usage => {
+            let now = now_secs();
+            if app.limits.is_empty() {
+                col = col.push(text("Sin cuotas observadas. Claude las informa con su statusline.").size(theme::SMALL_SIZE).color(MUTED));
+            }
+            for l in &app.limits {
+                col = col.push(text(l.agent.clone()).size(theme::BODY_SIZE).color(TEXT));
+                for r in usage::limit_rows(l, now) {
+                    col = col.push(kv(r.label.to_string(), format!("{:.0} % · {}", r.pct, r.detail)));
+                }
+            }
+            col = col.push(text("Coste por proveedor (equivalente de lista)").size(theme::SMALL_SIZE).color(MUTED));
+            for proveedor in ["claude", "codex", "pi", "opencode", "shell"] {
+                let grupo: Vec<&PaneInfo> = app.panes.iter().filter(|p| sidebar::provider(p) == proveedor).collect();
+                if grupo.is_empty() {
+                    continue;
+                }
+                let total = usage::group_total(&grupo).unwrap_or_else(|| "sin uso medido".into());
+                col = col.push(kv(proveedor.to_string(), format!("{} panel(es) · {total}", grupo.len())));
+            }
+        }
+        settings::Section::Developer => {
+            col = col
+                .push(kv("Versión de la GUI".into(), env!("CARGO_PKG_VERSION").into()))
+                .push(kv("Socket".into(), galgo_proto::socket_path().display().to_string()))
+                .push(kv("CLI usada".into(), std::env::var("GALGO_BIN").unwrap_or_else(|_| "galgo (PATH)".into())));
+        }
+    }
+    col.into()
+}
+
+/// Panel de ajustes: barra de secciones a la izquierda, contenido a la derecha. Cmd+, lo abre; Esc lo cierra.
+pub fn settings_panel(app: &App) -> Element<'_, Message> {
+    let current = app.settings.unwrap_or(settings::Section::General);
+    let mut nav = column![].spacing(2);
+    for s in settings::Section::ALL {
+        let on = s == current;
+        nav = nav.push(
+            theme::btn(container(text(s.label()).size(theme::BODY_SIZE).color(if on { TEXT } else { MUTED })).padding([6, 10]))
+                .width(Length::Fill)
+                .padding(0)
+                .on_press(Message::SettingsSection(s))
+                .style(theme::row(on)),
+        );
+    }
+    let header = row![
+        text("Ajustes").size(theme::TITLE_SIZE).color(TEXT),
+        Space::with_width(Length::Fill),
+        theme::btn(text("×").size(16).color(MUTED)).padding([0, 6]).on_press(Message::CloseSettings),
+    ]
+    .align_y(Alignment::Center);
+    let body = row![
+        container(nav).width(Length::Fixed(170.0)),
+        theme::rule(true),
+        scrollable(container(settings_content(app, current)).padding([0, 14])).width(Length::Fill).height(Length::Fill),
+    ]
+    .height(Length::Fill);
+    container(column![header, theme::rule(false), body].spacing(10).padding(14))
+        .width(Length::Fixed(820.0))
+        .height(Length::Fixed(540.0))
+        .style(theme::surface(SIDEBAR))
+        .into()
+}
