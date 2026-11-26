@@ -1834,6 +1834,12 @@ pub const SYMBOLS_FAMILY: &str = "Symbols Nerd Font Mono";
 /// Bytes de la fuente de símbolos, que se cargan al arrancar.
 static SYMBOLS_FONT: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
 
+/// Columnas que ocupa un carácter en la pantalla, según el ancho Unicode que usa el parser vt100: 2 para los anchos
+/// (CJK, emoji), 0 para los combinados (que se pegan a la celda anterior) y 1 para el resto.
+fn cells_of(ch: char) -> u16 {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16
+}
+
 /// Carácter de área privada (iconos Nerd Font, separadores powerline): sus glifos no los tienen las fuentes de texto,
 /// así que el fallback del sistema los elige al azar. Se dibujan con la familia de símbolos (punto 2).
 fn is_symbol(ch: char) -> bool {
@@ -1886,7 +1892,8 @@ fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>
             chunk_mark = mark;
             chunk_symbol = symbol;
             chunk.push(ch);
-            col += 1;
+            // Punto 4: avanza lo que ocupa en la celda (2 para CJK, 0 para combinados), como el parser vt100.
+            col += cells_of(ch);
         }
         if !chunk.is_empty() {
             out.push(styled(chunk, r, chunk_mark, chunk_symbol));
@@ -3354,5 +3361,19 @@ mod simbolos_tests {
         assert!(!is_symbol('a'));
         assert!(!is_symbol('█'));
         assert_eq!(&SYMBOLS_FONT[0..4], &[0x00, 0x01, 0x00, 0x00]);
+    }
+}
+
+#[cfg(test)]
+mod anchos_tests {
+    use super::*;
+
+    /// Punto 4 (fuente): un carácter ancho ocupa dos columnas, un combinado ninguna, y un símbolo de área privada una.
+    #[test]
+    fn caracteres_anchos_ocupan_lo_que_dice_vt100() {
+        assert_eq!(cells_of('中'), 2);
+        assert_eq!(cells_of('\u{301}'), 0, "el acento combinado no avanza");
+        assert_eq!(cells_of('a'), 1);
+        assert_eq!(cells_of('\u{e0b0}'), 1, "el separador powerline ocupa una celda");
     }
 }
