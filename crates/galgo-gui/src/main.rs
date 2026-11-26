@@ -212,6 +212,10 @@ struct App {
     /// Ajustes abiertos: la sección elegida, y la salida de la CLI por agente (estado de hooks y planes).
     settings: Option<settings::Section>,
     hooks_output: std::collections::HashMap<String, String>,
+    /// Plan de hooks (`--dry-run`) pendiente de «Aplicar», por agente. Sin plan no se escribe nada (A1).
+    hooks_plan: std::collections::HashMap<String, String>,
+    /// Agentes con una orden de hooks en curso: sus botones se desactivan (B5).
+    hooks_busy: std::collections::HashSet<String>,
     /// Paleta de comandos abierta: texto de búsqueda y resultado resaltado.
     palette: Option<String>,
     palette_cursor: usize,
@@ -310,7 +314,13 @@ enum Message {
     CloseSettings,
     SettingsSection(settings::Section),
     HooksStatus(String),
-    HooksInstall(String, bool),
+    /// Pide el plan (`--dry-run`) para instalar; se muestra y hay que aplicarlo aparte.
+    HooksPlan(String),
+    HooksPlanned(String, Result<String, String>),
+    /// Aplica el plan pendiente (`--yes`). Sin plan, no hace nada.
+    HooksApply(String),
+    HooksApplied(String, Result<String, String>),
+    HooksCancel(String),
     HooksOutput(String, Result<String, String>),
 }
 
@@ -969,6 +979,30 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 
 /// Invariante (G1): el panel seleccionado está en la pestaña activa de su workspace. Si no lo está, la pestaña
 /// activa pasa a ser la suya. Así lo que se teclea siempre va a un panel que se ve.
+/// Plan de hooks: `galgo hooks install <agente> --dry-run`, en segundo plano.
+fn hooks_plan_task(agent: &str, args: Vec<String>) -> Task<Message> {
+    let agent = agent.to_string();
+    Task::perform(
+        async move {
+            let out = tokio::task::spawn_blocking(move || settings::run_galgo(&args)).await.map_err(|e| e.to_string()).and_then(|r| r);
+            (agent, out)
+        },
+        |(agent, out)| Message::HooksPlanned(agent, out),
+    )
+}
+
+/// Aplicar hooks: `galgo hooks install <agente> --yes`, en segundo plano; solo tras un plan visto.
+fn hooks_task_apply(agent: &str, args: Vec<String>) -> Task<Message> {
+    let agent = agent.to_string();
+    Task::perform(
+        async move {
+            let out = tokio::task::spawn_blocking(move || settings::run_galgo(&args)).await.map_err(|e| e.to_string()).and_then(|r| r);
+            (agent, out)
+        },
+        |(agent, out)| Message::HooksApplied(agent, out),
+    )
+}
+
 /// Ejecuta `galgo` con `args` en segundo plano (no bloquea la ventana) y devuelve la salida al agente `agent`.
 fn hooks_task(agent: &str, args: Vec<String>) -> Task<Message> {
     let agent = agent.to_string();
@@ -1202,9 +1236,55 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::HooksStatus(agent) => hooks_task(&agent, settings::status_args(&agent)),
-        Message::HooksInstall(agent, apply) => hooks_task(&agent, settings::install_args(&agent, apply)),
+        Message::HooksStatus(agent) => {
+            // Consultar el estado invalida el plan: lo que se aplicaría ya no es lo que hay (A1).
+            app.hooks_plan.remove(&agent);
+            if !app.hooks_busy.insert(agent.clone()) {
+                return Task::none();
+            }
+            hooks_task(&agent, settings::status_args(&agent))
+        }
+        Message::HooksPlan(agent) => {
+            if !app.hooks_busy.insert(agent.clone()) {
+                return Task::none();
+            }
+            hooks_plan_task(&agent, settings::install_args(&agent, false))
+        }
+        Message::HooksPlanned(agent, result) => {
+            app.hooks_busy.remove(&agent);
+            match result {
+                Ok(plan) => {
+                    app.hooks_plan.insert(agent, plan);
+                }
+                Err(e) => {
+                    app.hooks_output.insert(agent, format!("error: {e}"));
+                }
+            }
+            Task::none()
+        }
+        Message::HooksApply(agent) => {
+            // Sin un plan visto por el usuario no se escribe nada.
+            if !app.hooks_plan.contains_key(&agent) || !app.hooks_busy.insert(agent.clone()) {
+                return Task::none();
+            }
+            hooks_task_apply(&agent, settings::install_args(&agent, true))
+        }
+        Message::HooksApplied(agent, result) => {
+            app.hooks_busy.remove(&agent);
+            app.hooks_plan.remove(&agent);
+            let text = match result {
+                Ok(t) => t,
+                Err(e) => format!("error: {e}"),
+            };
+            app.hooks_output.insert(agent, text);
+            Task::none()
+        }
+        Message::HooksCancel(agent) => {
+            app.hooks_plan.remove(&agent);
+            Task::none()
+        }
         Message::HooksOutput(agent, result) => {
+            app.hooks_busy.remove(&agent);
             let text = match result {
                 Ok(t) => t,
                 Err(e) => format!("error: {e}"),
@@ -2930,5 +3010,45 @@ mod lanzador_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod hooks_tests {
+    use super::*;
+
+    /// A1 (review-14): «Aplicar» sin un plan visto no escribe nada.
+    #[test]
+    fn r14_instalar_no_escribe_sin_plan() {
+        let mut app = App::default();
+        let _ = update(&mut app, Message::HooksApply("claude".into()));
+        assert!(app.hooks_busy.is_empty(), "sin plan no hay orden de escritura");
+        assert!(app.hooks_plan.is_empty());
+    }
+
+    /// A1: el plan se guarda al pedirlo; «Aplicar» lo consume y deja el agente libre al terminar.
+    #[test]
+    fn r14_plan_y_aplicar() {
+        let mut app = App::default();
+        let _ = update(&mut app, Message::HooksPlanned("claude".into(), Ok("+ hook PreToolUse".into())));
+        assert_eq!(app.hooks_plan.get("claude").map(String::as_str), Some("+ hook PreToolUse"));
+        let _ = update(&mut app, Message::HooksApply("claude".into()));
+        assert!(app.hooks_busy.contains("claude"));
+        let _ = update(&mut app, Message::HooksApplied("claude".into(), Ok("instalado".into())));
+        assert!(app.hooks_plan.is_empty(), "el plan se consume al aplicarlo");
+        assert!(app.hooks_busy.is_empty());
+    }
+
+    /// A1: consultar el estado invalida el plan, y cancelar lo quita.
+    #[test]
+    fn r14_estado_y_cancelar_invalidan_el_plan() {
+        let mut app = App::default();
+        let _ = update(&mut app, Message::HooksPlanned("codex".into(), Ok("plan".into())));
+        let _ = update(&mut app, Message::HooksStatus("codex".into()));
+        assert!(app.hooks_plan.is_empty(), "el estado nuevo no se aplica con un plan viejo");
+        let _ = update(&mut app, Message::HooksOutput("codex".into(), Ok("no instalados".into())));
+        let _ = update(&mut app, Message::HooksPlanned("codex".into(), Ok("plan".into())));
+        let _ = update(&mut app, Message::HooksCancel("codex".into()));
+        assert!(app.hooks_plan.is_empty());
     }
 }

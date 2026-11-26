@@ -749,22 +749,28 @@ fn settings_content(app: &App, section: settings::Section) -> Element<'_, Messag
             }
         }
         settings::Section::Integrations => {
-            col = col.push(text("Hooks de cada agente: el plan se muestra antes de escribir nada.").size(theme::SMALL_SIZE).color(MUTED));
+            let destino = match settings::hooks_binary() {
+                Ok(bin) => format!("Los hooks apuntarán a: {bin}"),
+                Err(e) => format!("No se pueden instalar hooks: {e}"),
+            };
+            col = col.push(text(destino).size(theme::SMALL_SIZE).color(MUTED));
+            col = col.push(text("Instalar muestra el plan (sin escribir nada). Solo «Aplicar» escribe la configuración del agente.").size(theme::SMALL_SIZE).color(MUTED));
             for agent in settings::AGENTS {
+                let busy = app.hooks_busy.contains(agent);
                 let salida = app.hooks_output.get(agent).cloned().unwrap_or_else(|| "consultando…".into());
-                col = col.push(
-                    column![
-                        text(agent).size(theme::BODY_SIZE).color(TEXT),
-                        text(salida).size(theme::SMALL_SIZE).color(MUTED),
-                        row![
-                            theme::btn_secondary(text("Estado").size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::HooksStatus(agent.into())),
-                            theme::btn_secondary(text("Ver plan").size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::HooksInstall(agent.into(), false)),
-                            theme::btn_secondary(text("Instalar").size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::HooksInstall(agent.into(), true)),
-                        ]
-                        .spacing(8.0),
-                    ]
-                    .spacing(4),
-                );
+                let mut acciones = row![
+                    enabled_btn("Estado", !busy, Message::HooksStatus(agent.into())),
+                    enabled_btn("Instalar…", !busy, Message::HooksPlan(agent.into())),
+                ]
+                .spacing(8.0);
+                let mut bloque = column![text(agent).size(theme::BODY_SIZE).color(TEXT), text(salida).size(theme::SMALL_SIZE).color(MUTED)].spacing(4);
+                if let Some(plan) = app.hooks_plan.get(agent) {
+                    bloque = bloque.push(text(plan.clone()).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT));
+                    acciones = acciones
+                        .push(enabled_btn("Aplicar", !busy, Message::HooksApply(agent.into())))
+                        .push(enabled_btn("Cancelar", true, Message::HooksCancel(agent.into())));
+                }
+                col = col.push(bloque.push(acciones));
             }
         }
         settings::Section::Notifications => {
@@ -799,6 +805,12 @@ fn settings_content(app: &App, section: settings::Section) -> Element<'_, Messag
         }
     }
     col.into()
+}
+
+/// Botón secundario que solo responde si `enabled` (B5: sin órdenes solapadas para el mismo agente).
+fn enabled_btn<'a>(label: &'a str, enabled: bool, message: Message) -> Element<'a, Message> {
+    let b = theme::btn_secondary(text(label).size(theme::SMALL_SIZE)).padding([4, 10]);
+    if enabled { b.on_press(message).into() } else { b.into() }
 }
 
 /// Panel de ajustes: barra de secciones a la izquierda, contenido a la derecha. Cmd+, lo abre; Esc lo cierra.

@@ -1,6 +1,8 @@
 //! Ajustes (Cmd+,): secciones y órdenes de la CLI que usa la ventana. Lógica pura: no lee ni escribe la configuración
 //! de los agentes; eso lo hace `galgo hooks` cuando el usuario pulsa un botón.
 
+use std::path::PathBuf;
+
 /// Secciones del panel de ajustes, en el orden de la barra izquierda.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -73,9 +75,37 @@ pub const SHORTCUTS: [(&str, &str); 14] = [
     ("Esc", "Cerrar paleta, lanzador o ajustes"),
 ];
 
-/// Ejecuta `galgo` con `args` y devuelve su salida (stdout y stderr juntos). `GALGO_BIN` elige el binario.
+/// Ruta del binario que escribirá los hooks. Los hooks guardan la ruta del propio binario: si es una copia dentro
+/// de la `.app` (App Translocation, o un bundle que se mueve), desaparece y los hooks fallan en silencio. Por eso
+/// se prefiere `~/.galgo/bin/galgo` y se rechaza cualquier ruta dentro de un `.app`.
+pub fn hooks_binary() -> Result<String, String> {
+    if let Some(bin) = std::env::var_os("GALGO_BIN") {
+        return checked_binary(&PathBuf::from(bin));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let stable = PathBuf::from(home).join(".galgo/bin/galgo");
+        if stable.is_file() {
+            return checked_binary(&stable);
+        }
+    }
+    let found = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("galgo")).find(|c| c.is_file()))
+        .ok_or_else(|| "no encuentro galgo: instálalo en ~/.galgo/bin/galgo".to_string())?;
+    checked_binary(&found)
+}
+
+/// Acepta una ruta fuera de cualquier `.app` y de App Translocation; el resto se rechaza con el motivo.
+pub fn checked_binary(path: &std::path::Path) -> Result<String, String> {
+    let text = path.to_string_lossy().into_owned();
+    if text.contains("AppTranslocation") || text.contains(".app/Contents/") {
+        return Err(format!("{text} está dentro de la app y puede ser temporal; instala galgo en ~/.galgo/bin/galgo"));
+    }
+    Ok(text)
+}
+
+/// Ejecuta `galgo` con `args` y devuelve su salida (stdout y stderr juntos), con el binario de `hooks_binary`.
 pub fn run_galgo(args: &[String]) -> Result<String, String> {
-    let bin = std::env::var("GALGO_BIN").unwrap_or_else(|_| "galgo".into());
+    let bin = hooks_binary()?;
     let out = std::process::Command::new(&bin).args(args).output().map_err(|e| format!("no pude ejecutar {bin}: {e}"))?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -111,5 +141,13 @@ mod tests {
     fn atajos_incluyen_los_basicos() {
         assert!(SHORTCUTS.iter().any(|(k, _)| *k == "Cmd+N"));
         assert!(SHORTCUTS.iter().any(|(k, _)| *k == "Cmd+,"));
+    }
+
+    /// A2 (review-14): los hooks no se escriben con una copia dentro de la `.app`; la ruta de `~/.galgo/bin` sí vale.
+    #[test]
+    fn ruta_de_hooks_fuera_de_la_app() {
+        assert!(checked_binary(std::path::Path::new("/private/var/folders/x/AppTranslocation/U/d/galgo.app/Contents/MacOS/galgo")).is_err());
+        assert!(checked_binary(std::path::Path::new("/Applications/galgo.app/Contents/MacOS/galgo")).is_err());
+        assert_eq!(checked_binary(std::path::Path::new("/Users/x/.galgo/bin/galgo")).unwrap(), "/Users/x/.galgo/bin/galgo");
     }
 }
