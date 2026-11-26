@@ -598,6 +598,11 @@ pub fn palette_panel(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+/// Modelo que muestra y lanza el desplegable de un agente: el elegido, o «predeterminado» si no hay elección (M2).
+pub fn launcher_choice(app: &App, agent: launch::Agent) -> String {
+    app.launch_model.get(agent.label()).cloned().unwrap_or_else(|| launch::DEFAULT_MODEL.to_string())
+}
+
 pub fn launcher_panel(app: &App) -> Element<'_, Message> {
     let (workspace, cwd) = focus_context(app);
     let target = format!("{} · {}", workspace.as_deref().unwrap_or("sin workspace"), cwd.as_deref().map(tilde).unwrap_or_else(|| "~".into()));
@@ -623,8 +628,9 @@ pub fn launcher_panel(app: &App) -> Element<'_, Message> {
         let mut fila = row![launch_row].spacing(6).align_y(Alignment::Center);
         if !models.is_empty() {
             let label = agent.label().to_string();
-            let options: Vec<String> = models.iter().map(|m| m.to_string()).collect();
-            let elegido = app.launch_model.get(agent.label()).cloned().or_else(|| options.first().cloned());
+            // M2: la primera opción es «predeterminado»; lo que se muestra es lo que se lanza.
+            let options: Vec<String> = std::iter::once(launch::DEFAULT_MODEL.to_string()).chain(models.iter().map(|m| m.to_string())).collect();
+            let elegido = Some(launcher_choice(app, *agent));
             fila = fila.push(
                 pick_list(options, elegido, move |m| Message::LauncherModel(label.clone(), m))
                     .text_size(theme::SMALL_SIZE + 1.0)

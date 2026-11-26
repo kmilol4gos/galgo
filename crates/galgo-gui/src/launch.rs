@@ -13,6 +13,9 @@ pub fn free_name(base: &str, taken: &[&str]) -> String {
         .unwrap_or_else(|| base.to_string())
 }
 
+/// Opción del desplegable de modelo que no pasa ningún modelo: el que trae el agente por defecto (M2).
+pub const DEFAULT_MODEL: &str = "predeterminado";
+
 /// Lo que se puede lanzar desde el lanzador: un agente conocido o un shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {

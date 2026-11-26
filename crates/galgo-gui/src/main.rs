@@ -470,7 +470,7 @@ fn context_request(app: &App, agent: launch::Agent) -> galgo_proto::Request {
     let (workspace, cwd) = focus_context(app);
     let cwd = cwd.unwrap_or_else(home_dir);
     let name = launch::free_name(agent.label(), &names(app));
-    let model = app.launch_model.get(agent.label()).map(String::as_str);
+    let model = app.launch_model.get(agent.label()).map(String::as_str).filter(|m| *m != launch::DEFAULT_MODEL);
     launch::spawn_request(&name, agent.command_with(&login_shell(), model), &cwd, workspace, rows, cols)
 }
 
@@ -1315,7 +1315,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             spawn_task(app, req)
         }
         Message::LauncherModel(agent, model) => {
-            app.launch_model.insert(agent, model);
+            // «predeterminado» quita la elección: el agente arranca con su modelo por defecto (M2).
+            if model == launch::DEFAULT_MODEL {
+                app.launch_model.remove(&agent);
+            } else {
+                app.launch_model.insert(agent, model);
+            }
             Task::none()
         }
         Message::OpenNewWorkspace => {
@@ -3071,5 +3076,28 @@ mod atencion_tests {
         app.attention.mark_read(1);
         let (texto, _) = chrome::agent_side(&app, &working);
         assert!(!texto.contains("sin leer"), "{texto}");
+    }
+}
+
+#[cfg(test)]
+mod modelo_tests {
+    use super::*;
+
+    /// M2 (review-14): sin elección, el desplegable dice «predeterminado» y el comando no lleva modelo.
+    #[test]
+    fn r14_predeterminado_no_pasa_modelo() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        assert_eq!(chrome::launcher_choice(&app, launch::Agent::Claude), launch::DEFAULT_MODEL);
+        match context_request(&app, launch::Agent::Claude) {
+            galgo_proto::Request::Spawn { cmd, .. } => assert_eq!(cmd, vec!["claude"]),
+            other => panic!("{other:?}"),
+        }
+        let _ = update(&mut app, Message::LauncherModel("claude".into(), "opus".into()));
+        assert_eq!(chrome::launcher_choice(&app, launch::Agent::Claude), "opus");
+        let _ = update(&mut app, Message::LauncherModel("claude".into(), launch::DEFAULT_MODEL.into()));
+        match context_request(&app, launch::Agent::Claude) {
+            galgo_proto::Request::Spawn { cmd, .. } => assert_eq!(cmd, vec!["claude"], "volver a predeterminado quita el flag"),
+            other => panic!("{other:?}"),
+        }
     }
 }
