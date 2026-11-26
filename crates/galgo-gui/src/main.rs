@@ -46,7 +46,9 @@ const ZOOM_MAX: i32 = 12;
 /// (tamaño de letra, alto de línea, ancho de celda) para un paso de zoom: proporcionales a los de base.
 fn metrics_for(zoom: i32) -> (f32, f32, f32) {
     let size = FONT_SIZE + zoom as f32;
-    (size, (size * LINE_H / FONT_SIZE).round(), size * CELL_W / FONT_SIZE)
+    // Punto 3: el alto de línea y el ancho de celda salen de la fuente en uso, no de constantes de Menlo.
+    let (cell_em, line_em) = fonts::metrics();
+    ((size), (size * line_em).round(), size * cell_em)
 }
 
 fn zoom() -> i32 {
@@ -2435,7 +2437,10 @@ mod tests {
     /// El zoom escala la letra, la línea y la celda en proporción; Cmd+= / Cmd+- / Cmd+0 lo manejan.
     #[test]
     fn zoom_de_la_letra() {
-        assert_eq!(metrics_for(0), (FONT_SIZE, LINE_H, CELL_W));
+        let (size, line, cell) = metrics_for(0);
+        assert_eq!(size, FONT_SIZE);
+        assert!((line - LINE_H).abs() < 1.0, "alto {line}");
+        assert!((cell - CELL_W).abs() < 0.05, "ancho {cell}");
         let (size, line, cell) = metrics_for(4);
         assert_eq!(size, FONT_SIZE + 4.0);
         assert!(line > LINE_H && cell > CELL_W);

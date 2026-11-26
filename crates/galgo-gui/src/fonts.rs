@@ -45,13 +45,47 @@ pub fn automatic(installed: &[&'static str]) -> &'static str {
 
 /// Fuente del terminal en uso. Empieza en Menlo; `main` la fija con la detección o con la elección guardada.
 static CURRENT: RwLock<&'static str> = RwLock::new("Menlo");
+/// Métricas de la fuente en uso, en em: (ancho de celda, alto de línea). Por defecto, las de Menlo (8,43 px y 18 px a 14).
+static METRICS: RwLock<(f32, f32)> = RwLock::new((8.43 / 14.0, 18.0 / 14.0));
 
 pub fn current() -> &'static str {
     *CURRENT.read().unwrap()
 }
 
+/// Ancho de celda y alto de línea de la fuente en uso, en em (punto 3: salen de la fuente, no de Menlo fijo).
+pub fn metrics() -> (f32, f32) {
+    *METRICS.read().unwrap()
+}
+
+/// Fija la fuente en uso y sus métricas, leídas del archivo de la fuente. Si no se pueden leer, se quedan las de Menlo.
 pub fn set_current(family: &'static str) {
     *CURRENT.write().unwrap() = family;
+    if let Some(m) = file_for(family, &font_dirs()).and_then(|f| metrics_from_file(&f)) {
+        *METRICS.write().unwrap() = m;
+    }
+}
+
+/// Archivo de la familia dentro de `dirs` (el de su prefijo, con preferencia por el Regular).
+pub fn file_for(family: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let prefijo = CANDIDATES.iter().find(|(f, _)| *f == family)?.1;
+    let mut hallados: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect::<Vec<_>>())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefijo)))
+        .collect();
+    hallados.sort_by_key(|p| !p.to_string_lossy().contains("Regular"));
+    hallados.into_iter().next()
+}
+
+/// Ancho de celda (em de la letra M) y alto de línea (ascendente − descendente + interlineado) de un archivo de fuente.
+pub fn metrics_from_file(path: &Path) -> Option<(f32, f32)> {
+    let data = std::fs::read(path).ok()?;
+    let face = ttf_parser::Face::parse(&data, 0).ok()?;
+    let upm = face.units_per_em() as f32;
+    let adv = face.glyph_index('M').and_then(|g| face.glyph_hor_advance(g))? as f32;
+    let alto = (face.ascender() as f32 - face.descender() as f32 + face.line_gap() as f32) / upm;
+    (adv > 0.0 && alto > 0.0).then_some((adv / upm, alto))
 }
 
 /// Elección guardada del usuario ("automática" = no hay elección). Archivo junto al socket, 0600.
@@ -102,6 +136,18 @@ mod tests {
         assert_eq!(automatic(&detect(std::slice::from_ref(&vacia))), "Menlo");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&vacia);
+    }
+
+    /// La elección se guarda y se vuelve a leer; una elección "automática" vuelve a null.
+    /// Punto 3: el ancho de celda sale de la fuente. Menlo mide 0,602 em de ancho; si la máquina no tiene Menlo, la
+    /// prueba no aplica.
+    #[test]
+    fn metricas_salen_de_la_fuente() {
+        let menlo = PathBuf::from("/System/Library/Fonts/Menlo.ttc");
+        if let Some((cell, line)) = metrics_from_file(&menlo) {
+            assert!((cell - 0.602).abs() < 0.01, "ancho de celda {cell}");
+            assert!(line > 1.0 && line < 1.6, "alto de línea {line}");
+        }
     }
 
     /// La elección se guarda y se vuelve a leer; una elección "automática" vuelve a null.
