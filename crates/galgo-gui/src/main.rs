@@ -1827,7 +1827,18 @@ enum Mark {
 const SELECTION_BG: Color = Color::from_rgb(0.153, 0.243, 0.420);
 
 /// Un tramo de texto con el estilo de `r` y la marca de celda.
-fn styled(text: String, r: &Run, mark: Mark) -> Span<'static, Message> {
+/// Familia de los símbolos Nerd Font empaquetados (Symbols Nerd Font Mono, licencia OFL en `assets/`).
+pub const SYMBOLS_FAMILY: &str = "Symbols Nerd Font Mono";
+/// Bytes de la fuente de símbolos, que se cargan al arrancar.
+static SYMBOLS_FONT: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
+
+/// Carácter de área privada (iconos Nerd Font, separadores powerline): sus glifos no los tienen las fuentes de texto,
+/// así que el fallback del sistema los elige al azar. Se dibujan con la familia de símbolos (punto 2).
+fn is_symbol(ch: char) -> bool {
+    matches!(ch, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
+}
+
+fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Message> {
     let (mut fg, mut bg) = (term::color(r.fg), term::color(r.bg));
     if r.inverse ^ (mark == Mark::Cursor) {
         let (f, b) = (bg.unwrap_or(term::DEFAULT_BG), fg.unwrap_or(term::DEFAULT_FG));
@@ -1839,7 +1850,9 @@ fn styled(text: String, r: &Run, mark: Mark) -> Span<'static, Message> {
     }
     let mut sp: Span<'static, Message> = span(text).color(fg.unwrap_or(term::DEFAULT_FG)).underline(r.underline);
     if let Some(b) = bg { sp = sp.background(b); }
-    if r.bold || r.italic {
+    if symbol {
+        sp = sp.font(Font::with_name(SYMBOLS_FAMILY));
+    } else if r.bold || r.italic {
         sp = sp.font(Font {
             weight: if r.bold { font::Weight::Bold } else { font::Weight::Normal },
             style: if r.italic { font::Style::Italic } else { font::Style::Normal },
@@ -1855,6 +1868,7 @@ fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>
     for r in runs {
         let mut chunk = String::new();
         let mut chunk_mark = Mark::Normal;
+        let mut chunk_symbol = false;
         for ch in r.t.chars() {
             let mark = if cursor_col == Some(col) {
                 Mark::Cursor
@@ -1863,15 +1877,17 @@ fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>
             } else {
                 Mark::Normal
             };
-            if !chunk.is_empty() && mark != chunk_mark {
-                out.push(styled(std::mem::take(&mut chunk), r, chunk_mark));
+            let symbol = is_symbol(ch);
+            if !chunk.is_empty() && (mark != chunk_mark || symbol != chunk_symbol) {
+                out.push(styled(std::mem::take(&mut chunk), r, chunk_mark, chunk_symbol));
             }
             chunk_mark = mark;
+            chunk_symbol = symbol;
             chunk.push(ch);
             col += 1;
         }
         if !chunk.is_empty() {
-            out.push(styled(chunk, r, chunk_mark));
+            out.push(styled(chunk, r, chunk_mark, chunk_symbol));
         }
     }
     if out.is_empty() { out.push(span(" ".to_string())); }
@@ -1976,7 +1992,9 @@ fn main() -> iced::Result {
                 prefs_path: Some(prefs),
                 ..Default::default()
             };
-            (app, Task::batch([load_panes(), load_limits()]))
+            // Símbolos Nerd Font empaquetados: se cargan en el sistema de fuentes antes de usarse.
+            let simbolos = iced::font::load(std::borrow::Cow::Borrowed(SYMBOLS_FONT)).map(|_| Message::Echo);
+            (app, Task::batch([load_panes(), load_limits(), simbolos]))
         })
 }
 
@@ -2969,6 +2987,64 @@ mod render {
         app
     }
 
+    /// Prompt tipo powerlevel10k: segmentos con fondo, separadores powerline y iconos de Nerd Font.
+    fn prompt_p10k() -> Snapshot {
+        let run = |t: &str, bg: Option<(u8, u8, u8)>, fg: (u8, u8, u8)| Run {
+            t: t.into(),
+            fg: galgo_proto::Color::Rgb(fg.0, fg.1, fg.2),
+            bg: bg.map_or(galgo_proto::Color::Default, |b| galgo_proto::Color::Rgb(b.0, b.1, b.2)),
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        };
+        let azul = (0x3a, 0x5f, 0x8a);
+        let gris = (0x5a, 0x6e, 0x82);
+        let blanco = (0xee, 0xee, 0xee);
+        let line0 = vec![
+            run(" \u{f179} ", Some(azul), blanco),
+            run("\u{e0b0}", Some(gris), azul),
+            run(" \u{f015} ~ ", Some(gris), blanco),
+            run("\u{e0b0}", None, gris),
+            run("     ", None, blanco),
+            run("\u{e0b2}", None, azul),
+            run(" \u{f017} 18:42:34 ", Some(azul), blanco),
+            run("\u{e0b0}", None, azul),
+        ];
+        let line1 = vec![run("\u{276f} ", None, (0x7f, 0xd0, 0x6a)), run("ls -la", None, blanco)];
+        Snapshot {
+            gen: 0,
+            rows: 2,
+            cols: 80,
+            cursor: (1, 8),
+            cursor_hidden: false,
+            lines: vec![line0, line1],
+            scrollback: 0,
+            scrollback_max: 0,
+            bracketed_paste: false,
+            wrapped: vec![false, false],
+        }
+    }
+
+    /// Render del prompt p10k con cada fuente disponible (para comparar a ojo).
+    #[test]
+    #[ignore]
+    fn render_prompt_p10k() {
+        let dir = std::path::PathBuf::from(std::env::var("GALGO_UX_DIR").unwrap_or_else(|_| "/tmp/galgo-ux".into()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App { window: (900.0, 220.0), panes: vec![pane_info(1, "shell", Status::Idle)], selected: Some(1), snap: Some(prompt_p10k()), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        // Experimento: Menlo con los símbolos empaquetados cargados en el sistema de fuentes de iced.
+        iced_graphics::text::font_system().write().unwrap().load_font(std::borrow::Cow::Borrowed(SYMBOLS_FONT));
+        for familia in ["Menlo", "MesloLGLDZ Nerd Font Mono"] {
+            let nombre: &'static str = fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == familia).unwrap_or("Menlo");
+            fonts::set_current(nombre);
+            let archivo = format!("p10k-{}-simbolos-en-span.png", familia.replace(' ', "_"));
+            render(&app, (900, 220), &dir.join(archivo));
+        }
+        fonts::set_current("Menlo");
+    }
+
     #[test]
     #[ignore]
     fn render_capturas() {
@@ -3257,5 +3333,21 @@ mod r14_b_tests {
         let _ = update(&mut app, Message::Echo);
         assert!(app.loading, "pide la pantalla del enfocado");
         assert!(app.others_loading.is_empty(), "no pide a los demás paneles");
+    }
+}
+
+#[cfg(test)]
+mod simbolos_tests {
+    use super::*;
+
+    /// Punto 2 (fuente): los iconos y separadores de área privada van con la familia de símbolos; el texto normal no.
+    /// El asset empaquetado es una fuente TrueType válida.
+    #[test]
+    fn simbolos_van_con_su_familia_y_el_asset_es_ttf() {
+        assert!(is_symbol('\u{e0b0}'));
+        assert!(is_symbol('\u{f179}'));
+        assert!(!is_symbol('a'));
+        assert!(!is_symbol('█'));
+        assert_eq!(&SYMBOLS_FONT[0..4], &[0x00, 0x01, 0x00, 0x00]);
     }
 }
