@@ -83,13 +83,27 @@ fn worst(panes: &[&PaneInfo]) -> Status {
 }
 
 /// Fila de un agente en «agents»: punto de estado, nombre, título de la tarea debajo y proveedor·modelo a la derecha.
-fn agent_row<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
-    let selected = app.selected == Some(pane.id);
+/// Texto del lado derecho de una fila de agente: la insignia de atención si la hay (M1), o proveedor·modelo.
+pub fn agent_side(app: &App, pane: &PaneInfo) -> (String, Color) {
+    if let Some(b) = attention::badge(pane, app.attention.is_unread(pane.id)) {
+        let (label, color) = match b {
+            attention::Badge::Blocked => ("necesita decisión", theme::BLOCKED),
+            attention::Badge::DoneUnread => ("sin leer", theme::DONE),
+            attention::Badge::Orphan => ("sin confirmar", theme::FAILED),
+        };
+        return (label.to_string(), color);
+    }
     let provider = sidebar::provider(pane);
     let who = match sidebar::model(pane) {
         Some(m) => format!("{provider} · {m}"),
         None => provider,
     };
+    (who, theme::DIM)
+}
+
+fn agent_row<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
+    let selected = app.selected == Some(pane.id);
+    let (side, side_color) = agent_side(app, pane);
     let title = pane.title.clone().unwrap_or_else(|| pane.status.as_str().to_string());
     let body = column![
         text(&pane.name).size(theme::BODY_SIZE).color(if selected { TEXT } else { theme::TEXT_SOFT }).wrapping(iced::widget::text::Wrapping::None),
@@ -100,7 +114,7 @@ fn agent_row<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
         dot(theme::status_color(pane.status), 7.0),
         body,
         Space::with_width(Length::Fill),
-        text(who).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None),
+        text(side).size(theme::SMALL_SIZE).color(side_color).wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -198,9 +212,16 @@ fn limits_footer(app: &App) -> Element<'_, Message> {
 /// y a la derecha las acciones. El hueco de la izquierda deja sitio a los semáforos de macOS.
 pub fn session_bar(app: &App) -> Element<'_, Message> {
     let current = focus_key(app);
-    let mut bar = row![Space::with_width(78.0), text("galgo").size(theme::BODY_SIZE).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT), Space::with_width(12.0)]
+    // M1: la ventana no muestra «(n)» en la barra de título (título oculto): el contador va aquí.
+    let atencion = app.attention.count(&app.panes);
+    let mut bar = row![Space::with_width(78.0), text("galgo").size(theme::BODY_SIZE).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT)]
+        .spacing(8)
         .align_y(Alignment::Center)
         .height(TABS_H);
+    if atencion > 0 {
+        bar = bar.push(text(atencion.to_string()).size(theme::SMALL_SIZE).color(theme::BLOCKED));
+    }
+    bar = bar.push(Space::with_width(12.0));
     for (i, ws) in sidebar::workspaces(&app.panes).into_iter().enumerate() {
         let key = ws.label.clone().unwrap_or_default();
         let active = current.as_deref().is_some_and(|k| k == key);

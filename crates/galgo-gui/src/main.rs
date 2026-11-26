@@ -3052,3 +3052,24 @@ mod hooks_tests {
         assert!(app.hooks_plan.is_empty());
     }
 }
+
+#[cfg(test)]
+mod atencion_tests {
+    use super::*;
+
+    /// M1 (review-14): un resultado sin leer se distingue en la fila del agente; un Done ya visto no.
+    #[test]
+    fn r14_fila_muestra_la_insignia_de_sin_leer() {
+        let mut working = PaneInfo { id: 1, name: "codex".into(), status: Status::Working, manager: None, cmd: vec!["codex".into()], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None };
+        let mut app = App::default();
+        app.attention.observe(&[working.clone()], None);
+        working.status = Status::Done;
+        app.attention.observe(&[working.clone()], None);
+        let (texto, _) = chrome::agent_side(&app, &working);
+        assert!(texto.contains("sin leer"), "{texto}");
+        assert_eq!(app.attention.count(&[working.clone()]), 1, "la barra de sesiones cuenta el panel");
+        app.attention.mark_read(1);
+        let (texto, _) = chrome::agent_side(&app, &working);
+        assert!(!texto.contains("sin leer"), "{texto}");
+    }
+}
