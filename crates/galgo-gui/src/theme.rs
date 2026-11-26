@@ -10,22 +10,22 @@ use iced::theme::Palette;
 use iced::widget::{button, container};
 use iced::{Background, Border, Color, Element, Shadow, Theme};
 
-pub const BG: Color = Color::from_rgb(0.055, 0.059, 0.071);
-pub const SIDEBAR: Color = Color::from_rgb(0.071, 0.075, 0.090);
-pub const HOVER: Color = Color::from_rgb(0.102, 0.110, 0.129);
-pub const SELECTED: Color = Color::from_rgb(0.129, 0.141, 0.169);
-pub const BORDER: Color = Color::from_rgb(0.149, 0.165, 0.192);
-pub const TEXT: Color = Color::from_rgb(0.894, 0.902, 0.918);
+pub const BG: Color = Color::from_rgb(0.106, 0.090, 0.075);
+pub const SIDEBAR: Color = Color::from_rgb(0.141, 0.122, 0.098);
+pub const HOVER: Color = Color::from_rgb(0.173, 0.149, 0.118);
+pub const SELECTED: Color = Color::from_rgb(0.227, 0.188, 0.141);
+pub const BORDER: Color = Color::from_rgb(0.227, 0.196, 0.161);
+pub const TEXT: Color = Color::from_rgb(0.925, 0.890, 0.824);
 /// Texto de las filas no seleccionadas: un punto más apagado que `TEXT`.
-pub const TEXT_SOFT: Color = Color::from_rgb(0.776, 0.788, 0.812);
-pub const MUTED: Color = Color::from_rgb(0.541, 0.565, 0.600);
-pub const DIM: Color = Color::from_rgb(0.357, 0.380, 0.420);
-pub const ACCENT: Color = Color::from_rgb(0.357, 0.553, 0.937);
-pub const WORKING: Color = Color::from_rgb(0.424, 0.714, 0.839);
-pub const BLOCKED: Color = Color::from_rgb(0.878, 0.643, 0.345);
-pub const DONE: Color = Color::from_rgb(0.498, 0.753, 0.541);
-pub const FAILED: Color = Color::from_rgb(0.878, 0.424, 0.459);
-pub const IDLE: Color = Color::from_rgb(0.357, 0.380, 0.420);
+pub const TEXT_SOFT: Color = Color::from_rgb(0.788, 0.749, 0.682);
+pub const MUTED: Color = Color::from_rgb(0.561, 0.518, 0.459);
+pub const DIM: Color = Color::from_rgb(0.369, 0.337, 0.286);
+pub const ACCENT: Color = Color::from_rgb(0.435, 0.608, 0.820);
+pub const WORKING: Color = Color::from_rgb(0.435, 0.659, 0.784);
+pub const BLOCKED: Color = Color::from_rgb(0.878, 0.659, 0.290);
+pub const DONE: Color = Color::from_rgb(0.561, 0.749, 0.498);
+pub const FAILED: Color = Color::from_rgb(0.851, 0.451, 0.420);
+pub const IDLE: Color = Color::from_rgb(0.369, 0.337, 0.286);
 
 /// Esquina de botones, filas y paneles.
 pub const RADIUS: f32 = 3.0;
@@ -142,11 +142,11 @@ pub fn tab_underline(active: bool) -> impl Fn(&Theme) -> container::Style {
 /// Fondo del área de terminales (igual que el del terminal: el panel no se distingue de su marco).
 pub const TERM_BG: Color = term::DEFAULT_BG;
 /// Superficie elevada: paleta, lanzador y diálogos que flotan sobre el terminal.
-pub const ELEVATED: Color = Color::from_rgb(0.090, 0.096, 0.114);
+pub const ELEVATED: Color = Color::from_rgb(0.141, 0.122, 0.098);
 /// Velo bajo una capa flotante.
 pub const SCRIM: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.55 };
 /// Esquina de las capas flotantes.
-pub const RADIUS_LG: f32 = 8.0;
+pub const RADIUS_LG: f32 = 10.0;
 
 /// Atajo en el formato de macOS: «Cmd+Shift+U» → «⌘⇧U».
 pub fn keys(spec: &str) -> String {

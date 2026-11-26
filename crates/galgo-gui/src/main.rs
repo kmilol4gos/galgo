@@ -1733,6 +1733,8 @@ fn view(app: &App) -> Element<'_, Message> {
 fn main() -> iced::Result {
     iced::application(app_title, update, view)
         .theme(|_| theme::app())
+        // Rex: fuente monoespaciada en toda la interfaz, no solo en el terminal.
+        .default_font(iced::Font::MONOSPACE)
         .subscription(|_: &App| Subscription::batch([
             iced::time::every(Duration::from_millis(50)).map(|_| Message::TickScreen),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TickList),
