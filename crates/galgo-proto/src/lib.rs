@@ -90,6 +90,15 @@ impl FromStr for HookEvent {
     }
 }
 
+/// Qué hacer con el worktree de tarea de un panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeAction {
+    Diff,
+    Accept,
+    Discard,
+}
+
 /// Los paneles se referencian por id numérico o por nombre.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -150,6 +159,14 @@ pub enum Request {
         summary: String,
         #[serde(default)]
         failed: bool,
+    },
+    /// Acción sobre el worktree de tarea de un panel: ver cambios, fusionarlo en el repo principal o descartarlo.
+    /// `Accept` y `Discard` exigen `confirm` (tocan el repo del usuario).
+    Worktree {
+        pane: String,
+        action: WorktreeAction,
+        #[serde(default)]
+        confirm: bool,
     },
     /// Bloquea hasta que `target` reporte, termine o se agote el tiempo.
     Wait {

@@ -4,7 +4,7 @@ mod persist;
 mod usage;
 
 use anyhow::{anyhow, bail, Context, Result};
-use galgo_proto::{HookEvent, Message, PaneInfo, Request, Response, Status};
+use galgo_proto::{HookEvent, Message, PaneInfo, Request, Response, Status, WorktreeAction};
 use galgo_usage::PaneUsage;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
@@ -448,6 +448,103 @@ fn persist_loop(d: Arc<Daemon>, rx: std::sync::mpsc::Receiver<()>) {
     }
 }
 
+/// Clave de config donde se guarda el commit base de un worktree de tarea.
+fn clave_base(rama: &str) -> String {
+    format!("branch.{rama}.galgo-base")
+}
+
+/// Cambios de un worktree de tarea frente a su commit base: estadística (recortada a `max` líneas si se pide)
+/// y si hay archivos sin confirmar. `None` si el directorio no es un worktree de tarea.
+fn resumen_de_cambios(cwd: &str, max: Option<usize>) -> Option<String> {
+    let rama = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base = git_out(cwd, &["config", "--get", &clave_base(&rama)])?;
+    let stat = git_out(cwd, &["diff", "--stat", &base]);
+    let sucio = git_out(cwd, &["status", "--porcelain"]).is_some();
+    let mut lineas = vec![format!("Cambios en el worktree de la tarea (rama {rama}):")];
+    match stat {
+        Some(s) => {
+            let todas: Vec<&str> = s.lines().collect();
+            let (mostradas, resto) = match max {
+                Some(m) if todas.len() > m => (&todas[..m], todas.len() - m),
+                _ => (&todas[..], 0),
+            };
+            lineas.extend(mostradas.iter().map(|l| l.to_string()));
+            if resto > 0 {
+                lineas.push(format!("… y {resto} líneas más (galgo worktree diff)"));
+            }
+        }
+        None => lineas.push("sin cambios respecto a la base".into()),
+    }
+    if sucio {
+        lineas.push("hay archivos sin confirmar en el worktree".into());
+    }
+    Some(lineas.join("\n"))
+}
+
+/// Datos de un worktree de tarea desde un directorio: rama, commit base, repo principal y raíz del worktree.
+struct TareaWt {
+    rama: String,
+    principal: String,
+    top: String,
+}
+
+fn tarea_de(cwd: &str) -> std::result::Result<TareaWt, String> {
+    let sin = || "este panel no tiene un worktree de tarea".to_string();
+    let top = git_run(cwd, &["rev-parse", "--show-toplevel"]).map_err(|_| sin())?;
+    let rama = git_run(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).map_err(|_| sin())?;
+    // Sin el commit base en la config, no es un worktree de tarea: no se toca nada.
+    git_run(cwd, &["config", "--get", &clave_base(&rama)]).map_err(|_| sin())?;
+    let listado = git_run(cwd, &["worktree", "list", "--porcelain"])?;
+    // La primera entrada del listado es siempre el repo principal.
+    let principal = listado.lines().find_map(|l| l.strip_prefix("worktree ")).map(str::to_string).ok_or_else(sin)?;
+    if principal == top {
+        return Err(sin());
+    }
+    Ok(TareaWt { rama, principal, top })
+}
+
+/// Ejecuta la acción sobre el worktree de tarea. `ocupado`: el agente sigue trabajando (no se toca nada).
+fn worktree_accion(cwd: &str, action: WorktreeAction, confirm: bool, ocupado: bool) -> std::result::Result<Value, String> {
+    let t = tarea_de(cwd)?;
+    match action {
+        WorktreeAction::Diff => {
+            let texto = resumen_de_cambios(&t.top, None).unwrap_or_else(|| "sin cambios".into());
+            Ok(json!({ "texto": texto }))
+        }
+        WorktreeAction::Accept | WorktreeAction::Discard => {
+            let accion = if action == WorktreeAction::Accept { "fusionar" } else { "descartar" };
+            if ocupado {
+                return Err("el panel sigue trabajando: espera a que termine".into());
+            }
+            if !confirm {
+                return Err(format!("para {accion} la rama {} añade --yes", t.rama));
+            }
+            if action == WorktreeAction::Accept {
+                if git_out(&t.top, &["status", "--porcelain"]).is_some() {
+                    return Err("hay cambios sin confirmar en el worktree: haz commit antes".into());
+                }
+                if git_out(&t.principal, &["status", "--porcelain"]).is_some() {
+                    return Err("el repo principal tiene cambios sin confirmar: no se fusiona nada".into());
+                }
+                let mensaje = format!("Fusiona {} (tarea de galgo)", t.rama);
+                if let Err(e) = git_run(&t.principal, &["merge", "--no-ff", "-m", &mensaje, &t.rama]) {
+                    let _ = git_run(&t.principal, &["merge", "--abort"]);
+                    return Err(format!("no se fusionó (se deshizo el intento): {e}"));
+                }
+                git_run(&t.principal, &["worktree", "remove", &t.top])?;
+                git_run(&t.principal, &["branch", "-d", &t.rama])?;
+                let _ = git_run(&t.principal, &["config", "--unset", &clave_base(&t.rama)]);
+                Ok(json!({ "mensaje": format!("fusionada {} en el repo principal; worktree y rama borrados", t.rama) }))
+            } else {
+                git_run(&t.principal, &["worktree", "remove", "--force", &t.top])?;
+                git_run(&t.principal, &["branch", "-D", &t.rama])?;
+                let _ = git_run(&t.principal, &["config", "--unset", &clave_base(&t.rama)]);
+                Ok(json!({ "mensaje": format!("descartada {} sin fusionar; worktree y rama borrados", t.rama) }))
+            }
+        }
+    }
+}
+
 /// Carpeta de los worktrees de tareas: `~/.galgo/worktrees/<repo>/<rama>`.
 fn worktrees_base() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -497,8 +594,11 @@ fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(Pa
     if let Some(padre) = path.parent() {
         std::fs::create_dir_all(padre).map_err(|e| format!("no pude crear {}: {e}", padre.display()))?;
     }
+    let base = git_run(&top, &["rev-parse", "HEAD"])?;
     let destino = path.to_string_lossy().into_owned();
     git_run(&top, &["worktree", "add", "-b", rama, &destino])?;
+    // El commit base queda en la config del repo: el daemon compara contra él sin guardar estado propio.
+    git_run(&top, &["config", &clave_base(rama), &base])?;
     Ok((path, top))
 }
 
@@ -1148,6 +1248,17 @@ impl Daemon {
                 Ok(json!({}))
             }
             Request::Done { pane, summary, failed } => {
+                // Si el panel trabaja en un worktree de tarea, el resultado lleva los cambios para el manager.
+                let cwd = {
+                    let st = self.state.lock().unwrap();
+                    st.resolve(&pane).ok().and_then(|id| st.panes[&id].cwd.clone())
+                };
+                let cambios = tokio::task::spawn_blocking(move || cwd.as_deref().and_then(|c| resumen_de_cambios(c, Some(15))))
+                    .await?;
+                let summary = match cambios {
+                    Some(c) => format!("{summary}\n{c}"),
+                    None => summary,
+                };
                 let manager = {
                     let mut st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
@@ -1278,6 +1389,18 @@ impl Daemon {
                 let title = title.trim().to_string();
                 st.panes.get_mut(&id).unwrap().title = (!title.is_empty()).then_some(title);
                 Ok(json!({}))
+            }
+            Request::Worktree { pane, action, confirm } => {
+                let (cwd, ocupado) = {
+                    let st = self.state.lock().unwrap();
+                    let p = &st.panes[&st.resolve(&pane)?];
+                    (p.cwd.clone(), matches!(p.status, Status::Working | Status::Blocked))
+                };
+                let cwd = cwd.ok_or_else(|| anyhow!("el panel no tiene directorio de trabajo"))?;
+                let v = tokio::task::spawn_blocking(move || worktree_accion(&cwd, action, confirm, ocupado))
+                    .await?
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok(v)
             }
             Request::Wait { .. } => unreachable!("se atiende en dispatch"),
             Request::Inbox { pane } => {
@@ -2067,8 +2190,16 @@ mod worktree_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
         git_run(&d, &["init", "-q"]).unwrap();
-        git_run(&d, &["-c", "user.name=galgo", "-c", "user.email=galgo@test", "commit", "-q", "--allow-empty", "-m", "base"]).unwrap();
+        // Identidad propia del repo de prueba: el merge y los commits de los worktrees la necesitan.
+        git_run(&d, &["config", "user.name", "galgo"]).unwrap();
+        git_run(&d, &["config", "user.email", "galgo@test"]).unwrap();
+        git_run(&d, &["commit", "-q", "--allow-empty", "-m", "base"]).unwrap();
         dir
+    }
+
+    /// Escribe un archivo en el worktree (sin confirmar aún).
+    fn escribir(dir: &Path, nombre: &str) {
+        std::fs::write(dir.join(nombre), "contenido\n").unwrap();
     }
 
     /// Un panel de tarea arranca en su propio worktree, con una rama nueva y el workspace del repo original.
@@ -2109,5 +2240,60 @@ mod worktree_tests {
         let base = dir.join("base");
         assert!(crear_worktree(&dir.to_string_lossy(), "tarea", &base).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ver cambios, fusionar sin --yes (no hace nada), fusionar con --yes: el archivo llega al repo principal y el
+    /// worktree y la rama se borran.
+    #[test]
+    fn aceptar_fusiona_y_limpia() {
+        let repo = repo_de_prueba("aceptar");
+        let base = repo.join("..").join(format!("galgo-wt-aceptar-base-{}", std::process::id()));
+        let d = repo.to_string_lossy().into_owned();
+        let (path, _) = crear_worktree(&d, "tarea/dos", &base).unwrap();
+        let p = path.to_string_lossy().into_owned();
+        escribir(&path, "nuevo.txt");
+        let sin_confirmar = resumen_de_cambios(&p, Some(15)).unwrap();
+        assert!(sin_confirmar.contains("sin confirmar"), "{sin_confirmar}");
+        git_run(&p, &["add", "-A"]).unwrap();
+        git_run(&p, &["commit", "-q", "-m", "tarea"]).unwrap();
+        let diff = worktree_accion(&p, WorktreeAction::Diff, false, false).unwrap();
+        assert!(diff["texto"].as_str().unwrap().contains("nuevo.txt"), "{diff}");
+        assert!(worktree_accion(&p, WorktreeAction::Accept, false, false).is_err(), "sin --yes no se fusiona");
+        assert!(worktree_accion(&p, WorktreeAction::Accept, true, true).is_err(), "con el agente trabajando no se fusiona");
+        worktree_accion(&p, WorktreeAction::Accept, true, false).unwrap();
+        assert!(repo.join("nuevo.txt").exists(), "el archivo llega al repo principal");
+        assert!(!path.exists(), "el worktree se borra");
+        assert!(git_run(&d, &["branch", "--list", "tarea/dos"]).unwrap().is_empty(), "la rama se borra");
+        assert!(tarea_de(&p).is_err(), "ya no es un worktree de tarea");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Descartar sin --yes no toca nada; con --yes borra worktree y rama aunque no estén fusionadas.
+    #[test]
+    fn descartar_exige_confirmacion() {
+        let repo = repo_de_prueba("descartar");
+        let base = repo.join("..").join(format!("galgo-wt-descartar-base-{}", std::process::id()));
+        let d = repo.to_string_lossy().into_owned();
+        let (path, _) = crear_worktree(&d, "tarea/tres", &base).unwrap();
+        let p = path.to_string_lossy().into_owned();
+        escribir(&path, "descartable.txt");
+        assert!(worktree_accion(&p, WorktreeAction::Discard, false, false).is_err());
+        assert!(path.exists(), "sin --yes el worktree sigue");
+        worktree_accion(&p, WorktreeAction::Discard, true, false).unwrap();
+        assert!(!path.exists() && !repo.join("descartable.txt").exists(), "descartado sin tocar el principal");
+        assert!(git_run(&d, &["branch", "--list", "tarea/tres"]).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// En el repo principal (no es un worktree de tarea) no hay acción posible.
+    #[test]
+    fn repo_principal_no_es_tarea() {
+        let repo = repo_de_prueba("principal");
+        let d = repo.to_string_lossy().into_owned();
+        assert!(worktree_accion(&d, WorktreeAction::Diff, false, false).is_err());
+        assert!(worktree_accion(&d, WorktreeAction::Discard, true, false).is_err());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

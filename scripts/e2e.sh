@@ -1363,6 +1363,29 @@ assert p["workspace"]=="repo/tarea-e2e", p.get("workspace")'
 check "el workspace sale del repo original" $?
 HOME="$H139" galgo spawn wt139b --cwd "$R139" --worktree tarea-e2e -- bash --norc >/dev/null 2>&1; [ $? -ne 0 ]; check "una rama que ya existe se rechaza" $?
 HOME="$H139" galgo spawn wt139c --cwd "$TMP" --worktree otra -- bash --norc >/dev/null 2>&1; [ $? -ne 0 ]; check "fuera de un repo git no hay worktree" $?
+
+echo "143. worktree de tarea: el resultado lleva los cambios; fusionar exige --yes y descartar borra sin fusionar"
+export GALGO_SOCKET="$TMP/c139/g.sock"
+galgo spawn mgr140 -- bash --norc >/dev/null
+HOME="$H139" galgo spawn wt140 --cwd "$R139" --manager mgr140 --worktree tarea-140 -- bash --norc >/dev/null; check "worker con manager y worktree" $?
+WT140=$(galgo --json ls | python3 -c 'import json,sys
+print([x for x in json.load(sys.stdin) if x["name"]=="wt140"][0]["cwd"])')
+galgo send wt140 "echo hola > nuevo140.txt && git add -A && git commit -qm trabajo140" >/dev/null
+for i in $(seq 1 50); do [ -f "$WT140/nuevo140.txt" ] && git -C "$WT140" log -1 --format=%s 2>/dev/null | grep -q trabajo140 && break; sleep 0.2; done
+[ "$(git -C "$WT140" log -1 --format=%s)" = trabajo140 ]; check "el worker hace su commit en el worktree" $?
+galgo send wt140 "" >/dev/null 2>&1
+GALGO_PANE=wt140 galgo done --summary "listo" >/dev/null; check "el worker reporta Done" $?
+galgo inbox --pane mgr140 | grep -q "nuevo140.txt"; check "el resultado llega al manager con los cambios" $?
+galgo worktree diff wt140 | grep -q "nuevo140.txt"; check "galgo worktree diff muestra el archivo" $?
+galgo worktree accept wt140 >/dev/null 2>&1; [ $? -ne 0 ] && [ ! -f "$R139/nuevo140.txt" ]; check "fusionar sin --yes no toca el repo" $?
+galgo worktree accept wt140 --yes >/dev/null; check "fusionar con --yes" $?
+[ -f "$R139/nuevo140.txt" ] && [ ! -e "$WT140" ]; check "el archivo llega al repo principal y el worktree se borra" $?
+HOME="$H139" galgo spawn wt140b --cwd "$R139" --worktree tarea-140b -- bash --norc >/dev/null; check "segundo worker con worktree" $?
+WT140B=$(galgo --json ls | python3 -c 'import json,sys
+print([x for x in json.load(sys.stdin) if x["name"]=="wt140b"][0]["cwd"])')
+galgo worktree discard wt140b >/dev/null 2>&1; [ -d "$WT140B" ]; check "descartar sin --yes no borra" $?
+galgo worktree discard wt140b --yes >/dev/null; check "descartar con --yes" $?
+[ ! -e "$WT140B" ] && [ -z "$(git -C "$R139" branch --list tarea-140b)" ]; check "el worktree y la rama descartados desaparecen" $?
 galgo stop >/dev/null 2>&1; sleep 0.3
 export GALGO_SOCKET="$TMP/galgo.sock"
 

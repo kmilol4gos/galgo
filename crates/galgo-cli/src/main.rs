@@ -131,6 +131,29 @@ enum Cmd {
         #[arg(long, env = "GALGO_PANE")]
         pane: String,
     },
+    /// Worktree de tarea de un panel (creado con `spawn --worktree`): ver cambios, fusionarlo o descartarlo.
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// Cambios del worktree frente a la base de su tarea.
+    Diff { pane: String },
+    /// Fusiona la rama de la tarea en el repo principal y borra worktree y rama. Pide --yes.
+    Accept {
+        pane: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Borra el worktree y su rama sin fusionar. Pide --yes.
+    Discard {
+        pane: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -188,6 +211,14 @@ fn run() -> Result<()> {
         Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
         Cmd::Stop => Request::Shutdown,
         Cmd::Title { text, pane } => Request::SetTitle { pane: pane.clone(), title: text.clone() },
+        Cmd::Worktree { action } => {
+            let (pane, action, confirm) = match action {
+                WorktreeCmd::Diff { pane } => (pane, galgo_proto::WorktreeAction::Diff, false),
+                WorktreeCmd::Accept { pane, yes } => (pane, galgo_proto::WorktreeAction::Accept, *yes),
+                WorktreeCmd::Discard { pane, yes } => (pane, galgo_proto::WorktreeAction::Discard, *yes),
+            };
+            Request::Worktree { pane: pane.clone(), action, confirm }
+        }
         Cmd::Hook { .. } | Cmd::Statusline { .. } | Cmd::Hooks { .. } | Cmd::Env { .. } | Cmd::Skill { .. } | Cmd::Usage(_) => unreachable!("se atienden antes"),
     };
 
@@ -313,6 +344,10 @@ fn print_human(cmd: &Cmd, data: Value) -> Result<()> {
             }
         }
         Cmd::Read { .. } => println!("{}", data["text"].as_str().unwrap_or("")),
+        Cmd::Worktree { action } => match action {
+            WorktreeCmd::Diff { .. } => println!("{}", data["texto"].as_str().unwrap_or("sin cambios")),
+            _ => println!("{}", data["mensaje"].as_str().unwrap_or("hecho")),
+        },
         Cmd::Wait { .. } => {
             let from = data["from"].as_str().unwrap_or("?");
             match data["summary"].as_str() {
