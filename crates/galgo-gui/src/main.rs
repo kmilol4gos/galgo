@@ -508,11 +508,15 @@ enum Body {
     Launcher,
     Palette,
     Form,
+    Settings,
     Screen,
 }
 
 fn body_mode(app: &App) -> Body {
-    if app.palette.is_some() {
+    if app.settings.is_some() {
+        // M4: con los ajustes abiertos, ningún atajo ni clic del terminal de detrás cuenta.
+        Body::Settings
+    } else if app.palette.is_some() {
         Body::Palette
     } else if app.new_ws.is_some() {
         Body::NewWorkspace
@@ -1503,23 +1507,6 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     _ => Task::none(),
                 };
             }
-            // Cmd+Opt+flechas: el foco se mueve al split vecino.
-            if modifiers.command() && modifiers.alt() {
-                let dir = match &key {
-                    Key::Named(Named::ArrowLeft) => Some(layout::Dir::Left),
-                    Key::Named(Named::ArrowRight) => Some(layout::Dir::Right),
-                    Key::Named(Named::ArrowUp) => Some(layout::Dir::Up),
-                    Key::Named(Named::ArrowDown) => Some(layout::Dir::Down),
-                    _ => None,
-                };
-                if let Some(dir) = dir {
-                    return update(app, Message::FocusDir(dir));
-                }
-            }
-            // Cmd+Shift+Enter: maximizar o restaurar el panel enfocado de un split.
-            if modifiers.command() && modifiers.shift() && matches!(&key, Key::Named(Named::Enter)) && body_mode(app) == Body::Screen {
-                return update(app, Message::ToggleMaximize);
-            }
             // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
             if modifiers.command() && app.new_ws.is_none() && !app.launcher && app.settings.is_none() {
                 if let Some(message) = shortcut_in_state(app, &key, modifiers) {
@@ -1545,6 +1532,23 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             if app.form.is_some() {
                 return Task::none();
+            }
+            // Cmd+Opt+flechas: el foco se mueve al split vecino.
+            if modifiers.command() && modifiers.alt() {
+                let dir = match &key {
+                    Key::Named(Named::ArrowLeft) => Some(layout::Dir::Left),
+                    Key::Named(Named::ArrowRight) => Some(layout::Dir::Right),
+                    Key::Named(Named::ArrowUp) => Some(layout::Dir::Up),
+                    Key::Named(Named::ArrowDown) => Some(layout::Dir::Down),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    return update(app, Message::FocusDir(dir));
+                }
+            }
+            // Cmd+Shift+Enter: maximizar o restaurar el panel enfocado de un split.
+            if modifiers.command() && modifiers.shift() && matches!(&key, Key::Named(Named::Enter)) && body_mode(app) == Body::Screen {
+                return update(app, Message::ToggleMaximize);
             }
             // Con la vista congelada, Esc la libera (no se envía al panel).
             if app.sel_snap.is_some() && matches!(&key, Key::Named(Named::Escape)) {
@@ -1878,6 +1882,7 @@ fn view(app: &App) -> Element<'_, Message> {
             Some(f) => chrome::floating(base, chrome::form_panel(app, f), 460.0, Message::CancelForm),
             None => base,
         },
+        Body::Settings => chrome::floating(base, chrome::settings_panel(app), 820.0, Message::CloseSettings),
         Body::Welcome | Body::Screen => base,
     }
 }
@@ -3120,5 +3125,42 @@ mod arrastre_tests {
         let _ = update(&mut app, Message::DragWindow);
         assert_eq!(app.selected, Some(1));
         assert!(app.settings.is_none() && app.palette.is_none());
+    }
+}
+
+#[cfg(test)]
+mod capas_tests {
+    use super::*;
+
+    fn tecla(key: Key, modifiers: keyboard::Modifiers) -> Message {
+        Message::Event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+        }))
+    }
+
+    /// M4 (review-14): con los ajustes abiertos, Cmd+Opt+flecha no mueve el foco del split de detrás, y Cmd+Shift+Enter
+    /// no maximiza el panel de detrás.
+    #[test]
+    fn r14_atajos_no_actuan_bajo_las_capas() {
+        let mut uno = PaneInfo { id: 1, name: "a".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some("w".into()), cwd: None, usage: None, title: None };
+        let dos = PaneInfo { id: 2, name: "b".into(), ..uno.clone() };
+        uno.id = 1;
+        let mut app = App { panes: vec![uno, dos], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        app.layouts.split(1, true, 2);
+        app.layouts.sync(&pane_keys(&app));
+        app.settings = Some(settings::Section::General);
+        assert_eq!(body_mode(&app), Body::Settings);
+        let cmd_opt = keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT;
+        let cmd_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
+        let _ = update(&mut app, tecla(Key::Named(Named::ArrowRight), cmd_opt));
+        assert_eq!(app.selected, Some(1), "el foco de detrás no se mueve");
+        let _ = update(&mut app, tecla(Key::Named(Named::Enter), cmd_shift));
+        assert!(app.maximized.is_none(), "el panel de detrás no se maximiza");
     }
 }
