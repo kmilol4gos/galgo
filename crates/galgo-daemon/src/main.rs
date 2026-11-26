@@ -375,9 +375,17 @@ fn is_injectable(m: &InboxMsg) -> bool {
 /// Límite de longitud para nombres y workspaces, y texto sin caracteres de control (B2).
 const MAX_LABEL: usize = 128;
 
+/// Caracteres de formato invisibles o de dirección (Cf): pueden invertir o esconder un texto en la pantalla (B1).
+fn formato_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
 fn check_text(what: &str, text: &str, max: usize) -> Result<()> {
-    if text.chars().any(char::is_control) {
-        bail!("{what} no puede tener caracteres de control");
+    if text.chars().any(|c| char::is_control(c) || formato_invisible(c)) {
+        bail!("{what} no puede tener caracteres de control o de formato invisible");
     }
     if text.chars().count() > max {
         bail!("{what} tiene más de {max} caracteres");
@@ -1959,5 +1967,18 @@ mod tests_fantasmas {
         };
         assert!(v.title.is_none(), "un título vacío lo borra");
         assert!(rt.block_on(d.handle(Request::SetTitle { pane: "1".into(), title: "x\u{1b}[31m".into() })).is_err());
+    }
+}
+
+#[cfg(test)]
+mod r14_tests {
+    use super::*;
+
+    /// B1 (review-14): un carácter de dirección (RLO) o de ancho cero no entra en un nombre ni en un título.
+    #[test]
+    fn r14_formato_invisible_se_rechaza() {
+        assert!(check_text("el título", "bug \u{202E}ventas", MAX_LABEL).is_err());
+        assert!(check_text("el nombre", "a\u{200B}b", MAX_LABEL).is_err());
+        assert!(check_text("el título", "bug de ventas", MAX_LABEL).is_ok());
     }
 }

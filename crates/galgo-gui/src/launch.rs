@@ -57,15 +57,15 @@ impl Agent {
         }
     }
 
-    /// Comando con el modelo elegido: `claude --model opus`, `codex -m gpt-5.6-terra`… Sin modelo, el de siempre.
-    /// Los flags de PI y opencode son los habituales de sus CLI; no están verificados aquí.
+    /// Comando con el modelo elegido: `claude --model opus`, `codex -m gpt-5.6-terra`, `pi --model …`. Sin modelo, el
+    /// de siempre. opencode no tiene flag de modelo en su comando principal (verificado con `opencode --help`): se
+    /// lanza sin modelo aunque se pida uno (B6).
     pub fn command_with(self, shell: &str, model: Option<&str>) -> Vec<String> {
         let base = self.command(shell);
         match (model, self) {
             (Some(m), Agent::Claude) => vec![base[0].clone(), "--model".into(), m.into()],
             (Some(m), Agent::Codex) => vec![base[0].clone(), "-m".into(), m.into()],
             (Some(m), Agent::Pi) => vec![base[0].clone(), "--model".into(), m.into()],
-            (Some(m), Agent::OpenCode) => vec![base[0].clone(), "-m".into(), m.into()],
             _ => base,
         }
     }
@@ -101,6 +101,8 @@ mod tests {
         assert_eq!(Agent::Claude.command_with("/bin/zsh", None), vec!["claude"]);
         assert!(Agent::Shell.models().is_empty());
         assert_eq!(Agent::Shell.command_with("/bin/zsh", Some("x")), vec!["/bin/zsh"]);
+        // B6: opencode no acepta modelo en su comando principal; no se le pasa un flag inventado.
+        assert_eq!(Agent::OpenCode.command_with("/bin/zsh", Some("x")), vec!["opencode"]);
     }
 
     #[test]

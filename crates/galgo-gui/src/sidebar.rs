@@ -85,6 +85,16 @@ pub fn provider(p: &PaneInfo) -> String {
     }
 }
 
+/// Recorta `text` a `max` caracteres con «…» al final (B3): un título largo no empuja el resto de la fila.
+pub fn recortar(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Modelo del agente, si se conoce (lo da el uso medido).
 pub fn model(p: &PaneInfo) -> Option<String> {
     p.usage.as_ref().and_then(|u| u.model.clone())
@@ -156,5 +166,18 @@ mod tests {
         p.cmd = vec!["/bin/zsh".into()];
         assert_eq!(provider(&p), "shell");
         assert_eq!(model(&p), None);
+    }
+}
+
+#[cfg(test)]
+mod recorte_tests {
+    use super::*;
+
+    /// B3 (review-14): un título largo se recorta con «…» y no pasa del máximo.
+    #[test]
+    fn r14_titulo_largo_se_recorta() {
+        assert_eq!(recortar("corto", 10), "corto");
+        assert_eq!(recortar("abcdefghij", 5), "abcd…");
+        assert_eq!(recortar("abcdefghij", 5).chars().count(), 5);
     }
 }

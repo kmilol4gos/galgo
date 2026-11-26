@@ -104,7 +104,8 @@ pub fn agent_side(app: &App, pane: &PaneInfo) -> (String, Color) {
 fn agent_row<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
     let selected = app.selected == Some(pane.id);
     let (side, side_color) = agent_side(app, pane);
-    let title = pane.title.clone().unwrap_or_else(|| pane.status.as_str().to_string());
+    // B3: el título se recorta; así proveedor·modelo siempre cabe a la derecha.
+    let title = sidebar::recortar(&pane.title.clone().unwrap_or_else(|| pane.status.as_str().to_string()), 40);
     let body = column![
         text(&pane.name).size(theme::BODY_SIZE).color(if selected { TEXT } else { theme::TEXT_SOFT }).wrapping(iced::widget::text::Wrapping::None),
         text(title).size(theme::SMALL_SIZE).color(MUTED).wrapping(iced::widget::text::Wrapping::None),
