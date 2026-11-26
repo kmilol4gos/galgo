@@ -596,7 +596,21 @@ pub fn launcher_panel(app: &App) -> Element<'_, Message> {
         ]
         .spacing(10)
         .align_y(Alignment::Center);
-        list = list.push(theme::btn(line).width(Length::Fill).padding([8, 12]).on_press(Message::Launch(*agent)).style(theme::row(false)));
+        let launch_row = theme::btn(line).width(Length::Fill).padding([8, 12]).on_press(Message::Launch(*agent)).style(theme::row(false));
+        // Proveedor y modelo: el desplegable va fuera del botón de lanzar, para que su clic no lance el agente.
+        let models = agent.models();
+        let mut fila = row![launch_row].spacing(6).align_y(Alignment::Center);
+        if !models.is_empty() {
+            let label = agent.label().to_string();
+            let options: Vec<String> = models.iter().map(|m| m.to_string()).collect();
+            let elegido = app.launch_model.get(agent.label()).cloned().or_else(|| options.first().cloned());
+            fila = fila.push(
+                pick_list(options, elegido, move |m| Message::LauncherModel(label.clone(), m))
+                    .text_size(theme::SMALL_SIZE + 1.0)
+                    .padding([3, 8]),
+            );
+        }
+        list = list.push(fila);
     }
     column![
         container(column![text("Lanzar agente").size(theme::TITLE_SIZE).color(TEXT), text(target).size(theme::SMALL_SIZE).color(theme::DIM)].spacing(4)).padding([14, 16]),

@@ -44,6 +44,28 @@ impl Agent {
             other => vec![other.label().to_string()],
         }
     }
+
+    /// Modelos que se ofrecen en el lanzador. Vacío = el que trae el agente por defecto.
+    pub fn models(self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["opus", "sonnet", "haiku"],
+            Agent::Codex => &["gpt-5.6-terra", "gpt-5.5"],
+            Agent::Pi | Agent::OpenCode | Agent::Shell => &[],
+        }
+    }
+
+    /// Comando con el modelo elegido: `claude --model opus`, `codex -m gpt-5.6-terra`… Sin modelo, el de siempre.
+    /// Los flags de PI y opencode son los habituales de sus CLI; no están verificados aquí.
+    pub fn command_with(self, shell: &str, model: Option<&str>) -> Vec<String> {
+        let base = self.command(shell);
+        match (model, self) {
+            (Some(m), Agent::Claude) => vec![base[0].clone(), "--model".into(), m.into()],
+            (Some(m), Agent::Codex) => vec![base[0].clone(), "-m".into(), m.into()],
+            (Some(m), Agent::Pi) => vec![base[0].clone(), "--model".into(), m.into()],
+            (Some(m), Agent::OpenCode) => vec![base[0].clone(), "-m".into(), m.into()],
+            _ => base,
+        }
+    }
 }
 
 /// `Spawn` de un proceso en `cwd`, dentro de `workspace` si lo hay (si no, lo deduce el daemon del repo git).
@@ -68,6 +90,15 @@ pub fn shell_request(name: &str, shell: &str, cwd: &str, workspace: Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modelo_elegido_va_en_el_comando() {
+        assert_eq!(Agent::Claude.command_with("/bin/zsh", Some("opus")), vec!["claude", "--model", "opus"]);
+        assert_eq!(Agent::Codex.command_with("/bin/zsh", Some("gpt-5.5")), vec!["codex", "-m", "gpt-5.5"]);
+        assert_eq!(Agent::Claude.command_with("/bin/zsh", None), vec!["claude"]);
+        assert!(Agent::Shell.models().is_empty());
+        assert_eq!(Agent::Shell.command_with("/bin/zsh", Some("x")), vec!["/bin/zsh"]);
+    }
 
     #[test]
     fn nombres_libres_en_secuencia() {

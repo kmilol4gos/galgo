@@ -207,6 +207,8 @@ struct App {
     recents_path: Option<std::path::PathBuf>,
     /// Lanzador de agentes abierto.
     launcher: bool,
+    /// Modelo elegido en el lanzador, por agente (la etiqueta del agente → modelo).
+    launch_model: std::collections::HashMap<String, String>,
     /// Ajustes abiertos: la sección elegida, y la salida de la CLI por agente (estado de hooks y planes).
     settings: Option<settings::Section>,
     hooks_output: std::collections::HashMap<String, String>,
@@ -284,6 +286,8 @@ enum Message {
     OpenLauncher,
     CloseLauncher,
     Launch(launch::Agent),
+    /// Modelo elegido en el lanzador para un agente.
+    LauncherModel(String, String),
     /// Un panel creado desde un atajo o el lanzador: queda seleccionado.
     PaneLaunched(Result<serde_json::Value, String>),
     /// Un lanzamiento que falló: su nombre queda libre y su split pendiente se descarta (B1, B2).
@@ -456,7 +460,8 @@ fn context_request(app: &App, agent: launch::Agent) -> galgo_proto::Request {
     let (workspace, cwd) = focus_context(app);
     let cwd = cwd.unwrap_or_else(home_dir);
     let name = launch::free_name(agent.label(), &names(app));
-    launch::spawn_request(&name, agent.command(&login_shell()), &cwd, workspace, rows, cols)
+    let model = app.launch_model.get(agent.label()).map(String::as_str);
+    launch::spawn_request(&name, agent.command_with(&login_shell(), model), &cwd, workspace, rows, cols)
 }
 
 /// Crea un panel con la petición dada; al llegar queda seleccionado.
@@ -1228,6 +1233,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         Message::Launch(agent) => {
             let req = context_request(app, agent);
             spawn_task(app, req)
+        }
+        Message::LauncherModel(agent, model) => {
+            app.launch_model.insert(agent, model);
+            Task::none()
         }
         Message::OpenNewWorkspace => {
             app.form = None;
@@ -2886,5 +2895,40 @@ mod ajustes_tests {
         assert_eq!(app.settings, Some(settings::Section::Shortcuts));
         let _ = update(&mut app, Message::CloseSettings);
         assert!(app.settings.is_none());
+    }
+}
+
+#[cfg(test)]
+mod lanzador_tests {
+    use super::*;
+
+    /// Paso 5 (rex): el lanzador lleva el modelo elegido en el comando, y el nombre es libre (claude, claude-2…).
+    #[test]
+    fn lanzador_con_modelo_y_nombre_automatico() {
+        let uno = PaneInfo {
+            id: 1,
+            name: "claude".into(),
+            status: Status::Idle,
+            manager: None,
+            cmd: vec!["claude".into()],
+            unacked: 0,
+            oldest_unacked_secs: None,
+            orphan: false,
+            waiting_on: None,
+            waiting_secs: None,
+            workspace: None,
+            cwd: None,
+            usage: None,
+            title: None,
+        };
+        let mut app = App { panes: vec![uno], window: (1100.0, 700.0), ..Default::default() };
+        let _ = update(&mut app, Message::LauncherModel("claude".into(), "opus".into()));
+        match context_request(&app, launch::Agent::Claude) {
+            galgo_proto::Request::Spawn { name, cmd, .. } => {
+                assert_eq!(name, "claude-2", "claude ya existe");
+                assert_eq!(cmd, vec!["claude", "--model", "opus"]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
