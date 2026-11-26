@@ -229,7 +229,7 @@ pub fn session_bar(app: &App) -> Element<'_, Message> {
         let key = ws.label.clone().unwrap_or_default();
         let active = current.as_deref().is_some_and(|k| k == key);
         let state = ws.panes.iter().map(|p| p.status).min_by_key(|s| sidebar::priority(*s)).unwrap_or(Status::Idle);
-        let label = row![dot(theme::status_color(state), 6.0), text(ws.label.clone().unwrap_or_else(|| "sin workspace".into())).size(theme::SMALL_SIZE + 1.0).color(if active { TEXT } else { MUTED }).wrapping(iced::widget::text::Wrapping::None)]
+        let label = row![dot(theme::status_color(state), 6.0), text(ws.label.clone().unwrap_or_else(|| ws.name.clone())).size(theme::SMALL_SIZE + 1.0).color(if active { TEXT } else { MUTED }).wrapping(iced::widget::text::Wrapping::None)]
             .spacing(7)
             .align_y(Alignment::Center);
         // B4: la sesión se elige por su clave, no por su posición, que puede cambiar entre el dibujo y el clic.
@@ -288,7 +288,15 @@ pub fn sidebar_view(app: &App) -> Element<'_, Message> {
 /// Barra superior del área de terminales: dónde estás (proyecto / rama), las pestañas del workspace y las acciones.
 pub fn tabs_bar(app: &App) -> Element<'_, Message> {
     let key = focus_key(app);
-    let (project, branch) = sidebar::split_label(key.as_deref().filter(|k| !k.is_empty()));
+    // Punto 5: sin workspace, la miga muestra la carpeta del panel enfocado (o `~`).
+    let (project, branch) = match key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => sidebar::split_label(Some(k)),
+        None => {
+            let cwd = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).and_then(|p| p.cwd.clone());
+            let l = sidebar::folder_label(cwd.as_deref(), &home_dir());
+            (l.clone(), l)
+        }
+    };
     let crumb = row![text(project).size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text("/").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text(branch).size(theme::SMALL_SIZE + 1.0).color(MUTED)]
         .spacing(4)
         .align_y(Alignment::Center);

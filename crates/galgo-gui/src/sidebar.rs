@@ -29,10 +29,34 @@ pub fn split_label(label: Option<&str>) -> (String, String) {
 }
 
 /// Proyectos por nombre, y dentro de cada uno sus workspaces por etiqueta. «sin proyecto» va al final.
+/// Nombre de un panel sin workspace a partir de su carpeta: el nombre de la carpeta, o `~` en el inicio (punto 5).
+pub fn folder_label(cwd: Option<&str>, home: &str) -> String {
+    let Some(cwd) = cwd.map(|c| c.trim_end_matches('/')).filter(|c| !c.is_empty()) else {
+        return "sin workspace".into();
+    };
+    if cwd == home.trim_end_matches('/') {
+        return "~".into();
+    }
+    cwd.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("/").to_string()
+}
+
+/// Árbol con el inicio del usuario (para mostrar `~`).
 pub fn tree(panes: &[PaneInfo]) -> Vec<Project<'_>> {
-    let mut by_project: BTreeMap<(bool, String), BTreeMap<String, Workspace<'_>>> = BTreeMap::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+    tree_with_home(panes, &home)
+}
+
+pub fn tree_with_home<'a>(panes: &'a [PaneInfo], home: &str) -> Vec<Project<'a>> {
+    let mut by_project: BTreeMap<(bool, String), BTreeMap<String, Workspace<'a>>> = BTreeMap::new();
     for p in panes {
-        let (project, name) = split_label(p.workspace.as_deref());
+        // Punto 5: un panel sin workspace se nombra por su carpeta, no como «sin proyecto / sin workspace».
+        let (project, name) = match p.workspace.as_deref() {
+            Some(_) => split_label(p.workspace.as_deref()),
+            None => {
+                let l = folder_label(p.cwd.as_deref(), home);
+                (l.clone(), l)
+            }
+        };
         let sortable = (p.workspace.is_none(), project);
         let key = p.workspace.clone().unwrap_or_default();
         let ws = by_project.entry(sortable).or_default().entry(key).or_insert_with(|| Workspace {
@@ -142,7 +166,7 @@ mod tests {
         ];
         let arbol = tree(&panes);
         let nombres: Vec<&str> = arbol.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(nombres, vec!["a", "a-b", "sin proyecto"]);
+        assert_eq!(nombres, vec!["a", "a-b", "sin workspace"], "un panel sin workspace ni carpeta");
         let de_a: Vec<&str> = arbol[0].workspaces.iter().map(|w| w.name.as_str()).collect();
         assert_eq!(de_a, vec!["feat", "main"], "dentro del proyecto, por rama");
         // El orden de los atajos es el de la barra.
@@ -166,6 +190,25 @@ mod tests {
         p.cmd = vec!["/bin/zsh".into()];
         assert_eq!(provider(&p), "shell");
         assert_eq!(model(&p), None);
+    }
+}
+
+#[cfg(test)]
+mod carpeta_tests {
+    use super::*;
+
+    /// Punto 5 (review-14 del usuario): un panel sin workspace se llama como su carpeta, o `~` en el inicio.
+    #[test]
+    fn panel_sin_workspace_usa_el_nombre_de_su_carpeta() {
+        assert_eq!(folder_label(Some("/Users/x/proyecto"), "/Users/x"), "proyecto");
+        assert_eq!(folder_label(Some("/Users/x"), "/Users/x"), "~");
+        assert_eq!(folder_label(None, "/Users/x"), "sin workspace");
+        let mut p = PaneInfo { id: 1, name: "shell".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: Some("/Users/x".into()), usage: None, title: None };
+        let arbol = tree_with_home(std::slice::from_ref(&p), "/Users/x");
+        assert_eq!(arbol[0].name, "~");
+        p.cwd = Some("/Users/x/nexo".into());
+        let arbol = tree_with_home(std::slice::from_ref(&p), "/Users/x");
+        assert_eq!(arbol[0].name, "nexo");
     }
 }
 
