@@ -225,14 +225,15 @@ pub fn session_bar(app: &App) -> Element<'_, Message> {
         bar = bar.push(text(atencion.to_string()).size(theme::SMALL_SIZE).color(theme::BLOCKED));
     }
     bar = bar.push(Space::with_width(12.0));
-    for (i, ws) in sidebar::workspaces(&app.panes).into_iter().enumerate() {
+    for ws in sidebar::workspaces(&app.panes) {
         let key = ws.label.clone().unwrap_or_default();
         let active = current.as_deref().is_some_and(|k| k == key);
         let state = ws.panes.iter().map(|p| p.status).min_by_key(|s| sidebar::priority(*s)).unwrap_or(Status::Idle);
         let label = row![dot(theme::status_color(state), 6.0), text(ws.label.clone().unwrap_or_else(|| "sin workspace".into())).size(theme::SMALL_SIZE + 1.0).color(if active { TEXT } else { MUTED }).wrapping(iced::widget::text::Wrapping::None)]
             .spacing(7)
             .align_y(Alignment::Center);
-        bar = bar.push(theme::btn(container(label).padding([4, 12])).padding(0).on_press(Message::SelectWorkspaceAt(i)).style(theme::tab(active)));
+        // B4: la sesión se elige por su clave, no por su posición, que puede cambiar entre el dibujo y el clic.
+        bar = bar.push(theme::btn(container(label).padding([4, 12])).padding(0).on_press(Message::SelectWorkspace(key.clone())).style(theme::tab(active)));
     }
     bar = bar.push(icon_button(text("+").size(16).color(MUTED).into(), "Nuevo workspace  ⌘N", Message::OpenNewWorkspace));
     bar = bar

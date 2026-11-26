@@ -313,6 +313,10 @@ enum Message {
     OpenSettings,
     /// Arrastra la ventana desde un hueco de la barra de sesiones (M3).
     DragWindow,
+    /// Elige un workspace por su clave (B4): la barra de sesiones y la paleta no usan posiciones.
+    SelectWorkspace(String),
+    /// Eco de una tecla: pide solo la pantalla del panel enfocado (B7), sin sondear los demás.
+    Echo,
     CloseSettings,
     SettingsSection(settings::Section),
     HooksStatus(String),
@@ -336,9 +340,10 @@ struct PaletteItem {
 /// Todos los resultados posibles: workspaces, paneles y comandos. Se filtran con la búsqueda.
 fn palette_items(app: &App) -> Vec<PaletteItem> {
     let mut items = Vec::new();
-    for (i, ws) in sidebar::workspaces(&app.panes).into_iter().enumerate() {
+    for ws in sidebar::workspaces(&app.panes) {
         let label = ws.label.clone().unwrap_or_else(|| "sin workspace".into());
-        items.push(PaletteItem { label: format!("Workspace · {label}"), detail: format!("{} panel(es)", ws.panes.len()), message: Message::SelectWorkspaceAt(i) });
+        let key = ws.label.clone().unwrap_or_default();
+        items.push(PaletteItem { label: format!("Workspace · {label}"), detail: format!("{} panel(es)", ws.panes.len()), message: Message::SelectWorkspace(key) });
     }
     for p in &app.panes {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
@@ -948,12 +953,16 @@ fn resize_if_needed(app: &mut App) {
 }
 
 /// Pide la pantalla del panel enfocado dentro de unos milisegundos (lo que tarda el PTY en hacer eco de una tecla),
-/// sin esperar al siguiente tick.
+/// sin esperar al siguiente tick. Espera con `tokio::time::sleep`: no bloquea un hilo por tecla (B7).
 fn echo_soon() -> Task<Message> {
-    Task::perform(
-        async { tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(ECHO_DELAY_MS))).await.ok() },
-        |_| Message::TickScreen,
-    )
+    Task::perform(async { tokio::time::sleep(Duration::from_millis(ECHO_DELAY_MS)).await }, |_| Message::Echo)
+}
+
+/// Panel que enfoca un workspace por su clave: el de su pestaña activa, o el primero (B4).
+fn workspace_focus(app: &App, key: &str) -> Option<u32> {
+    let ws = sidebar::workspaces(&app.panes).into_iter().find(|w| w.label.clone().unwrap_or_default() == key)?;
+    let activo = app.layouts.active_tab(key).map(|t| t.focus).filter(|f| ws.panes.iter().any(|p| p.id == *f));
+    activo.or_else(|| ws.panes.first().map(|p| p.id))
 }
 
 /// Espera tras una tecla antes de pedir su eco.
@@ -1227,6 +1236,19 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::SelectWorkspace(key) => match workspace_focus(app, &key) {
+            Some(id) => select(app, id),
+            None => Task::none(),
+        },
+        Message::Echo => match app.selected {
+            // B7: el eco pide solo la pantalla del enfocado; ni el sondeo de los demás paneles ni el redimensionado.
+            Some(id) if !app.loading => {
+                app.loading = true;
+                let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
+                load_screen(id, app.scroll, since)
+            }
+            _ => Task::none(),
+        },
         Message::DragWindow => {
             // window::drag arrastra la ventana más reciente; no cambia el estado de la app.
             iced::window::get_latest().and_then(iced::window::drag)
@@ -3162,5 +3184,48 @@ mod capas_tests {
         assert_eq!(app.selected, Some(1), "el foco de detrás no se mueve");
         let _ = update(&mut app, tecla(Key::Named(Named::Enter), cmd_shift));
         assert!(app.maximized.is_none(), "el panel de detrás no se maximiza");
+    }
+}
+
+#[cfg(test)]
+mod r14_b_tests {
+    use super::*;
+
+    fn pane(id: u32, ws: &str) -> PaneInfo {
+        PaneInfo { id, name: format!("p{id}"), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some(ws.into()), cwd: None, usage: None, title: None }
+    }
+
+    /// B4 (review-14): elegir un workspace por clave lleva a su panel aunque cambie el orden de la lista.
+    #[test]
+    fn r14_sesion_se_elige_por_clave() {
+        let mut app = App { panes: vec![pane(1, "repo/main"), pane(2, "otro/dev")], window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        let _ = update(&mut app, Message::SelectWorkspace("repo/main".into()));
+        assert_eq!(app.selected, Some(1));
+        let _ = update(&mut app, Message::SelectWorkspace("otro/dev".into()));
+        assert_eq!(app.selected, Some(2));
+    }
+
+    /// B5 (review-14): con una orden de hooks en curso para un agente, otra no se encola encima.
+    #[test]
+    fn r14_orden_de_hooks_no_se_solapa() {
+        let mut app = App::default();
+        let _ = update(&mut app, Message::HooksStatus("claude".into()));
+        assert!(app.hooks_busy.contains("claude"));
+        let _ = update(&mut app, Message::HooksPlan("claude".into()));
+        assert_eq!(app.hooks_busy.len(), 1, "el segundo pedido se ignora mientras el primero corre");
+    }
+
+    /// B7 (review-14): el eco de una tecla no sondea los paneles visibles sin foco.
+    #[test]
+    fn r14_eco_no_sondea_los_demas_paneles() {
+        let mut app = App { panes: vec![pane(1, "w"), pane(2, "w")], window: (1100.0, 700.0), ..Default::default() };
+        app.layouts.sync(&pane_keys(&app));
+        app.layouts.split(1, true, 2);
+        app.layouts.sync(&pane_keys(&app));
+        app.selected = Some(1);
+        let _ = update(&mut app, Message::Echo);
+        assert!(app.loading, "pide la pantalla del enfocado");
+        assert!(app.others_loading.is_empty(), "no pide a los demás paneles");
     }
 }
