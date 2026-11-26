@@ -311,6 +311,8 @@ enum Message {
     PaletteRun(usize),
     /// Ajustes (Cmd+,): abrir, cerrar, elegir sección; estado o plan/instalación de hooks de un agente.
     OpenSettings,
+    /// Arrastra la ventana desde un hueco de la barra de sesiones (M3).
+    DragWindow,
     CloseSettings,
     SettingsSection(settings::Section),
     HooksStatus(String),
@@ -1220,6 +1222,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 app.palette_cursor = (app.palette_cursor as isize + delta).rem_euclid(n as isize) as usize;
             }
             Task::none()
+        }
+        Message::DragWindow => {
+            // window::drag arrastra la ventana más reciente; no cambia el estado de la app.
+            iced::window::get_latest().and_then(iced::window::drag)
         }
         Message::OpenSettings => {
             app.settings = Some(settings::Section::General);
@@ -3099,5 +3105,20 @@ mod modelo_tests {
             galgo_proto::Request::Spawn { cmd, .. } => assert_eq!(cmd, vec!["claude"], "volver a predeterminado quita el flag"),
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod arrastre_tests {
+    use super::*;
+
+    /// M3 (review-14): arrastrar la barra no cambia el panel, la vista ni las capas.
+    #[test]
+    fn r14_arrastrar_la_barra_no_toca_el_estado() {
+        let p = PaneInfo { id: 1, name: "p".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None };
+        let mut app = App { window: (1100.0, 700.0), panes: vec![p], selected: Some(1), ..Default::default() };
+        let _ = update(&mut app, Message::DragWindow);
+        assert_eq!(app.selected, Some(1));
+        assert!(app.settings.is_none() && app.palette.is_none());
     }
 }

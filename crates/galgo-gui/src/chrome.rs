@@ -214,7 +214,9 @@ pub fn session_bar(app: &App) -> Element<'_, Message> {
     let current = focus_key(app);
     // M1: la ventana no muestra «(n)» en la barra de título (título oculto): el contador va aquí.
     let atencion = app.attention.count(&app.panes);
-    let mut bar = row![Space::with_width(78.0), text("galgo").size(theme::BODY_SIZE).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT)]
+    // M3: los huecos de la barra arrastran la ventana (window::drag); los botones de sesión siguen siendo clics.
+    let arrastre = || mouse_area(Space::with_width(Length::Fill)).on_press(Message::DragWindow);
+    let mut bar = row![mouse_area(Space::with_width(78.0)).on_press(Message::DragWindow), text("galgo").size(theme::BODY_SIZE).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT)]
         .spacing(8)
         .align_y(Alignment::Center)
         .height(TABS_H);
@@ -233,7 +235,7 @@ pub fn session_bar(app: &App) -> Element<'_, Message> {
     }
     bar = bar.push(icon_button(text("+").size(16).color(MUTED).into(), "Nuevo workspace  ⌘N", Message::OpenNewWorkspace));
     bar = bar
-        .push(Space::with_width(Length::Fill))
+        .push(arrastre())
         .push(icon_button(text("⌘").size(14).color(MUTED).into(), "Buscar o ejecutar  ⌘K", Message::OpenPalette))
         .push(Space::with_width(8));
     container(bar).width(Length::Fill).style(theme::surface(SIDEBAR)).into()
