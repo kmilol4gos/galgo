@@ -151,6 +151,7 @@ pub fn spawn_request(form: &NewPane, rows: u16, cols: u16, env: &Env) -> Result<
         rows,
         cols,
         workspace: Some(form.workspace.trim().to_string()).filter(|w| !w.is_empty()),
+        worktree: None,
     })
 }
 

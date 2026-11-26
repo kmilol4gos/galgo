@@ -82,6 +82,7 @@ pub fn spawn_request(name: &str, cmd: Vec<String>, cwd: &str, workspace: Option<
         rows,
         cols,
         workspace,
+        worktree: None,
     }
 }
 

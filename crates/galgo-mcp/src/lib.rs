@@ -165,6 +165,7 @@ fn build_request(name: &str, args: &Value, env: &Env) -> Result<Request, String>
             rows: 40,
             cols: 140,
             workspace: opt_str(args, "workspace"),
+            worktree: opt_str(args, "worktree"),
         }),
         "galgo_send" => Ok(Request::Send {
             pane: str_arg(args, "pane")?,
@@ -256,6 +257,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "cmd": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Comando y argumentos." },
                 "manager": { "type": "string", "description": "Panel que recibe el resultado de este." },
                 "workspace": { "type": "string", "description": "Workspace del panel, p. ej. \"inventia/cotizacion\". Si falta, se deduce del repo git de cwd." },
+                "worktree": { "type": "string", "description": "Rama nueva para un worktree git propio del panel (desde el repo de cwd). El panel arranca dentro de ese worktree." },
                 "cwd": { "type": "string", "description": "Directorio de trabajo. Por defecto, el del servidor MCP." },
             }),
             &["name", "cmd"],

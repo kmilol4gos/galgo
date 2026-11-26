@@ -448,6 +448,60 @@ fn persist_loop(d: Arc<Daemon>, rx: std::sync::mpsc::Receiver<()>) {
     }
 }
 
+/// Carpeta de los worktrees de tareas: `~/.galgo/worktrees/<repo>/<rama>`.
+fn worktrees_base() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".galgo").join("worktrees")
+}
+
+/// Ejecuta git sin tiempo límite (crear un worktree puede tardar con un repo grande) y devuelve su salida o su error.
+fn git_run(dir: &str, args: &[&str]) -> std::result::Result<String, String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for var in GIT_ENV_REMOVE {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().map_err(|e| format!("no pude ejecutar git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Nombre de rama que git acepta y que no puede parecer una opción (no empieza por `-`) ni llevar espacios.
+fn rama_valida(dir: &str, rama: &str) -> std::result::Result<(), String> {
+    let mal = || format!("nombre de rama no válido: {rama:?}");
+    if rama.starts_with('-') || rama.contains("@{") || rama.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(mal());
+    }
+    git_run(dir, &["check-ref-format", "--branch", rama]).map(|_| ()).map_err(|_| mal())
+}
+
+/// Crea el worktree de una tarea: rama nueva desde HEAD en `<base>/<repo>/<rama>`. Devuelve su ruta y la raíz
+/// del repo original (de ahí sale el workspace). No borra nada: si la rama o la carpeta ya existen, falla.
+fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(PathBuf, String), String> {
+    let top = git_run(dir, &["rev-parse", "--show-toplevel"]).map_err(|_| format!("{dir} no está en un repo git"))?;
+    rama_valida(&top, rama)?;
+    let repo = Path::new(&top).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
+    let carpeta: String = rama.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect();
+    let path = base.join(repo).join(carpeta);
+    if path.exists() {
+        return Err(format!("ya existe {}", path.display()));
+    }
+    if let Some(padre) = path.parent() {
+        std::fs::create_dir_all(padre).map_err(|e| format!("no pude crear {}: {e}", padre.display()))?;
+    }
+    let destino = path.to_string_lossy().into_owned();
+    git_run(&top, &["worktree", "add", "-b", rama, &destino])?;
+    Ok((path, top))
+}
+
 /// Deduce el workspace de un directorio dentro de un repo git: "<repo>/<rama>". Sin git, o con el
 /// HEAD desligado, devuelve `None` o solo el nombre del repo. Nunca falla: git ausente no es un error.
 fn workspace_for(cwd: Option<&str>) -> Option<String> {
@@ -953,13 +1007,32 @@ impl Daemon {
 
     async fn handle(self: &Arc<Self>, req: Request) -> Result<Value> {
         match req {
-            Request::Spawn { name, cmd, cwd, manager, inject, rows, cols, workspace } => {
-                // git puede tardar (red, disco lento): la consulta va fuera del hilo de peticiones y con tiempo límite.
-                let workspace = match workspace.filter(|w| !w.trim().is_empty()) {
-                    Some(w) => Some(w),
+            Request::Spawn { name, cmd, cwd, manager, inject, rows, cols, workspace, worktree } => {
+                let rama = worktree.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+                let (cwd, workspace) = match rama {
+                    // Worktree propio: el panel arranca dentro, y el workspace sale del repo original, no del worktree.
+                    Some(rama) => {
+                        let dir = cwd.clone().ok_or_else(|| anyhow!("un worktree necesita un directorio de trabajo"))?;
+                        let base = worktrees_base();
+                        let r = rama.clone();
+                        let (path, top) = tokio::task::spawn_blocking(move || crear_worktree(&dir, &r, &base))
+                            .await?
+                            .map_err(|e| anyhow!("{e}"))?;
+                        let workspace = workspace
+                            .filter(|w| !w.trim().is_empty())
+                            .or_else(|| Some(clean_label(&workspace_name(&top, &rama))).filter(|w| !w.is_empty()));
+                        (Some(path.to_string_lossy().into_owned()), workspace)
+                    }
                     None => {
-                        let dir = cwd.clone();
-                        tokio::task::spawn_blocking(move || workspace_for(dir.as_deref())).await?
+                        // git puede tardar (red, disco lento): la consulta va fuera del hilo de peticiones y con tiempo límite.
+                        let workspace = match workspace.filter(|w| !w.trim().is_empty()) {
+                            Some(w) => Some(w),
+                            None => {
+                                let dir = cwd.clone();
+                                tokio::task::spawn_blocking(move || workspace_for(dir.as_deref())).await?
+                            }
+                        };
+                        (cwd, workspace)
                     }
                 };
                 let (id, inherited) = self.spawn_pane(name, cmd, cwd, manager, inject, rows, cols, workspace)?;
@@ -1980,5 +2053,61 @@ mod r14_tests {
         assert!(check_text("el título", "bug \u{202E}ventas", MAX_LABEL).is_err());
         assert!(check_text("el nombre", "a\u{200B}b", MAX_LABEL).is_err());
         assert!(check_text("el título", "bug de ventas", MAX_LABEL).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    /// Repo git de prueba con un commit, en un directorio temporal propio del test.
+    fn repo_de_prueba(nombre: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("galgo-wt-{nombre}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        git_run(&d, &["init", "-q"]).unwrap();
+        git_run(&d, &["-c", "user.name=galgo", "-c", "user.email=galgo@test", "commit", "-q", "--allow-empty", "-m", "base"]).unwrap();
+        dir
+    }
+
+    /// Un panel de tarea arranca en su propio worktree, con una rama nueva y el workspace del repo original.
+    #[test]
+    fn crear_worktree_deja_rama_y_carpeta() {
+        let repo = repo_de_prueba("crear");
+        let base = repo.join("..").join(format!("galgo-wt-base-{}", std::process::id()));
+        let d = repo.to_string_lossy().into_owned();
+        let (path, top) = crear_worktree(&d, "tarea/uno", &base).unwrap();
+        assert!(path.join(".git").exists(), "el worktree tiene su .git");
+        assert_eq!(git_run(&path.to_string_lossy(), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(), "tarea/uno");
+        assert_eq!(workspace_name(&top, "tarea/uno"), format!("{}/tarea/uno", repo.file_name().unwrap().to_string_lossy()));
+        // La rama ya existe: falla sin tocar el worktree anterior.
+        assert!(crear_worktree(&d, "tarea/uno", &base).is_err());
+        let _ = git_run(&d, &["worktree", "remove", "--force", &path.to_string_lossy()]);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Un nombre que git no acepta, o que parece una opción, no crea nada.
+    #[test]
+    fn rama_peligrosa_se_rechaza() {
+        let repo = repo_de_prueba("nombres");
+        let base = repo.join("..").join(format!("galgo-wt-nombres-base-{}", std::process::id()));
+        let d = repo.to_string_lossy().into_owned();
+        for mala in ["-f", "a..b", "con espacio", "x@{1}", "rama.lock", ""] {
+            assert!(crear_worktree(&d, mala, &base).is_err(), "{mala:?} debe rechazarse");
+        }
+        assert!(!base.exists(), "ningún nombre malo llega a crear carpetas");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Fuera de un repo git no hay worktree posible.
+    #[test]
+    fn fuera_de_repo_no_hay_worktree() {
+        let dir = std::env::temp_dir().join(format!("galgo-wt-sin-repo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base");
+        assert!(crear_worktree(&dir.to_string_lossy(), "tarea", &base).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

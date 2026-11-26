@@ -1345,6 +1345,24 @@ p=[x for x in json.load(sys.stdin) if x["name"]=="t138"][0]
 assert p.get("title") is None'
 check "un título vacío lo borra" $?
 galgo title $'x\e[31m' --pane t138 >/dev/null 2>&1; [ $? -ne 0 ]; check "un título con caracteres de control se rechaza" $?
+
+echo "139. worktree de tarea: spawn --worktree crea un worktree propio en una rama nueva y el panel arranca dentro"
+mkdir -p "$TMP/c139" && chmod 700 "$TMP/c139"
+export GALGO_SOCKET="$TMP/c139/g.sock"
+H139="$TMP/home139"; mkdir -p "$H139"
+R139="$TMP/c139/repo"; mkdir -p "$R139" && git -C "$R139" init -q && git -C "$R139" -c user.name=e2e -c user.email=e2e@test commit -q --allow-empty -m base
+HOME="$H139" galgo spawn wt139 --cwd "$R139" --worktree tarea-e2e -- bash --norc >/dev/null; check "spawn con --worktree" $?
+WT139=$(galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="wt139"][0]
+print(p["cwd"])')
+case "$WT139" in "$H139/.galgo/worktrees/"*) true;; *) false;; esac; check "el panel arranca en ~/.galgo/worktrees" $?
+[ "$(git -C "$WT139" rev-parse --abbrev-ref HEAD)" = tarea-e2e ]; check "el worktree está en la rama nueva" $?
+galgo --json ls | python3 -c 'import json,sys
+p=[x for x in json.load(sys.stdin) if x["name"]=="wt139"][0]
+assert p["workspace"]=="repo/tarea-e2e", p.get("workspace")'
+check "el workspace sale del repo original" $?
+HOME="$H139" galgo spawn wt139b --cwd "$R139" --worktree tarea-e2e -- bash --norc >/dev/null 2>&1; [ $? -ne 0 ]; check "una rama que ya existe se rechaza" $?
+HOME="$H139" galgo spawn wt139c --cwd "$TMP" --worktree otra -- bash --norc >/dev/null 2>&1; [ $? -ne 0 ]; check "fuera de un repo git no hay worktree" $?
 galgo stop >/dev/null 2>&1; sleep 0.3
 export GALGO_SOCKET="$TMP/galgo.sock"
 

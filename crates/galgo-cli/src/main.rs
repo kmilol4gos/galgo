@@ -40,6 +40,9 @@ enum Cmd {
         /// Workspace del panel, p. ej. "inventia/cotizacion". Si falta, se deduce del repo git de --cwd.
         #[arg(long)]
         workspace: Option<String>,
+        /// Crea una rama nueva con su propio worktree git (en ~/.galgo/worktrees/<repo>/<rama>) y arranca el panel ahí.
+        #[arg(long)]
+        worktree: Option<String>,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -150,8 +153,9 @@ fn run() -> Result<()> {
         _ => {}
     }
     let req = match &cli.cmd {
-        Cmd::Spawn { name, manager, inject, cwd, workspace, cmd } => Request::Spawn {
+        Cmd::Spawn { name, manager, inject, cwd, workspace, worktree, cmd } => Request::Spawn {
             workspace: workspace.clone(),
+            worktree: worktree.clone(),
             name: name.clone(),
             cmd: cmd.clone(),
             cwd: {

@@ -108,6 +108,10 @@ pub enum Request {
         /// del directorio de trabajo ("<repo>/<rama>").
         #[serde(default)]
         workspace: Option<String>,
+        /// Rama nueva para un worktree git propio del panel (`git worktree add -b <rama>`), creado desde el repo
+        /// de `cwd`. El panel arranca dentro de ese worktree; el workspace sale del repo original.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
     },
     List,
     Send {
