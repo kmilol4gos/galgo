@@ -10,6 +10,7 @@ use theme::{BG, MUTED, SIDEBAR, TEXT};
 mod attention;
 mod chrome;
 mod launch;
+mod fonts;
 mod layout;
 mod newpane;
 mod palette;
@@ -83,7 +84,7 @@ struct Selection {
 }
 
 fn terminal_font() -> Font {
-    Font::with_name("Menlo")
+    Font::with_name(fonts::current())
 }
 
 /// Último error de envío que el hilo de `outbox` no pudo entregar. La GUI lo muestra.
@@ -209,6 +210,9 @@ struct App {
     launcher: bool,
     /// Modelo elegido en el lanzador, por agente (la etiqueta del agente → modelo).
     launch_model: std::collections::HashMap<String, String>,
+    /// Fuentes Nerd instaladas detectadas al arrancar, y dónde se guarda la elección de fuente.
+    font_installed: Vec<&'static str>,
+    prefs_path: Option<std::path::PathBuf>,
     /// Ajustes abiertos: la sección elegida, y la salida de la CLI por agente (estado de hooks y planes).
     settings: Option<settings::Section>,
     hooks_output: std::collections::HashMap<String, String>,
@@ -313,6 +317,8 @@ enum Message {
     OpenSettings,
     /// Arrastra la ventana desde un hueco de la barra de sesiones (M3).
     DragWindow,
+    /// Fuente del terminal elegida en Ajustes > Terminal; None = la automática (la primera Nerd Font instalada).
+    SetTerminalFont(Option<String>),
     /// Elige un workspace por su clave (B4): la barra de sesiones y la paleta no usan posiciones.
     SelectWorkspace(String),
     /// Eco de una tecla: pide solo la pantalla del panel enfocado (B7), sin sondear los demás.
@@ -1249,6 +1255,17 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             _ => Task::none(),
         },
+        Message::SetTerminalFont(choice) => {
+            let family = match &choice {
+                Some(name) => fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == name.as_str()).unwrap_or("Menlo"),
+                None => fonts::automatic(&app.font_installed),
+            };
+            fonts::set_current(family);
+            if let Some(path) = &app.prefs_path {
+                let _ = fonts::save(path, choice.as_deref());
+            }
+            Task::none()
+        }
         Message::DragWindow => {
             // window::drag arrastra la ventana más reciente; no cambia el estado de la app.
             iced::window::get_latest().and_then(iced::window::drag)
@@ -1945,7 +1962,20 @@ fn main() -> iced::Result {
         })
         .run_with(|| {
             let file = recents::file();
-            let app = App { window: (1100.0, 700.0), focused: true, recents: recents::load(&file), recents_path: Some(file), ..Default::default() };
+            // Fuente: la elección guardada si la hay y sigue instalada; si no, la automática (Nerd Font o Menlo).
+            let prefs = file.with_file_name("gui-prefs.json");
+            let installed: Vec<&'static str> = fonts::detect(&fonts::font_dirs());
+            let elegida = fonts::load(&prefs).and_then(|name| fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == name).filter(|f| installed.contains(f)));
+            fonts::set_current(elegida.unwrap_or_else(|| fonts::automatic(&installed)));
+            let app = App {
+                window: (1100.0, 700.0),
+                focused: true,
+                recents: recents::load(&file),
+                recents_path: Some(file),
+                font_installed: installed,
+                prefs_path: Some(prefs),
+                ..Default::default()
+            };
             (app, Task::batch([load_panes(), load_limits()]))
         })
 }

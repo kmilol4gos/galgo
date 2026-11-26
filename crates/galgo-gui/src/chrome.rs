@@ -766,9 +766,17 @@ fn settings_content(app: &App, section: settings::Section) -> Element<'_, Messag
         }
         settings::Section::Terminal => {
             col = col
-                .push(kv("Fuente del terminal".into(), "Menlo".into()))
+                .push(kv("Fuente del terminal".into(), fonts::current().into()))
                 .push(kv("Historial".into(), "el del daemon (scrollback)".into()))
                 .push(kv("Selección".into(), "por celda, con copia en el portapapeles".into()));
+            // Elegir fuente: «Automática» (la primera Nerd Font instalada) o una de las detectadas.
+            let mut opciones = row![theme::btn_secondary(text("Automática").size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::SetTerminalFont(None))].spacing(8.0);
+            for familia in &app.font_installed {
+                opciones = opciones.push(
+                    theme::btn_secondary(text(familia.to_string()).size(theme::SMALL_SIZE)).padding([4, 10]).on_press(Message::SetTerminalFont(Some(familia.to_string()))),
+                );
+            }
+            col = col.push(text("Fuente que se usa en los paneles:").size(theme::SMALL_SIZE).color(MUTED)).push(opciones);
         }
         settings::Section::Shortcuts => {
             for (keys, what) in settings::SHORTCUTS {
