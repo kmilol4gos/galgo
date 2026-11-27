@@ -48,6 +48,38 @@ pub fn nombres(v: &Value) -> Vec<String> {
     out
 }
 
+/// Orden y pestaña activa de cada panel guardado, por nombre: (orden de su pestaña, si era la activa de su workspace).
+/// Sirve para colocar un panel que vuelve después de la restauración, cuando su pestaña no existía aún.
+pub fn ordenes_pendientes(v: &Value) -> std::collections::HashMap<String, (u64, bool)> {
+    fn hojas(t: &Value, out: &mut Vec<String>) {
+        if let Some(n) = t.get("leaf").and_then(Value::as_str) {
+            out.push(n.to_string());
+        }
+        if let Some(s) = t.get("split") {
+            for k in ["a", "b"] {
+                if let Some(x) = s.get(k) {
+                    hojas(x, out);
+                }
+            }
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for ws in v.get("workspaces").and_then(Value::as_array).into_iter().flatten() {
+        let activa = ws.get("active").and_then(Value::as_u64).unwrap_or(0) as usize;
+        for (i, t) in ws.get("tabs").and_then(Value::as_array).into_iter().flatten().enumerate() {
+            let orden = t.get("orden").and_then(Value::as_u64).unwrap_or(i as u64);
+            let mut names = Vec::new();
+            if let Some(tree) = t.get("tree") {
+                hojas(tree, &mut names);
+            }
+            for n in names {
+                out.insert(n, (orden, i == activa));
+            }
+        }
+    }
+    out
+}
+
 /// Metadatos de los paneles guardados junto a la disposición: nombre → (cwd, workspace). Sirven para relanzar un
 /// shell nuevo, en su carpeta, cuando su panel no vuelve tras un reinicio (M3).
 pub type MetaPaneles = BTreeMap<String, (Option<String>, Option<String>)>;
@@ -137,7 +169,8 @@ pub fn restore(v: &Value, id_de: &dyn Fn(&str) -> Option<u32>) -> Restored {
     // Sin «orden» (guardados antiguos): se numeran en el orden en que vienen.
     let mut sin_orden = 0u64;
     for ws in list.iter().take(MAX_WORKSPACES) {
-        let Some(key) = ws.get("key").and_then(Value::as_str).filter(|k| !k.is_empty() && k.len() <= 200) else { continue };
+        // La clave vacía es «sin workspace»: sus pestañas también se restauran.
+        let Some(key) = ws.get("key").and_then(Value::as_str).filter(|k| k.len() <= 200) else { continue };
         let mut tabs = Vec::new();
         for t in ws.get("tabs").and_then(Value::as_array).into_iter().flatten().take(MAX_TABS) {
             let Some(root) = t.get("tree").and_then(|tree| json_to_tree(tree, id_de)).and_then(|r| sin_repetidos(r, &mut vistos)) else { continue };
@@ -249,6 +282,21 @@ mod tests {
     }
 
     /// Entradas malformadas o fuera de límite no rompen la restauración.
+    /// Las pestañas sin workspace (clave vacía) se restauran con su orden y su pestaña activa.
+    #[test]
+    fn las_pestanas_sin_workspace_se_restauran() {
+        let guardado = json!({ "workspaces": [{ "key": "", "active": 1, "tabs": [
+            { "focus": "claude", "orden": 0, "tree": { "leaf": "claude" } },
+            { "focus": "shell", "orden": 2, "tree": { "leaf": "shell" } },
+        ] }] });
+        let r = restore(&guardado, &ids);
+        let ws = &r.by_key[""];
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.active, 1);
+        assert_eq!(ws.tabs[1].orden, 2);
+        assert_eq!(ws.tabs[1].root.ids(), vec![1]);
+    }
+
     #[test]
     fn datos_raros_se_ignoran() {
         let r = restore(&json!({ "workspaces": [ 7, { "key": "", "tabs": [] }, { "key": "x", "tabs": [{ "tree": { "nada": 1 } }] } ] }), &ids);

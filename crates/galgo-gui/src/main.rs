@@ -415,7 +415,6 @@ enum Message {
     LaunchFailed(String, String),
     /// Pestañas y splits (E): cambiar de pestaña, elegir una, dividir el panel enfocado, mover el foco por direcciones.
     NextTab(isize),
-    SelectTab(usize),
     /// Una pestaña de cualquier workspace (la barra es plana): selecciona su grupo y esa pestaña.
     SelectTabIn(String, usize),
     SplitFocused(bool),
@@ -1200,8 +1199,9 @@ fn focus_key(app: &App) -> Option<String> {
 }
 
 /// Pares (id, clave de workspace) de todos los paneles, para alinear el layout.
-fn pane_keys(app: &App) -> Vec<(u32, String)> {
-    app.panes.iter().map(|p| (p.id, p.workspace.clone().unwrap_or_default())).collect()
+/// Como `pane_keys`, con el nombre de cada panel: para recuperar su orden tras un reinicio.
+fn pane_nombres(app: &App) -> Vec<(u32, String, String)> {
+    app.panes.iter().map(|p| (p.id, p.workspace.clone().unwrap_or_default(), p.name.clone())).collect()
 }
 
 /// Pantalla que se muestra: la congelada si hay selección, si no la última recibida.
@@ -1617,6 +1617,13 @@ fn intentar_restaurar(app: &mut App) -> Task<Message> {
     let r = workspace::restore(&v, &|n| ids.get(n).copied());
     app.explicit = r.explicit;
     app.layouts.cargar(r.by_key);
+    // El panel que tenía el foco vuelve a tenerlo (si ya está; si no, el primero, como siempre).
+    if let Some(id) = v.get("foco").and_then(serde_json::Value::as_str).and_then(|n| ids.get(n)) {
+        app.pending_focus = Some(*id);
+    }
+    // Los paneles que aún no han vuelto conservan su orden y su pestaña activa para cuando aparezcan.
+    let pendientes = workspace::ordenes_pendientes(&v).into_iter().filter(|(n, _)| !ids.contains_key(n)).collect();
+    app.layouts.recordar_pendientes(pendientes);
     app.ws_pendiente = None;
     app.ws_restored = true;
     Task::batch(tareas)
@@ -1648,6 +1655,8 @@ fn persist_workspaces(app: &mut App) {
             .map(|(n, (cwd, ws))| (n.clone(), serde_json::json!({ "cwd": cwd, "workspace": ws })))
             .collect();
         obj.insert("panes".into(), serde_json::Value::Object(panes));
+        // El panel con foco: tras un reinicio es el que queda seleccionado (y así, su pestaña, la activa).
+        obj.insert("foco".into(), serde_json::json!(app.selected.and_then(|id| nombres.get(&id).cloned())));
     }
     let texto = v.to_string();
     if texto != app.ws_saved {
@@ -1866,18 +1875,6 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 None => Task::none(),
             }
         }
-        Message::SelectTab(index) => {
-            let Some(key) = focus_key(app) else { return Task::none() };
-            if let Some(ws) = app.layouts.by_key.get_mut(&key) {
-                if index < ws.tabs.len() {
-                    ws.active = index;
-                }
-            }
-            match app.layouts.active_tab(&key).map(|t| t.focus) {
-                Some(id) => select(app, id),
-                None => Task::none(),
-            }
-        }
         Message::SplitFocused(vertical) => {
             let Some(focus) = app.selected else { return Task::none() };
             let (workspace, cwd) = focus_context(app);
@@ -1929,7 +1926,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     if let Some((focus, vertical)) = app.pending_split.remove(&p.name) {
                         app.layouts.split(focus, vertical, p.id);
                     }
-                    app.layouts.sync(&pane_keys(app));
+                    app.layouts.sync_nombrado(&pane_nombres(app));
                     app.layouts.focus(p.id);
                     let task = select(app, p.id);
                     Task::batch([task, load_panes()])
@@ -2366,7 +2363,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                             arranque = Some(open_terminal(app, home_dir(), false));
                         }
                     }
-                    app.layouts.sync(&pane_keys(app));
+                    app.layouts.sync_nombrado(&pane_nombres(app));
                     app.others.retain(|id, _| app.panes.iter().any(|p| p.id == *id));
                     app.others_gen.retain(|id, _| app.panes.iter().any(|p| p.id == *id));
                     if app.selected.is_some_and(|id| !app.panes.iter().any(|p| p.id == id)) {
@@ -3115,7 +3112,7 @@ mod tests {
         let mut p1 = pane_info(1, "uno", Status::Idle);
         p1.workspace = Some("w".into());
         app.panes = vec![p1];
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         assert!(matches!(layout_resizes(&mut app).as_slice(), [Request::Resize { pane, .. }] if pane == "1"));
         assert!(layout_resizes(&mut app).is_empty());
     }
@@ -3511,7 +3508,7 @@ mod tests {
         jefe.workspace = Some("ws".into());
         app.panes = vec![jefe];
         app.roles.insert("jefe".into(), "manager".into());
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.selected = Some(1);
         let _ = update(&mut app, Message::OpenAgentForm);
         assert_eq!(app.agent_form.as_ref().map(|f| f.role), Some(launch::Role::Worker), "ya hay manager: el rol por defecto es worker");
@@ -3559,7 +3556,7 @@ mod tests {
         let mut p = pane_info(1, "shell", Status::Idle);
         p.cwd = Some(root.clone());
         app.panes = vec![p];
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.selected = Some(1);
         let _ = update(&mut app, Message::TeamRequested(TeamSource::Repo));
         assert!(app.team_pending.is_some(), "la primera vez se pide confirmación");
@@ -3614,7 +3611,7 @@ mod tests {
     fn dialogo_abierto_es_dueno_del_teclado() {
         let mut app = App::default();
         app.panes = vec![pane_info(1, "shell", Status::Idle)];
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.selected = Some(1);
         app.agent_form = Some(AgentForm::para(&app));
         assert!(overlay_owns_keyboard(&app));
@@ -3670,7 +3667,7 @@ mod tests {
     fn arrastrar_archivo_no_pega_control() {
         let mut app = App::default();
         app.panes = vec![pane_info(1, "shell", Status::Idle)];
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.selected = Some(1);
         let _ = update(&mut app, Message::FileDropped(std::path::PathBuf::from("/tmp/a\u{3}touch x")));
         assert!(app.error.as_deref().is_some_and(|e| e.contains("control")), "un nombre con Ctrl-C no se pega");
@@ -3699,7 +3696,7 @@ mod tests {
         let mut p = pane_info(1, "shell", Status::Idle);
         p.cwd = Some(root.clone());
         app.panes = vec![p];
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.selected = Some(1);
         let _ = update(&mut app, Message::TeamRequested(TeamSource::Preset(0)));
         assert!(app.team_pending.as_ref().is_some_and(|t| t.preset), "un integrado pide confirmación");
@@ -3959,7 +3956,7 @@ mod tests {
         let mut p1 = pane_info(1, "uno", Status::Idle);
         p1.workspace = Some("repo/main".into());
         let mut app = App { panes: vec![p1], selected: Some(1), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::SplitFocused(true));
         assert_eq!(app.pending_split.get("shell"), Some(&(1, true)));
         let mut p2 = pane_info(2, "shell", Status::Idle);
@@ -3977,7 +3974,7 @@ mod tests {
     #[test]
     fn un_split_fallido_no_deja_el_pendiente() {
         let mut app = App { panes: vec![pane_info(1, "uno", Status::Idle)], selected: Some(1), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::SplitFocused(false));
         let _ = update(&mut app, Message::LaunchFailed("shell".into(), "sin daemon".into()));
         assert!(app.pending_split.is_empty());
@@ -3987,10 +3984,10 @@ mod tests {
     #[test]
     fn foco_por_direccion_entre_splits() {
         let mut app = App { panes: vec![pane_info(1, "izq", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.layouts.split(1, true, 2);
         app.panes.push(pane_info(2, "der", Status::Idle));
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.selected = Some(2);
         let _ = update(&mut app, Message::FocusDir(layout::Dir::Left));
         assert_eq!(app.selected, Some(1));
@@ -4002,7 +3999,7 @@ mod tests {
     #[test]
     fn geometria_del_panel_unico_y_del_split() {
         let mut app = App { panes: vec![pane_info(1, "uno", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         assert_eq!(focus_origin(&app), term_origin(), "un panel sin split usa el origen de referencia");
         app.layouts.split(1, true, 2);
         app.panes.push(pane_info(2, "dos", Status::Idle));
@@ -4018,10 +4015,10 @@ mod tests {
     #[test]
     fn paneles_visibles_se_sondean_por_turnos() {
         let mut app = App { panes: vec![pane_info(1, "a", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.layouts.split(1, true, 2);
         app.panes.push(pane_info(2, "b", Status::Idle));
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let first = next_other(&mut app);
         assert_eq!(first, Some(2), "el único sin foco");
         // Como en el tick: mientras su respuesta no llega, no se vuelve a pedir.
@@ -4037,7 +4034,7 @@ mod tests {
     #[test]
     fn cambiar_de_pestana_lleva_el_foco() {
         let mut app = App { panes: vec![pane_info(1, "a", Status::Idle), pane_info(2, "b", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.layouts.focus(1);
         assert_eq!(app.layouts.by_key[""].tabs.len(), 2, "dos paneles sin workspace, dos pestañas");
         let _ = update(&mut app, Message::NextTab(1));
@@ -4097,9 +4094,9 @@ mod tests {
         let mut dos = pane_info(2, "dos", Status::Idle);
         dos.workspace = Some("r/main".into());
         let mut app = App { panes: vec![otro, uno, dos], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.layouts.split(1, true, 2);
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::Select(2));
         let _ = update(&mut app, Message::ConfirmClose);
         app.panes.retain(|p| p.id != 2);
@@ -4115,7 +4112,7 @@ mod tests {
         let mut uno = pane_info(1, "uno", Status::Idle);
         uno.workspace = Some("r/main".into());
         let mut app = App { panes: vec![uno], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = layout_resizes(&mut app);
         let _ = update(&mut app, Message::SplitFocused(true));
         let mut dos = pane_info(2, "shell", Status::Idle);
@@ -4136,9 +4133,9 @@ mod tests {
         let mut dos = pane_info(2, "dos", Status::Idle);
         dos.workspace = Some("r/main".into());
         let mut app = App { panes: vec![uno, dos], selected: Some(1), window: (1100.0, 700.0), snap: Some(snap(&["x"; 40], 120)), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.layouts.split(1, true, 2);
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let (_, derecha) = layout::halves(terminal_area_for(&app), true);
         let punto = Point::new(derecha.x + derecha.w / 2.0, derecha.y + derecha.h / 2.0);
         app.pointer = Some(punto);
@@ -4160,7 +4157,7 @@ mod tests {
             })
             .collect();
         let mut app = App { panes, window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::Select(3));
         assert_eq!(app.layouts.active_tab("w").unwrap().focus, 3);
         let _ = update(&mut app, Message::SelectWorkspaceAt(0));
@@ -4173,7 +4170,7 @@ mod tests {
         let mut uno = pane_info(1, "uno", Status::Idle);
         uno.workspace = Some("r/main".into());
         let mut app = App { panes: vec![uno], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::SplitFocused(true));
         let _ = update(&mut app, Message::SplitFocused(false));
         assert_eq!(app.inflight, vec!["shell".to_string(), "shell-2".to_string()], "nombres distintos aunque estén en vuelo");
@@ -4204,7 +4201,7 @@ mod tests {
     #[test]
     fn r13_cambiar_de_foco_no_deja_la_pantalla_vacia() {
         let mut app = App { panes: vec![pane_info(1, "a", Status::Idle), pane_info(2, "b", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), snap: Some(snap(&["uno"], 8)), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::Select(2));
         assert!(app.others.contains_key(&1), "la pantalla del 1 se guarda al perder el foco");
         assert!(app.snap.is_none(), "el panel 2 no tiene pantalla todavía: no se muestra la del 1");
@@ -4348,7 +4345,7 @@ mod render {
         let y = ws(5, "shell", "inventia/cotizacion", Status::Idle);
         let _ = &mut ws;
         app.panes = vec![c, s, w, x, y];
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         // nexo/main: pestaña 1 = claude | shell (split), pestaña 2 = worker-tests.
         let mut l = layout::Layouts::default();
         l.new_tab("nexo/main", 1);
@@ -4445,7 +4442,7 @@ mod render {
             },
         );
         app.selected = Some(1);
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app
         };
         render(&base(), size, &dir.join("grupo-equipo.png"));
@@ -4491,7 +4488,7 @@ mod render {
             let nombre: &'static str = fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == familia).unwrap_or("Menlo");
             fonts::set_current(nombre);
             let mut app = App { window: ((cols + COLS_MARGIN as f32) * cell_w() + 2.0 * LEAF_PAD + SIDEBAR_W, 240.0), panes: vec![pane_info(1, "shell", Status::Idle)], selected: Some(1), snap: Some(snap.clone()), ..Default::default() };
-            app.layouts.sync(&pane_keys(&app));
+            app.layouts.sync_nombrado(&pane_nombres(&app));
             let archivo = format!("snap-{}.png", familia.replace(' ', "_"));
             render(&app, (app.window.0 as u32, 240), &dir.join(archivo));
         }
@@ -4505,7 +4502,7 @@ mod render {
         let dir = std::path::PathBuf::from(std::env::var("GALGO_UX_DIR").unwrap_or_else(|_| "/tmp/galgo-ux".into()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut app = App { window: (900.0, 220.0), panes: vec![pane_info(1, "shell", Status::Idle)], selected: Some(1), snap: Some(prompt_p10k()), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         // Experimento: Menlo con los símbolos empaquetados cargados en el sistema de fuentes de iced.
         iced_graphics::text::font_system().write().unwrap().load_font(std::borrow::Cow::Borrowed(SYMBOLS_FONT));
         for familia in ["Menlo", "MesloLGLDZ Nerd Font Mono"] {
@@ -4748,9 +4745,9 @@ mod capas_tests {
         let dos = PaneInfo { id: 2, name: "b".into(), ..uno.clone() };
         uno.id = 1;
         let mut app = App { panes: vec![uno, dos], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.layouts.split(1, true, 2);
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.settings = Some(settings::Section::General);
         assert_eq!(body_mode(&app), Body::Settings);
         let cmd_opt = keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT;
@@ -4774,7 +4771,7 @@ mod r14_b_tests {
     #[test]
     fn r14_sesion_se_elige_por_clave() {
         let mut app = App { panes: vec![pane(1, "repo/main"), pane(2, "otro/dev")], window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::SelectWorkspace("repo/main".into()));
         assert_eq!(app.selected, Some(1));
         let _ = update(&mut app, Message::SelectWorkspace("otro/dev".into()));
@@ -4795,9 +4792,9 @@ mod r14_b_tests {
     #[test]
     fn r14_eco_no_sondea_los_demas_paneles() {
         let mut app = App { panes: vec![pane(1, "w"), pane(2, "w")], window: (1100.0, 700.0), ..Default::default() };
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.layouts.split(1, true, 2);
-        app.layouts.sync(&pane_keys(&app));
+        app.layouts.sync_nombrado(&pane_nombres(&app));
         app.selected = Some(1);
         let _ = update(&mut app, Message::Echo);
         assert!(app.loading, "pide la pantalla del enfocado");

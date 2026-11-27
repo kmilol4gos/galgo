@@ -1,7 +1,7 @@
 //! Pestañas y splits de cada workspace. Lógica pura: sin GUI ni daemon. Las hojas son ids de panel del daemon; el
 //! layout vive solo en la GUI (el daemon no sabe de pestañas ni de splits).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Rectángulo en píxeles de la ventana.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -230,12 +230,22 @@ pub struct Layouts {
     pub by_key: BTreeMap<String, WsTabs>,
     /// Siguiente número de orden para una pestaña nueva.
     pub siguiente: u64,
+    /// Paneles de la disposición restaurada que aún no han vuelto: nombre → (orden de su pestaña, si era la activa).
+    pub pendientes: HashMap<String, (u64, bool)>,
 }
 
 impl Layouts {
     /// Alinea el layout con los paneles reales: quita los que ya no existen (y las pestañas vacías), y pone en una
     /// pestaña nueva los que no aparecen todavía. `panes` son (id, clave de workspace).
+    #[cfg(test)]
     pub fn sync(&mut self, panes: &[(u32, String)]) {
+        let sin_nombre: Vec<(u32, String, String)> = panes.iter().map(|(id, k)| (*id, k.clone(), String::new())).collect();
+        self.sync_nombrado(&sin_nombre);
+    }
+
+    /// Como `sync`, pero con el nombre de cada panel (`(id, clave, nombre)`): un panel que vuelve tras un reinicio
+    /// recupera el orden y la pestaña activa que tenía en la disposición guardada.
+    pub fn sync_nombrado(&mut self, panes: &[(u32, String, String)]) {
         for ws in self.by_key.values_mut() {
             // Cada pestaña se reconstruye sin los paneles que ya no existen; si no le queda ninguno, se va.
             let old = std::mem::take(&mut ws.tabs);
@@ -243,7 +253,7 @@ impl Layouts {
                 let (focus, orden) = (tab.focus, tab.orden);
                 let mut root = Some(tab.root.clone());
                 for id in tab.root.ids() {
-                    if !panes.iter().any(|(p, _)| *p == id) {
+                    if !panes.iter().any(|(p, _, _)| *p == id) {
                         root = root.and_then(|r| r.without(id));
                     }
                 }
@@ -254,12 +264,24 @@ impl Layouts {
             ws.active = ws.active.min(ws.tabs.len().saturating_sub(1));
         }
         self.by_key.retain(|_, ws| !ws.tabs.is_empty());
-        for (id, key) in panes {
+        for (id, key, nombre) in panes {
             let known = self.by_key.values().any(|ws| ws.tabs.iter().any(|t| t.root.ids().contains(id)));
-            if !known {
-                self.new_tab(key, *id);
+            if known {
+                continue;
+            }
+            match self.pendientes.remove(nombre) {
+                Some((orden, activa)) => {
+                    let i = self.push_tab_con(key, Node::Leaf(*id), *id, Some(orden));
+                    if activa {
+                        if let Some(ws) = self.by_key.get_mut(key) {
+                            ws.active = i;
+                        }
+                    }
+                }
+                None => self.new_tab(key, *id),
             }
         }
+
         // Una pestaña cuyo foco ya no existe pasa a su primer panel.
         for ws in self.by_key.values_mut() {
             for tab in &mut ws.tabs {
@@ -284,11 +306,32 @@ impl Layouts {
 
     /// Añade una pestaña al final del workspace `key` con el siguiente número de orden. Devuelve su índice.
     pub fn push_tab(&mut self, key: &str, root: Node, focus: u32) -> usize {
-        let orden = self.siguiente;
-        self.siguiente += 1;
+        self.push_tab_con(key, root, focus, None)
+    }
+
+    /// Como `push_tab`, con un orden concreto (el guardado) o, si no, el siguiente.
+    fn push_tab_con(&mut self, key: &str, root: Node, focus: u32, orden: Option<u64>) -> usize {
+        let orden = match orden {
+            Some(o) => {
+                self.siguiente = self.siguiente.max(o + 1);
+                o
+            }
+            None => {
+                self.siguiente += 1;
+                self.siguiente - 1
+            }
+        };
         let ws = self.by_key.entry(key.to_string()).or_default();
         ws.tabs.push(Tab { root, focus, orden });
         ws.tabs.len() - 1
+    }
+
+    /// Guarda los paneles que aún no han vuelto de la disposición restaurada, con su orden.
+    pub fn recordar_pendientes(&mut self, pendientes: HashMap<String, (u64, bool)>) {
+        if let Some(mas_alto) = pendientes.values().map(|(o, _)| o + 1).max() {
+            self.siguiente = self.siguiente.max(mas_alto);
+        }
+        self.pendientes = pendientes;
     }
 
     /// Carga pestañas restauradas (con su orden guardado) y deja el contador por encima de todas.
@@ -377,6 +420,25 @@ mod tests {
         l.new_tab("zeta", 3);
         let orden: Vec<(String, usize)> = l.en_orden().into_iter().map(|(k, i)| (k.clone(), i)).collect();
         assert_eq!(orden, vec![("zeta".to_string(), 0), ("alfa".to_string(), 0), ("zeta".to_string(), 1)]);
+    }
+
+    /// Un panel que vuelve después de la restauración recupera su orden (aunque llegue antes que otro que iba delante)
+    /// y, si era la pestaña activa, sigue activa.
+    #[test]
+    fn el_panel_que_vuelve_recupera_su_orden_y_la_activa() {
+        let mut l = Layouts::default();
+        let mut pend = HashMap::new();
+        pend.insert("shell".to_string(), (0u64, true));
+        pend.insert("tres".to_string(), (2u64, false));
+        l.recordar_pendientes(pend);
+        // Llega primero «tres» y luego «shell», como en una relanzada real.
+        l.sync_nombrado(&[(10, String::new(), "tres".into()), (11, String::new(), "shell".into())]);
+        let ws = &l.by_key[""];
+        assert_eq!(ws.tabs[ws.active].focus, 11, "la activa sigue siendo shell");
+        let orden: Vec<u32> = l.en_orden().into_iter().map(|(k, i)| l.by_key[k].tabs[i].focus).collect();
+        assert_eq!(orden, vec![11, 10], "shell (orden 0) antes que tres (orden 2)");
+        l.new_tab("", 12);
+        assert_eq!(l.en_orden().last().map(|(k, i)| l.by_key[*k].tabs[*i].focus), Some(12), "lo nuevo va al final");
     }
 
     /// Tras restaurar, el orden guardado manda y las pestañas nuevas van detrás de todas.
