@@ -1625,6 +1625,26 @@ fn titulo_pestana(p: &PaneInfo) -> String {
     }
 }
 
+/// Qué eventos de la ventana llegan a la app. El clic izquierdo llega SIEMPRE: `rich_text` captura cualquier clic que
+/// caiga sobre texto, así que filtrar por «no capturado» dejaba sin foco ni selección a un terminal con contenido.
+/// Quien lo recibe comprueba dónde cae (capas abiertas, divisor, panel, cuadrícula).
+fn reenviar_evento(event: Event, status: event::Status) -> Option<Message> {
+    match event {
+        Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::Keyboard(keyboard::Event::ModifiersChanged(_)) => Some(Message::Event(event)),
+        Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
+        Event::Window(iced::window::Event::Resized(_))
+        | Event::Window(iced::window::Event::Opened { .. })
+        | Event::Window(iced::window::Event::Focused)
+        | Event::Window(iced::window::Event::Unfocused) => Some(Message::Event(event)),
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => Some(Message::Event(event)),
+        // La rueda que otro widget ya usó (una lista con scroll) no llega al terminal.
+        Event::Mouse(mouse::Event::WheelScrolled { .. }) if status == event::Status::Ignored => Some(Message::Event(event)),
+        // El soltar del botón siempre llega, para no dejar una selección arrastrándose.
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) | Event::Mouse(mouse::Event::CursorMoved { .. }) => Some(Message::Event(event)),
+        _ => None,
+    }
+}
+
 /// Shells que terminaron solos (`exit`, Ctrl-D): su pestaña se cierra, como en cualquier terminal. Un agente, un
 /// comando suelto, un manager o un panel con resultados sin confirmar se quedan para poder leerlos.
 fn shells_terminados(panes: &[PaneInfo]) -> Vec<u32> {
@@ -2904,6 +2924,14 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             if body_mode(app) != Body::Screen {
                 return Task::none();
             }
+            // La barra de búsqueda flota arriba a la derecha del panel: un clic en ella no es un clic en el terminal.
+            if app.buscar.is_some() {
+                if let (Some(p), Some(r)) = (app.pointer, app.selected.and_then(|id| pane_rect(app, id))) {
+                    if p.x > r.x + r.w - 380.0 && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + leaf_top() + 48.0 {
+                        return Task::none();
+                    }
+                }
+            }
             // Un clic en otro panel visible le da el foco; el arrastre empieza en el siguiente clic dentro de él.
             if let Some(id) = app.pointer.and_then(|p| leaf_at(app, p)) {
                 if app.selected != Some(id) {
@@ -3304,22 +3332,7 @@ fn main() -> iced::Result {
                 None => Subscription::none(),
             },
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TickList),
-            event::listen_with(|event, status, _id| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::Keyboard(keyboard::Event::ModifiersChanged(_)) => Some(Message::Event(event)),
-                Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
-                Event::Window(iced::window::Event::Resized(_))
-                | Event::Window(iced::window::Event::Opened { .. })
-                | Event::Window(iced::window::Event::Focused)
-                | Event::Window(iced::window::Event::Unfocused) => Some(Message::Event(event)),
-                // Lo que otro widget ya capturó (la lista, un botón, un campo) no llega al terminal.
-                // El soltar del botón siempre llega, para no dejar una selección arrastrándose.
-                Event::Mouse(mouse::Event::WheelScrolled { .. })
-                | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                    if status == event::Status::Ignored => Some(Message::Event(event)),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                | Event::Mouse(mouse::Event::CursorMoved { .. }) => Some(Message::Event(event)),
-                _ => None,
-            }),
+            event::listen_with(|event, status, _id| reenviar_evento(event, status)),
         ]))
         // Barra de título integrada: transparente y sin título, con el contenido bajo ella (Rex).
         .window(iced::window::Settings {
@@ -4452,6 +4465,16 @@ mod tests {
         let mut app = App { panes: vec![pane_info(1, "a", Status::Exited)], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::ConfirmClose);
         assert!(app.salir_al_vaciar);
+    }
+
+    /// Un clic que un widget de texto capturó sigue llegando al terminal (foco de split y selección).
+    #[test]
+    fn el_clic_capturado_por_el_texto_llega_al_terminal() {
+        let clic = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        assert!(reenviar_evento(clic.clone(), event::Status::Captured).is_some());
+        assert!(reenviar_evento(clic, event::Status::Ignored).is_some());
+        let rueda = Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 } });
+        assert!(reenviar_evento(rueda, event::Status::Captured).is_none());
     }
 
     /// C: la paleta lista workspaces, paneles y acciones; la búsqueda los filtra y Enter ejecuta el elegido.
