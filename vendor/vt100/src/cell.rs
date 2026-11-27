@@ -195,10 +195,12 @@ impl Cell {
         self.attrs.inverse()
     }
 
+    /// Tachado (SGR 9). Añadido por galgo, ver PATCH-GALGO.md.
     pub fn strikethrough(&self) -> bool {
         self.attrs.strikethrough()
     }
 
+    /// Parpadeo (SGR 5). Añadido por galgo, ver PATCH-GALGO.md.
     pub fn blink(&self) -> bool {
         self.attrs.blink()
     }
