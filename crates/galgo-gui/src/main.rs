@@ -12,10 +12,8 @@ mod chrome;
 mod launch;
 mod fonts;
 mod layout;
-mod newpane;
 mod palette;
 mod prefs;
-mod recents;
 mod settings;
 mod sidebar;
 mod team;
@@ -34,12 +32,9 @@ use iced::mouse;
 use iced::widget::text::Span;
 use iced::widget::{rich_text, span};
 use iced::{event, font, Event, Point, Subscription};
-use newpane::{NewPane, Preset};
 use std::sync::{mpsc, OnceLock};
 
 const FONT_SIZE: f32 = 14.0;
-const LINE_H: f32 = 18.0;
-const CELL_W: f32 = 8.43; // Menlo: 0,602 em
 const SIDEBAR_W: f32 = 248.0;
 
 /// Paso de zoom de la fuente del terminal (Cmd+= / Cmd+- / Cmd+0): 0 es el tamaño base. Global porque la geometría
@@ -112,6 +107,11 @@ fn status_h() -> f32 {
 fn top_h() -> f32 {
     marco().filas_top as f32 * TABS_H
 }
+#[cfg(test)]
+const LINE_H: f32 = 18.0;
+#[cfg(test)]
+const CELL_W: f32 = 8.43; // Menlo: 0,602 em
+
 fn term_origin() -> (f32, f32) {
     (sidebar_w() + LEAF_PAD, top_h() + LEAF_TOP)
 }
@@ -136,7 +136,6 @@ fn save_pref(app: &App, key: &str, value: serde_json::Value) {
     }
 }
 /// Primera opción del desplegable de manager del formulario: ningún manager.
-const NO_MANAGER: &str = "(ninguno)";
 
 /// (fila, columna) dentro de la pantalla mostrada.
 type Cell = (u16, u16);
@@ -245,8 +244,6 @@ struct App {
     watch_down: bool,
     /// Workspaces explícitos (con nombre y carpeta propios): clave → carpeta. Los demás salen de la etiqueta del repo.
     explicit: BTreeMap<String, String>,
-    /// El próximo workspace que se abra es explícito (Cmd+Shift+N).
-    new_ws_explicit: bool,
     /// Ya se aplicó lo guardado. Antes no se escribe nada: un primer listado incompleto borraría los layouts.
     ws_restored: bool,
     /// Último estado de workspaces escrito en disco (para no escribir si no cambió).
@@ -289,9 +286,6 @@ struct App {
     /// Tamaño con el que se pidió el último `Spawn`: es el tamaño del panel que nace.
     spawn_size: Option<(u16, u16)>,
     attention: Attention,
-    /// Formulario de "Nuevo panel", abierto mientras existe.
-    form: Option<NewPane>,
-    form_error: Option<String>,
     /// Pide confirmación antes de cerrar el panel seleccionado.
     confirm_close: bool,
     /// Cuotas por agente del daemon, y el último error si no se pudieron leer.
@@ -300,10 +294,7 @@ struct App {
     /// La ventana tiene el foco: si no, las alertas van a notificación de macOS.
     focused: bool,
     /// «Nuevo workspace» abierto, con el texto de búsqueda en recientes.
-    new_ws: Option<String>,
     /// Carpetas abiertas recientemente (la más reciente primero) y dónde se guardan.
-    recents: Vec<String>,
-    recents_path: Option<std::path::PathBuf>,
     /// Lanzador de agentes abierto.
     launcher: bool,
     /// Modelo elegido en el lanzador, por agente (la etiqueta del agente → modelo).
@@ -357,16 +348,8 @@ enum Message {
     Event(Event),
     Paste(Option<String>),
     /// Pliega o despliega un grupo de workspace (la clave es el nombre; vacío = sin workspace).
-    FormWorkspace(String),
-    OpenForm,
-    CancelForm,
-    FormName(String),
-    FormPreset(String),
-    FormCustom(String),
-    FormCwd(String),
-    FormManager(String),
-    SubmitForm,
-    Spawned(Result<serde_json::Value, String>),
+    /// Reintenta abrir la terminal de inicio (en ~).
+    RetryStart,
     AskClose,
     /// El daemon avisa que la pantalla de un panel cambió (suscripción `Watch`): se pide la nueva.
     PaneChanged(u32, u64),
@@ -400,17 +383,9 @@ enum Message {
     CancelClose,
     ConfirmClose,
     Killed(Result<serde_json::Value, String>),
-    OpenNewWorkspace,
-    CloseNewWorkspace,
-    NewWsQuery(String),
     /// Abre la primera carpeta reciente que coincide con la búsqueda (Enter).
-    NewWsSubmit,
-    PickFolder,
-    FolderPicked(Option<String>),
     /// La carpeta elegida tiene una ruta que no es UTF-8: no se abre (B10).
-    FolderRejected,
     /// Crea un workspace en esa carpeta: un shell, sin formulario.
-    OpenFolder(String),
     WorkspaceOpened(String, Result<serde_json::Value, String>),
     /// Atajos (B): pestaña nueva en el workspace actual, workspace por número, siguiente que necesita atención,
     /// cerrar el panel enfocado, lanzador de agentes.
@@ -482,15 +457,13 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 29] = [
-        ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
+    let commands: [(&str, &str, Message); 26] = [
         ("Nuevo workspace con grupo…", "Cmd+Shift+N", Message::OpenNewNamedWorkspace),
         ("Agregar agente al workspace…", "", Message::OpenAgentForm),
         ("Levantar equipo del repo", "", Message::TeamRequested(TeamSource::Repo)),
         ("Equipo: Claude manager + Codex worker + Claude revisor", "", Message::TeamRequested(TeamSource::Preset(0))),
         ("Equipo: Claude manager + PI worker", "", Message::TeamRequested(TeamSource::Preset(1))),
         ("Equipo: opencode + Claude revisor", "", Message::TeamRequested(TeamSource::Preset(2))),
-        ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
         ("Lanzar agente…", "Cmd+Shift+L", Message::OpenLauncher),
         ("Cerrar panel", "Cmd+W", Message::CloseFocused),
@@ -498,7 +471,6 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         ("Lanzar Claude aquí", "", Message::Launch(launch::Agent::Claude)),
         ("Lanzar Codex aquí", "", Message::Launch(launch::Agent::Codex)),
         ("Lanzar PI aquí", "", Message::Launch(launch::Agent::Pi)),
-        ("Nuevo panel con formulario", "", Message::OpenForm),
         ("Limpiar la pantalla", "Cmd+K", Message::ClearScreen),
         ("Mostrar u ocultar la barra lateral", "Cmd+B", Message::ToggleSidebar),
         ("Mostrar u ocultar la barra de estado", "Cmd+/", Message::ToggleStatus),
@@ -535,9 +507,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("p", true) => Some(Message::OpenPalette),
         ("k", false) => Some(Message::ClearScreen),
         (",", false) => Some(Message::OpenSettings),
-        ("n", false) => Some(Message::OpenNewWorkspace),
         ("n", true) => Some(Message::OpenNewNamedWorkspace),
-        ("o", false) => Some(Message::PickFolder),
         ("t", false) => Some(Message::NewTab),
         ("w", false) => Some(Message::CloseFocused),
         ("[", false) => Some(Message::NextTab(-1)),
@@ -568,12 +538,11 @@ fn needs_confirm(p: &PaneInfo) -> bool {
 /// el resto de atajos no actúa.
 fn shortcut_in_state(app: &App, key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     let message = shortcut(key, modifiers)?;
-    if app.form.is_none() {
+    if !overlay_owns_keyboard(app) {
         return Some(message);
     }
     match message {
-        Message::CloseFocused => Some(Message::CancelForm),
-        Message::OpenNewWorkspace | Message::OpenNewNamedWorkspace => Some(message),
+        Message::OpenNewNamedWorkspace => Some(message),
         _ => None,
     }
 }
@@ -885,10 +854,8 @@ enum Body {
     Welcome,
     TeamConfirm,
     AgentForm,
-    NewWorkspace,
     Launcher,
     Palette,
-    Form,
     Settings,
     Screen,
 }
@@ -899,16 +866,12 @@ fn body_mode(app: &App) -> Body {
         Body::Settings
     } else if app.palette.is_some() {
         Body::Palette
-    } else if app.new_ws.is_some() {
-        Body::NewWorkspace
     } else if app.launcher {
         Body::Launcher
     } else if app.team_pending.is_some() {
         Body::TeamConfirm
     } else if app.agent_form.is_some() {
         Body::AgentForm
-    } else if app.form.is_some() {
-        Body::Form
     } else if app.panes.is_empty() {
         Body::Welcome
     } else {
@@ -922,11 +885,11 @@ fn names(app: &App) -> Vec<&str> {
 }
 
 /// Crea un workspace en `path`: un shell en esa carpeta, con nombre libre y sin formulario.
-fn open_folder(app: &mut App, path: String) -> Task<Message> {
+/// Abre una terminal en `path`. Con `agrupar` (Cmd+Shift+N) el workspace se llama como la carpeta, numerado si ya
+/// existe, y se agrupa en la barra. Sin carpeta que elegir: la terminal hereda el cwd del panel enfocado.
+fn open_terminal(app: &mut App, path: String, agrupar: bool) -> Task<Message> {
     let (rows, cols) = grid_for(app.window);
-    // Con Cmd+Shift+N el workspace tiene nombre propio (el de la carpeta, numerado si ya existe) y se agrupa.
-    let explicit = std::mem::take(&mut app.new_ws_explicit);
-    let grupo = explicit.then(|| {
+    let grupo = agrupar.then(|| {
         let base = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "workspace".into());
         let mut taken: Vec<&str> = app.explicit.keys().map(String::as_str).collect();
         taken.extend(app.layouts.by_key.keys().map(String::as_str));
@@ -946,10 +909,9 @@ fn open_folder(app: &mut App, path: String) -> Task<Message> {
     )
 }
 
-/// Primera carpeta reciente que coincide con la búsqueda, si la hay.
-fn first_match(app: &App) -> Option<String> {
-    let query = app.new_ws.as_deref().unwrap_or("");
-    recents::matching(&app.recents, query).first().map(|p| p.to_string())
+/// Carpeta en la que nace una terminal nueva: la del panel enfocado (vivo, con `cd`), o `~`.
+fn cwd_nuevo(app: &App) -> String {
+    focus_context(app).1.unwrap_or_else(home_dir)
 }
 
 /// Siguiente panel visible sin el foco que hay que sondear, por turnos. `None` si no hay ninguno libre.
@@ -972,11 +934,6 @@ fn load_other(id: u32, since: Option<u64>) -> Task<Message> {
     }, move |r| Message::OtherScreen(id, r))
 }
 
-/// Identificador del buscador de «Nuevo workspace» (B3: para darle el foco).
-fn new_ws_input_id() -> iced::widget::text_input::Id {
-    iced::widget::text_input::Id::new("nuevo-workspace")
-}
-
 /// Resultados de la paleta que se dibujan (y, por tanto, a los que puede llegar el resaltado).
 const PALETTE_VISIBLE: usize = 12;
 
@@ -984,7 +941,6 @@ const PALETTE_VISIBLE: usize = 12;
 fn palette_input_id() -> iced::widget::text_input::Id {
     iced::widget::text_input::Id::new("paleta")
 }
-
 
 fn request(req: Request) -> Result<serde_json::Value, String> {
     let response = client::request(&req).map_err(|e| format!("{e:#}"))?;
@@ -2045,8 +2001,6 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::OpenLauncher => {
-            app.form = None;
-            app.new_ws = None;
             app.launcher = true;
             Task::none()
         }
@@ -2066,12 +2020,6 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 app.launch_model.insert(agent, model);
             }
             Task::none()
-        }
-        Message::OpenNewWorkspace => {
-            app.form = None;
-            app.new_ws = Some(String::new());
-            // B3: el foco va al buscador: lo que se escribe, y Enter, llegan ahí.
-            iced::widget::text_input::focus(new_ws_input_id())
         }
         Message::TeamRequested(source) => match source {
             TeamSource::Preset(i) => {
@@ -2220,10 +2168,11 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             spawn_task(app, req)
         }
         Message::OpenNewNamedWorkspace => {
-            app.new_ws = Some(String::new());
-            app.new_ws_explicit = true;
-            Task::none()
+            // Sin diálogos: agrupa desde el cwd del panel enfocado; el nombre sale de la carpeta.
+            let cwd = cwd_nuevo(app);
+            open_terminal(app, cwd, true)
         }
+        Message::RetryStart => open_terminal(app, home_dir(), false),
         Message::CloseWorkspace(key) => {
             // review-15 B5: el aviso caduca a los 3 s; el segundo clic solo cierra si llega dentro de ese plazo.
             let vigente = app.ws_close_armed.as_deref() == Some(key.as_str()) && app.ws_close_armed_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3));
@@ -2239,53 +2188,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             app.layouts.by_key.remove(&key);
             Task::batch(ids.into_iter().map(|id| send_request(Request::Kill { pane: id.to_string() }, |_| Message::Echo)))
         }
-        Message::CloseNewWorkspace => {
-            app.new_ws = None;
-            app.new_ws_explicit = false;
-            Task::none()
-        }
-        Message::NewWsQuery(query) => {
-            app.new_ws = Some(query);
-            Task::none()
-        }
-        Message::NewWsSubmit => match first_match(app) {
-            Some(path) => open_folder(app, path),
-            None => Task::none(),
-        },
-        Message::PickFolder => Task::perform(
-            async {
-                rfd::AsyncFileDialog::new()
-                    .set_title("Elegir la carpeta del workspace")
-                    .pick_folder()
-                    .await
-                    .map(|folder| folder.path().to_path_buf())
-            },
-            // B10: una ruta que no es UTF-8 no se convierte en otra carpeta con caracteres de reemplazo.
-            |folder| match folder {
-                None => Message::FolderPicked(None),
-                Some(path) => match path.to_str() {
-                    Some(text) => Message::FolderPicked(Some(text.to_string())),
-                    None => Message::FolderRejected,
-                },
-            },
-        ),
-        Message::FolderPicked(Some(path)) => open_folder(app, path),
-        Message::FolderPicked(None) => Task::none(),
-        Message::FolderRejected => {
-            app.error = Some("la carpeta tiene un nombre que no es UTF-8; elige otra o renómbrala".into());
-            Task::none()
-        }
-        Message::OpenFolder(path) => open_folder(app, path),
-        Message::WorkspaceOpened(path, Ok(data)) => {
-            app.new_ws = None;
+        Message::WorkspaceOpened(_, Ok(data)) => {
             app.error = None;
-            // B9: el inicio no es un workspace reciente; las rutas se guardan sin barra final.
-            if path != home_dir() {
-                recents::push(&mut app.recents, &path);
-            }
-            if let Some(file) = &app.recents_path {
-                let _ = recents::save(file, &app.recents);
-            }
             match serde_json::from_value::<PaneInfo>(data) {
                 Ok(p) => {
                     let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
@@ -2351,7 +2255,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     if !app.started {
                         app.started = true;
                         if app.panes.is_empty() {
-                            arranque = Some(open_folder(app, home_dir()));
+                            arranque = Some(open_terminal(app, home_dir(), false));
                         }
                     }
                     app.layouts.sync(&pane_keys(app));
@@ -2454,7 +2358,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 };
             }
             // Atajos de la ventana (Cmd+…), salvo mientras hay un diálogo abierto (ninguno puede actuar sobre el panel de detrás).
-            if modifiers.command() && app.new_ws.is_none() && !app.launcher && app.settings.is_none() && !overlay_owns_keyboard(app) {
+            if modifiers.command() && !app.launcher && app.settings.is_none() && !overlay_owns_keyboard(app) {
                 if let Some(message) = shortcut_in_state(app, &key, modifiers) {
                     return update(app, message);
                 }
@@ -2467,16 +2371,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     }
                 }
             }
-            // Con «Nuevo workspace» o el lanzador abiertos, el teclado es suyo, no del panel.
-            if app.new_ws.is_some() || app.launcher || app.settings.is_some() {
+            // Con el lanzador o los ajustes abiertos, el teclado es suyo, no del panel.
+            if app.launcher || app.settings.is_some() {
                 if matches!(&key, Key::Named(Named::Escape)) {
-                    app.new_ws = None;
                     app.launcher = false;
                     app.settings = None;
                 }
-                return Task::none();
-            }
-            if app.form.is_some() {
                 return Task::none();
             }
             // Un diálogo nuevo (formulario de agente, confirmación de equipo) es dueño del teclado: nada de lo que se
@@ -2649,81 +2549,6 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        // ---- Formulario de nuevo panel ----
-        Message::FormWorkspace(v) => {
-            if let Some(f) = app.form.as_mut() { f.workspace = v; }
-            Task::none()
-        }
-        Message::OpenForm => {
-            // B4: el workspace empieza vacío. Heredar el del panel seleccionado agrupaba en silencio un panel nuevo
-            // de otro repo bajo el workspace equivocado (un workspace explícito anula la deducción por git).
-            app.form = Some(NewPane::default());
-            app.form_error = None;
-            Task::none()
-        }
-        Message::CancelForm => {
-            app.form = None;
-            app.form_error = None;
-            Task::none()
-        }
-        Message::FormName(v) => {
-            if let Some(f) = app.form.as_mut() { f.name = v; }
-            Task::none()
-        }
-        Message::FormPreset(label) => {
-            if let (Some(f), Some(p)) = (app.form.as_mut(), Preset::from_label(&label)) { f.preset = p; }
-            Task::none()
-        }
-        Message::FormCustom(v) => {
-            if let Some(f) = app.form.as_mut() { f.custom = v; }
-            Task::none()
-        }
-        Message::FormCwd(v) => {
-            if let Some(f) = app.form.as_mut() { f.cwd = v; }
-            Task::none()
-        }
-        Message::FormManager(name) => {
-            if let Some(f) = app.form.as_mut() {
-                f.manager = if name == NO_MANAGER { None } else { Some(name) };
-            }
-            Task::none()
-        }
-        Message::SubmitForm => {
-            let Some(form) = app.form.clone() else { return Task::none() };
-            let (rows, cols) = grid_for(app.window);
-            let (home, shell) = (home_dir(), login_shell());
-            match newpane::spawn_request(&form, rows, cols, &newpane::Env { home: &home, shell: &shell }) {
-                Ok(req) => {
-                    app.form_error = None;
-                    app.spawn_size = Some((rows, cols));
-                    send_request(req, Message::Spawned)
-                }
-                Err(e) => {
-                    app.form_error = Some(e);
-                    Task::none()
-                }
-            }
-        }
-        Message::Spawned(Ok(data)) => {
-            app.form = None;
-            app.form_error = None;
-            match serde_json::from_value::<PaneInfo>(data) {
-                Ok(p) => {
-                    // El panel nace con el tamaño de la ventana: no hace falta otro Resize.
-                    let (rows, cols) = app.spawn_size.take().unwrap_or_else(|| grid_for(app.window));
-                    app.sizes.insert(p.id, (rows, cols));
-                    app.panes.push(p.clone());
-                    let task = select(app, p.id);
-                    Task::batch([task, load_panes()])
-                }
-                Err(_) => load_panes(),
-            }
-        }
-        Message::Spawned(Err(e)) => {
-            app.form_error = Some(e);
-            Task::none()
-        }
-
         // ---- Cerrar el panel seleccionado, con confirmación ----
         Message::AskClose => {
             app.confirm_close = app.selected.is_some();
@@ -2887,7 +2712,6 @@ fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle) -> E
     lines.into()
 }
 
-
 fn view(app: &App) -> Element<'_, Message> {
     let main: Element<'_, Message> = if app.panes.is_empty() {
         chrome::welcome_view(app)
@@ -2913,14 +2737,9 @@ fn view(app: &App) -> Element<'_, Message> {
     }
     match body_mode(app) {
         Body::Palette => chrome::floating(base, chrome::palette_panel(app), 600.0, Message::ClosePalette),
-        Body::NewWorkspace => chrome::floating(base, chrome::new_workspace_panel(app), 560.0, Message::CloseNewWorkspace),
         Body::Launcher => chrome::floating(base, chrome::launcher_panel(app), 440.0, Message::CloseLauncher),
         Body::AgentForm => chrome::floating(base, chrome::agent_form_panel(app), 480.0, Message::CloseAgentForm),
         Body::TeamConfirm => chrome::floating(base, chrome::team_confirm_panel(app), 500.0, Message::TeamCancel),
-        Body::Form => match &app.form {
-            Some(f) => chrome::floating(base, chrome::form_panel(app, f), 460.0, Message::CancelForm),
-            None => base,
-        },
         Body::Settings => chrome::floating(base, chrome::settings_panel(app), 820.0, Message::CloseSettings),
         Body::Welcome | Body::Screen => base,
     }
@@ -2968,9 +2787,9 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .run_with(|| {
-            let file = recents::file();
+            // Preferencias junto al socket (gui-prefs.json): fuente, barra lateral, zoom, workspaces…
+            let prefs = galgo_proto::socket_path().parent().unwrap_or(std::path::Path::new(".")).join("gui-prefs.json");
             // Fuente: la elección guardada si la hay y sigue instalada; si no, la automática (Nerd Font o Menlo).
-            let prefs = file.with_file_name("gui-prefs.json");
             let installed: Vec<&'static str> = fonts::detect(&fonts::font_dirs());
             let elegida = fonts::load(&prefs).and_then(|name| fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == name).filter(|f| installed.contains(f)));
             fonts::set_current(elegida.unwrap_or_else(|| fonts::automatic(&installed)));
@@ -2983,8 +2802,6 @@ fn main() -> iced::Result {
             let app = App {
                 window: (1100.0, 700.0),
                 focused: true,
-                recents: recents::load(&file),
-                recents_path: Some(file),
                 font_installed: installed,
                 sidebar: flag("sidebar"),
                 team_trust: confianza,
@@ -3204,24 +3021,6 @@ mod tests {
         assert_eq!(app_title(&app), "galgo");
     }
 
-    /// C: el formulario bloquea el teclado del panel mientras está abierto.
-    #[test]
-    fn con_el_formulario_abierto_el_teclado_no_va_al_panel() {
-        let mut app = App { selected: Some(1), form: Some(NewPane::default()), ..Default::default() };
-        let key = Event::Keyboard(keyboard::Event::KeyPressed {
-            key: Key::Character("a".into()),
-            modified_key: Key::Character("a".into()),
-            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(),
-            text: Some("a".into()),
-        });
-        let _ = update(&mut app, Message::Event(key));
-        // Sin formulario, la tecla habría quedado pendiente tras un pegado; aquí no se toca nada.
-        assert!(app.key_queue.is_empty());
-        assert!(app.form.is_some());
-    }
-
     /// Rendimiento: una respuesta `unchanged` no se trata como snapshot, y un snapshot completo sí.
     #[test]
     fn respuesta_unchanged_y_completa() {
@@ -3278,37 +3077,12 @@ mod tests {
         assert!(app.sel.is_none());
     }
 
-    /// B7: el panel nace con el tamaño con el que se pidió, aunque la ventana haya cambiado después.
-    #[test]
-    fn el_panel_nace_con_el_tamano_de_la_peticion() {
-        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
-        app.form = Some(NewPane { name: "w".into(), preset: Preset::Shell, ..Default::default() });
-        let _ = update(&mut app, Message::SubmitForm);
-        let pedido = grid_for(app.window);
-        app.window = (1600.0, 1000.0);
-        let data = serde_json::to_value(pane_info(7, "w", Status::Idle)).unwrap();
-        let _ = update(&mut app, Message::Spawned(Ok(data)));
-        assert_eq!(app.sizes.get(&7), Some(&pedido));
-    }
-
     /// B1: tras un fallo de conexión no se confía en la generación guardada.
     #[test]
     fn fallo_de_paneles_invalida_la_generacion() {
         let mut app = App { selected: Some(1), snap: Some(snap(&["a"], 1)), snap_gen: Some(3), ..Default::default() };
         let _ = update(&mut app, Message::Panes(Err("no hay daemon".into())));
         assert_eq!(app.snap_gen, None);
-    }
-
-    /// Workspace: el formulario de un panel nuevo hereda el workspace del seleccionado.
-    #[test]
-    fn el_formulario_no_hereda_el_workspace_del_seleccionado() {
-        let mut p = pane_info(1, "w", Status::Idle);
-        p.workspace = Some("inventia/cotizacion".into());
-        let mut app = App { panes: vec![p], selected: Some(1), ..Default::default() };
-        let _ = update(&mut app, Message::OpenForm);
-        assert_eq!(app.form.as_ref().unwrap().workspace, "", "B4: el campo empieza vacío");
-        let _ = update(&mut app, Message::FormWorkspace("galgo/main".into()));
-        assert_eq!(app.form.as_ref().unwrap().workspace, "galgo/main");
     }
 
     /// Grupos: plegar y desplegar alterna la clave del grupo.
@@ -3414,6 +3188,14 @@ mod tests {
 
     /// Workspace nativo: Cmd+Shift+N abre uno explícito; cerrarlo pide dos clics; y lo guardado vuelve al arrancar
     /// (pestañas, splits y el grupo) cuando el daemon lista de nuevo sus paneles.
+    /// P0.1: sin selector de carpeta. Cmd+O y Cmd+N ya no abren nada; Cmd+Shift+N agrupa desde el cwd actual.
+    #[test]
+    fn sin_selector_de_carpeta_ni_formularios() {
+        assert!(shortcut(&Key::Character("o".into()), keyboard::Modifiers::COMMAND).is_none());
+        assert!(shortcut(&Key::Character("n".into()), keyboard::Modifiers::COMMAND).is_none());
+        assert!(matches!(shortcut(&Key::Character("N".into()), keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenNewNamedWorkspace)));
+    }
+
     #[test]
     fn workspace_explicito_se_guarda_y_se_restaura() {
         let dir = std::env::temp_dir().join(format!("galgo-ws-{}", std::process::id()));
@@ -3423,8 +3205,6 @@ mod tests {
         let mut app = App { prefs_path: Some(prefs_path.clone()), ..Default::default() };
         // Cmd+Shift+N: el siguiente workspace abierto es explícito.
         assert!(matches!(shortcut(&Key::Character("N".into()), keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenNewNamedWorkspace)));
-        let _ = update(&mut app, Message::OpenNewNamedWorkspace);
-        assert!(app.new_ws.is_some() && app.new_ws_explicit);
         // Primer listado: arranque hecho, sin nada guardado todavía. Los paneles llevan la etiqueta de su workspace.
         let en_nexo = |id: u32, name: &str| {
             let mut p = pane_info(id, name, Status::Idle);
@@ -3712,39 +3492,6 @@ mod tests {
     fn cuerpo_sin_paneles_es_la_bienvenida() {
         let mut app = App::default();
         assert_eq!(body_mode(&app), Body::Welcome);
-        let _ = update(&mut app, Message::OpenNewWorkspace);
-        assert_eq!(body_mode(&app), Body::NewWorkspace);
-        let _ = update(&mut app, Message::CloseNewWorkspace);
-        assert_eq!(body_mode(&app), Body::Welcome);
-    }
-
-    /// A: Cmd+N abre «Nuevo workspace»; las demás teclas con Cmd siguen siendo de la ventana o del panel.
-    #[test]
-    fn cmd_n_es_nuevo_workspace() {
-        let n = Key::Character("n".into());
-        assert!(matches!(shortcut(&n, keyboard::Modifiers::COMMAND), Some(Message::OpenNewWorkspace)));
-        assert!(shortcut(&Key::Character("x".into()), keyboard::Modifiers::COMMAND).is_none());
-    }
-
-    /// A: una carpeta elegida crea (vía el daemon) un shell que queda seleccionado, y la carpeta pasa a recientes.
-    #[test]
-    fn carpeta_abierta_queda_seleccionada_y_reciente() {
-        let mut app = App { new_ws: Some(String::new()), ..Default::default() };
-        let pane = serde_json::to_value(pane_info(7, "shell", Status::Idle)).unwrap();
-        let _ = update(&mut app, Message::WorkspaceOpened("/Users/x/proyecto".into(), Ok(pane)));
-        assert_eq!(app.selected, Some(7));
-        assert!(app.new_ws.is_none());
-        assert_eq!(app.recents.first().map(String::as_str), Some("/Users/x/proyecto"));
-    }
-
-    /// A: si el daemon no puede crear el shell, el error se muestra y «Nuevo workspace» sigue abierto.
-    #[test]
-    fn error_al_abrir_carpeta_se_muestra() {
-        let mut app = App { new_ws: Some(String::new()), ..Default::default() };
-        let _ = update(&mut app, Message::WorkspaceOpened("/x".into(), Err("sin daemon".into())));
-        assert_eq!(app.error.as_deref(), Some("sin daemon"));
-        assert!(app.new_ws.is_some());
-        assert!(app.recents.is_empty());
     }
 
     /// B: los atajos nuevos, y sus teclas con Cmd (Shift cambia el número de la tecla de letra).
@@ -4092,25 +3839,6 @@ mod tests {
         assert_eq!(app.layouts.key_of(1).as_deref(), Some("r/main"));
     }
 
-    /// r13 M2: Cmd+W sobre un agente bloqueado o en espera pide confirmación; sobre uno terminado, no.
-    /// Con el formulario abierto, Cmd+W cierra el formulario y no toca el panel de detrás.
-    #[test]
-    fn r13_cmdw_con_formulario_y_estados() {
-        let cmd = keyboard::Modifiers::COMMAND;
-        let w = Key::Character("w".into());
-        let mut app = App { panes: vec![pane_info(1, "claude", Status::Blocked)], selected: Some(1), form: Some(NewPane::default()), ..Default::default() };
-        assert!(matches!(shortcut_in_state(&app, &w, cmd), Some(Message::CancelForm)));
-        app.form = None;
-        let _ = update(&mut app, Message::CloseFocused);
-        assert!(app.confirm_close, "bloqueado: pide confirmación");
-        let mut app = App { panes: vec![pane_info(2, "shell", Status::Idle)], selected: Some(2), ..Default::default() };
-        let _ = update(&mut app, Message::CloseFocused);
-        assert!(app.confirm_close, "un shell en Idle puede estar ejecutando algo: pide confirmación");
-        let mut app = App { panes: vec![pane_info(3, "viejo", Status::Done)], selected: Some(3), ..Default::default() };
-        let _ = update(&mut app, Message::CloseFocused);
-        assert!(!app.confirm_close, "terminado: no pregunta");
-    }
-
     /// r13 M3: al dividir, el panel original se redimensiona a su mitad (no se queda con toda la ventana).
     #[test]
     fn r13_split_no_redimensiona_el_original() {
@@ -4235,15 +3963,6 @@ mod tests {
         }
         assert!(app.palette_cursor < PALETTE_VISIBLE, "cursor {}", app.palette_cursor);
         assert!(palette_items(&App::default()).len() >= 15, "la paleta tiene los comandos de división, pestañas y lanzadores");
-    }
-
-    /// r13 B10: una carpeta que no es UTF-8 se rechaza con un aviso, no se abre con otro nombre.
-    #[test]
-    fn r13_ruta_no_utf8_se_rechaza() {
-        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
-        let _ = update(&mut app, Message::FolderRejected);
-        assert!(app.error.as_deref().is_some_and(|e| e.contains("UTF-8")));
-        assert!(app.recents.is_empty());
     }
 
     /// r13 B5: el error va en la barra de estado, de altura fija: mostrarlo no cambia el área de los paneles (ni
@@ -4530,10 +4249,8 @@ mod render {
         let dir = std::path::PathBuf::from(std::env::var("GALGO_UX_DIR").unwrap_or_else(|_| "/tmp/galgo-ux".into()));
         std::fs::create_dir_all(&dir).unwrap();
         let size = (1280, 800);
-        let mut welcome = App { window: (1280.0, 800.0), recents: vec![format!("{}/Development/nexo", home_dir()), format!("{}/Development/inventia", home_dir()), "/tmp/demo".into()], ..Default::default() };
+        let welcome = App { window: (1280.0, 800.0), ..Default::default() };
         render(&welcome, size, &dir.join("r-bienvenida.png"));
-        welcome.new_ws = Some(String::new());
-        render(&welcome, size, &dir.join("r-nuevo-workspace.png"));
         let app = scene();
         render(&app, size, &dir.join("r-paneles.png"));
         let mut palette = scene();
@@ -4547,9 +4264,6 @@ mod render {
         ajustes.hooks_output.insert("claude".into(), "claude: hooks de galgo instalados (3 eventos)".into());
         ajustes.hooks_output.insert("codex".into(), "codex: no instalados".into());
         render(&ajustes, size, &dir.join("r-ajustes.png"));
-        let mut form = scene();
-        form.form = Some(NewPane::default());
-        render(&form, size, &dir.join("r-formulario.png"));
         let mut close = scene();
         close.confirm_close = true;
         render(&close, size, &dir.join("r-cerrar.png"));

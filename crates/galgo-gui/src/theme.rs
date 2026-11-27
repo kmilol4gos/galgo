@@ -143,14 +143,6 @@ pub fn surface(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style { background: Some(color.into()), text_color: Some(TEXT), ..Default::default() }
 }
 
-/// Línea de 2 px bajo una pestaña: del acento si la pestaña está activa; si no, transparente.
-pub fn tab_underline(active: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| container::Style {
-        background: Some(Background::Color(if active { ACCENT } else { Color::TRANSPARENT })),
-        ..Default::default()
-    }
-}
-
 /// Fondo del área de terminales: el mismo tono cálido que el chrome (`BG`), así el panel se funde con su marco.
 pub const TERM_BG: Color = BG;
 /// Radio del panel del terminal y de las píldoras de pestaña.
@@ -263,25 +255,3 @@ pub fn field(_: &Theme, status: iced::widget::text_input::Status) -> iced::widge
     }
 }
 
-/// Desplegable de formulario: como un campo, con la flecha apagada.
-pub fn select(_: &Theme, status: iced::widget::pick_list::Status) -> iced::widget::pick_list::Style {
-    let open = matches!(status, iced::widget::pick_list::Status::Opened | iced::widget::pick_list::Status::Hovered);
-    iced::widget::pick_list::Style {
-        text_color: TEXT,
-        placeholder_color: DIM,
-        handle_color: MUTED,
-        background: Background::Color(TERM_BG),
-        border: Border { color: if open { MUTED } else { BORDER }, width: LINE, radius: RADIUS.into() },
-    }
-}
-
-/// Menú de un desplegable: superficie elevada, la opción bajo el puntero con el acento.
-pub fn menu(_: &Theme) -> iced::overlay::menu::Style {
-    iced::overlay::menu::Style {
-        background: Background::Color(ELEVATED),
-        border: Border { color: BORDER, width: LINE, radius: RADIUS.into() },
-        text_color: TEXT,
-        selected_text_color: TEXT,
-        selected_background: Background::Color(Color { a: 0.35, ..ACCENT }),
-    }
-}

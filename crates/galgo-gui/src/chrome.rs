@@ -54,14 +54,6 @@ pub fn tilde(path: &str) -> String {
     }
 }
 
-/// (carpeta, padre) de una ruta, para mostrar el nombre destacado y el resto en gris.
-fn split_path(path: &str) -> (String, String) {
-    let p = std::path::Path::new(path);
-    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
-    let parent = p.parent().map(|d| tilde(&d.to_string_lossy())).unwrap_or_default();
-    (name, parent)
-}
-
 // ---------------------------------------------------------------------------------------------------------------
 // Barra lateral
 // ---------------------------------------------------------------------------------------------------------------
@@ -155,7 +147,6 @@ fn sidebar_list(app: &App) -> Element<'_, Message> {
     list = list.push(
         container(
             row![
-                theme::btn(text("new").size(theme::SMALL_SIZE).color(MUTED)).padding([2, 6]).on_press(Message::OpenNewWorkspace),
                 text("· Local").size(theme::SMALL_SIZE).color(theme::DIM),
                 Space::with_width(Length::Fill),
                 theme::btn(text("menu").size(theme::SMALL_SIZE).color(MUTED)).padding([2, 6]).on_press(Message::OpenPalette),
@@ -232,7 +223,6 @@ pub fn session_bar(app: &App) -> Element<'_, Message> {
         // B4: la sesión se elige por su clave, no por su posición, que puede cambiar entre el dibujo y el clic.
         bar = bar.push(theme::btn(container(label).padding([5, 12])).padding(0).on_press(Message::SelectWorkspace(key.clone())).style(theme::tab(active)));
     }
-    bar = bar.push(icon_button(text("+").size(16).color(MUTED).into(), "Nuevo workspace  ⌘N", Message::OpenNewWorkspace));
     bar = bar
         .push(arrastre())
         .push(icon_button(text("⌘").size(14).color(MUTED).into(), "Buscar o ejecutar  ⌘K", Message::OpenPalette))
@@ -320,7 +310,6 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
         for (i, tab) in ws.tabs.iter().enumerate() {
             let pane = app.panes.iter().find(|p| p.id == tab.focus);
             let name = pane.map_or("?".to_string(), titulo_pestana);
-            let color = pane.map_or(theme::IDLE, |p| theme::status_color(p.status));
             let active = i == ws.active;
             let n = tab.root.ids().len();
             // Un shell normal es solo su nombre. Un agente real (lanzado por galgo o con hooks) suma su estado y, si
@@ -587,27 +576,17 @@ fn action_row<'a>(label: &'a str, keys: Option<&'a str>, message: Message, prima
 }
 
 pub fn welcome_view(app: &App) -> Element<'_, Message> {
-    let mut col = column![
+    // Solo se ve si el daemon no pudo crear el panel de inicio: sin carpetas que elegir, se reintenta en ~.
+    let _ = app;
+    let col = column![
         text("galgo").size(30).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT),
-        text("Terminales y agentes, ordenados por proyecto y rama.").size(theme::BODY_SIZE).color(MUTED),
-        Space::with_height(18),
-        action_row("Abrir carpeta…", Some("Cmd+O"), Message::PickFolder, true),
-        action_row("Nuevo workspace desde recientes", Some("Cmd+N"), Message::OpenNewWorkspace, false),
-        action_row("Terminal en ~", None, Message::OpenFolder(home_dir()), false),
+        text("No pude abrir una terminal.").size(theme::BODY_SIZE).color(MUTED),
+        Space::with_height(14),
+        action_row("Reintentar", None, Message::RetryStart, true),
         action_row("Paleta de comandos", Some("Cmd+K"), Message::OpenPalette, false),
     ]
     .spacing(2)
     .max_width(460);
-    if !app.recents.is_empty() {
-        col = col.push(Space::with_height(14)).push(container(text("RECIENTES").size(10).color(theme::DIM)).padding([4, 12]));
-        for p in app.recents.iter().take(6) {
-            let (name, parent) = split_path(p);
-            let r = row![text(name).size(theme::BODY_SIZE).color(theme::TEXT_SOFT), text(parent).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None)]
-                .spacing(10)
-                .align_y(Alignment::Center);
-            col = col.push(theme::btn(container(r).clip(true)).padding([7, 12]).width(Length::Fill).on_press(Message::OpenFolder(p.clone())).style(theme::row(false)));
-        }
-    }
     container(col).center(Length::Fill).style(theme::surface(theme::TERM_BG)).into()
 }
 
@@ -726,83 +705,6 @@ pub fn launcher_panel(app: &App) -> Element<'_, Message> {
         container(list).padding(6),
         theme::rule(false),
         hints(&[("1-5", "lanzar"), ("Esc", "cerrar")]),
-    ]
-    .into()
-}
-
-pub fn new_workspace_panel(app: &App) -> Element<'_, Message> {
-    let query = app.new_ws.as_deref().unwrap_or("");
-    let matches = recents::matching(&app.recents, query);
-    let mut list = column![].spacing(1);
-    for (i, p) in matches.iter().take(10).enumerate() {
-        let (name, parent) = split_path(p);
-        let r = row![text(name).size(theme::BODY_SIZE).color(TEXT), text(parent).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None)]
-            .spacing(10)
-            .align_y(Alignment::Center);
-        list = list.push(theme::btn(container(r).clip(true)).width(Length::Fill).padding([7, 12]).on_press(Message::OpenFolder((*p).clone())).style(theme::row(i == 0)));
-    }
-    if matches.is_empty() {
-        let msg = if app.recents.is_empty() { "Aún no hay carpetas recientes." } else { "Sin coincidencias entre las carpetas recientes." };
-        list = list.push(container(text(msg).size(theme::SMALL_SIZE).color(theme::DIM)).padding([10, 12]));
-    }
-    let pick = theme::btn(row![text("Elegir otra carpeta…").size(theme::BODY_SIZE).color(theme::ACCENT), Space::with_width(Length::Fill), theme::keycap("Cmd+O")].align_y(Alignment::Center))
-        .width(Length::Fill)
-        .padding([8, 12])
-        .on_press(Message::PickFolder)
-        .style(theme::row(false));
-    column![
-        text_input("Abrir carpeta reciente…", query)
-            .id(new_ws_input_id())
-            .on_input(Message::NewWsQuery)
-            .on_submit(Message::NewWsSubmit)
-            .size(15)
-            .padding([14, 16])
-            .style(theme::search_input),
-        theme::rule(false),
-        container(column![scrollable(list).height(Length::Shrink), pick].spacing(1)).padding(6).max_height(440),
-        theme::rule(false),
-        hints(&[("Enter", "abrir la primera"), ("Esc", "cerrar")]),
-    ]
-    .into()
-}
-
-/// Etiqueta de un campo del formulario.
-fn label<'a>(s: &'a str) -> Element<'a, Message> {
-    text(s).size(theme::SMALL_SIZE).color(MUTED).into()
-}
-
-pub fn form_panel<'a>(app: &'a App, f: &'a NewPane) -> Element<'a, Message> {
-    let presets: Vec<String> = Preset::ALL.iter().map(|p| p.label().to_string()).collect();
-    let mut managers: Vec<String> = vec![NO_MANAGER.to_string()];
-    managers.extend(app.panes.iter().map(|p| p.name.clone()));
-    let manager_sel = f.manager.clone().unwrap_or_else(|| NO_MANAGER.to_string());
-    let mut form = column![
-        column![label("Nombre"), text_input("p. ej. worker-tests", &f.name).on_input(Message::FormName).padding(8).style(theme::field)].spacing(4),
-        column![label("Workspace"), text_input("vacío = el del repo git", &f.workspace).on_input(Message::FormWorkspace).padding(8).style(theme::field)].spacing(4),
-        column![label("Comando"), pick_list(presets, Some(f.preset.label().to_string()), Message::FormPreset).width(Length::Fill).padding(8).style(theme::select).menu_style(theme::menu)].spacing(4),
-    ]
-    .spacing(12);
-    if f.preset == Preset::Custom {
-        form = form.push(text_input("p. ej. bash --norc", &f.custom).on_input(Message::FormCustom).padding(8).style(theme::field));
-    }
-    form = form
-        .push(column![label("Directorio"), text_input(&tilde(&home_dir()), &f.cwd).on_input(Message::FormCwd).padding(8).style(theme::field)].spacing(4))
-        .push(column![label("Manager (recibe el resultado)"), pick_list(managers, Some(manager_sel), Message::FormManager).width(Length::Fill).padding(8).style(theme::select).menu_style(theme::menu)].spacing(4));
-    if let Some(e) = &app.form_error {
-        form = form.push(text(e.clone()).size(theme::SMALL_SIZE).color(theme::FAILED));
-    }
-    let actions = row![
-        Space::with_width(Length::Fill),
-        theme::btn_secondary(text("Cancelar").size(theme::BODY_SIZE)).padding([6, 14]).on_press(Message::CancelForm),
-        theme::btn_primary(text("Crear panel").size(theme::BODY_SIZE)).padding([6, 14]).on_press(Message::SubmitForm),
-    ]
-    .spacing(8);
-    column![
-        container(text("Nuevo panel").size(theme::TITLE_SIZE).color(TEXT)).padding([14, 16]),
-        theme::rule(false),
-        container(form).padding(16),
-        theme::rule(false),
-        container(actions).padding([10, 16]),
     ]
     .into()
 }
