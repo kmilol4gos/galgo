@@ -1650,12 +1650,25 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             if body_mode(app) != Body::Screen {
                 return Task::none();
             }
+            // review-15 M3: un nombre con caracteres de control se rechaza: esos bytes los interpreta el editor de línea
+            // antes que la shell (Ctrl-C, Ctrl-U, secuencias de escape) y ejecutarían algo que el usuario no vio.
+            let Some(texto) = path.to_str() else {
+                app.error = Some("el nombre del archivo no es UTF-8: no se pega".into());
+                return Task::none();
+            };
+            if texto.chars().any(char::is_control) {
+                app.error = Some("el nombre del archivo tiene caracteres de control: no se pega".into());
+                return Task::none();
+            }
             match app.selected {
-                // La ruta se pega como texto, entre comillas si hace falta; sin Enter: lo decides tú.
-                Some(id) => send_request(
-                    Request::Send { pane: id.to_string(), text: shell_quote(&path.to_string_lossy()) + " ", enter: false },
-                    |_| Message::Echo,
-                ),
+                // La ruta se pega entre comillas, sin Enter: lo decides tú. Con bracketed paste activo en el panel, va
+                // marcada como pegado, para que el editor de línea no la interprete como teclas.
+                Some(id) => {
+                    let pegado = shell_quote(texto) + " ";
+                    let bracketed = shown(app).is_some_and(|s| s.bracketed_paste);
+                    let text = if bracketed { bracketed_paste(&pegado) } else { pegado };
+                    send_request(Request::Send { pane: id.to_string(), text, enter: false }, |_| Message::Echo)
+                }
                 None => Task::none(),
             }
         }
@@ -3516,6 +3529,20 @@ mod tests {
         app.panes.push(muerto.clone());
         let _ = update(&mut app, Message::Panes(Ok(vec![muerto])));
         assert!(app.prompts_pending.is_empty() && app.error.is_some(), "un agente que sale sin avisar deja el prompt sin enviar, y lo dice");
+    }
+
+    /// review-15 M3: un archivo cuyo nombre tiene caracteres de control no se pega; uno normal se pega sin Enter.
+    #[test]
+    fn arrastrar_archivo_no_pega_control() {
+        let mut app = App::default();
+        app.panes = vec![pane_info(1, "shell", Status::Idle)];
+        app.layouts.sync(&pane_keys(&app));
+        app.selected = Some(1);
+        let _ = update(&mut app, Message::FileDropped(std::path::PathBuf::from("/tmp/a\u{3}touch x")));
+        assert!(app.error.as_deref().is_some_and(|e| e.contains("control")), "un nombre con Ctrl-C no se pega");
+        app.error = None;
+        let _ = update(&mut app, Message::FileDropped(std::path::PathBuf::from("/tmp/normal.txt")));
+        assert!(app.error.is_none(), "un nombre normal sí");
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la
