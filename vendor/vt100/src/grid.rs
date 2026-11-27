@@ -94,6 +94,13 @@ impl Grid {
             scrollback.offset = 0;
         }
 
+        // GALGO (reflow, ver PATCH-GALGO.md): al cambiar el ancho de la pantalla principal, las líneas envueltas se
+        // reacomodan. El alto solo no altera el contenido, así que ese caso sigue por el camino de siempre.
+        if size.cols() != self.size.cols() && self.scrollback.is_some() && !self.rows.is_empty() {
+            self.reflow(size);
+            return;
+        }
+
         let new_row = || crate::row::Row::new(size.cols());
         let diff = self.size.rows().abs_diff(size.rows());
         // `rows` might be empty if this is the alternate screen and the rows
@@ -168,6 +175,140 @@ impl Grid {
         debug_assert!(self.pos.col < self.size.cols());
         debug_assert!(self.saved_pos.row < self.size.rows());
         debug_assert!(self.saved_pos.col < self.size.cols());
+    }
+
+    /// GALGO (reflow): reacomoda el historial y la pantalla de la pantalla principal al nuevo ancho.
+    ///
+    /// Une las filas envueltas (`wrapped`) en líneas lógicas, quita el relleno en blanco al final de cada una (sin
+    /// tocar celdas con color o atributos), y las vuelve a partir al ancho nuevo sin partir un carácter ancho. El
+    /// cursor se sigue por su posición dentro de su línea lógica. Lo que queda por debajo de lo último con contenido
+    /// (y del cursor) no entra; la pantalla son las últimas `alto` filas de ese resultado.
+    fn reflow(&mut self, size: Size) {
+        let w = usize::from(size.cols());
+        let sb: Vec<&crate::row::Row> = self.scrollback.as_ref().map_or_else(Vec::new, |s| s.rows.iter().collect());
+        let sb_len = sb.len();
+        let cursor_global = sb_len + usize::from(self.pos.row);
+        let cursor_col = usize::from(self.pos.col);
+
+        // 1. Líneas lógicas. `cursor_logico` = (índice de línea, desplazamiento dentro de la línea).
+        let mut lineas: Vec<Vec<crate::Cell>> = Vec::new();
+        let mut actual: Vec<crate::Cell> = Vec::new();
+        let mut cursor_logico: Option<(usize, usize)> = None;
+        for (i, fila) in sb.iter().copied().chain(self.rows.iter()).enumerate() {
+            let celdas = fila.cells_slice();
+            if i == cursor_global {
+                cursor_logico = Some((lineas.len(), actual.len() + cursor_col));
+            }
+            // En una fila envuelta, las celdas en blanco por defecto del final son relleno (p. ej. un ancho doble
+            // que no cabía y pasó a la fila siguiente): no son texto. Las que están en o tras el cursor se conservan.
+            let mut fin = celdas.len();
+            if fila.wrapped() {
+                let limite = if i == cursor_global { cursor_col } else { 0 };
+                while fin > limite && celdas[fin - 1] == crate::Cell::new() {
+                    fin -= 1;
+                }
+            }
+            actual.extend_from_slice(&celdas[..fin]);
+            if !fila.wrapped() {
+                if let Some((l, off)) = cursor_logico.filter(|(l, _)| *l == lineas.len()) {
+                    if off > actual.len().saturating_sub(1) && l == lineas.len() {
+                        actual.resize(off.max(actual.len()), crate::Cell::new());
+                    }
+                }
+                while actual.last().is_some_and(|c| *c == crate::Cell::new()) {
+                    let fuera = cursor_logico.is_some_and(|(l, off)| l == lineas.len() && off >= actual.len());
+                    if fuera {
+                        break;
+                    }
+                    actual.pop();
+                }
+                lineas.push(std::mem::take(&mut actual));
+            }
+        }
+        if !actual.is_empty() {
+            lineas.push(actual);
+        }
+
+        // 2. Se vuelve a partir cada línea al ancho nuevo.
+        let mut out: Vec<crate::row::Row> = Vec::new();
+        let mut cursor_out: Option<(usize, usize)> = None;
+        for (li, linea) in lineas.iter().enumerate() {
+            let cur = cursor_logico.filter(|(l, _)| *l == li).map(|(_, o)| o);
+            let mut fila: Vec<crate::Cell> = Vec::with_capacity(w);
+            let mut k = 0;
+            while k < linea.len() {
+                // Un carácter ancho ocupa dos celdas y no se parte. En una pantalla de una columna sigue siendo ancho
+                // (la marca se conserva) y su continuación se regenera al volver a ser más ancha.
+                let base_ancha = linea[k].is_wide();
+                let con_continuacion = k + 1 < linea.len() && linea[k + 1].is_wide_continuation();
+                let (unidad, consumidas): (Vec<crate::Cell>, usize) = if base_ancha && w >= 2 {
+                    let mut cont = crate::Cell::new();
+                    cont.set_wide_continuation(true);
+                    let segunda = if con_continuacion { linea[k + 1].clone() } else { cont };
+                    (vec![linea[k].clone(), segunda], if con_continuacion { 2 } else { 1 })
+                } else if base_ancha {
+                    (vec![linea[k].clone()], if con_continuacion { 2 } else { 1 })
+                } else {
+                    (vec![linea[k].clone()], 1)
+                };
+                if fila.len() + unidad.len() > w {
+                    fila.resize(w, crate::Cell::new());
+                    out.push(crate::row::Row::from_cells(std::mem::replace(&mut fila, Vec::with_capacity(w)), true));
+                }
+                if cur.is_some_and(|c| c >= k && c < k + consumidas) {
+                    cursor_out = Some((out.len(), fila.len()));
+                }
+                fila.extend(unidad);
+                k += consumidas;
+            }
+            if cur.is_some_and(|c| c >= linea.len()) {
+                cursor_out = Some((out.len(), fila.len()));
+            }
+            fila.resize(w, crate::Cell::new());
+            out.push(crate::row::Row::from_cells(fila, false));
+        }
+
+        // 3. Filas que van después de lo último con contenido (y del cursor) no se conservan.
+        let (cr, cc) = cursor_out.unwrap_or((out.len().saturating_sub(1), 0));
+        // Col == ancho es el «wrap pendiente» de vt100 (la línea está llena y el cursor va al final): se conserva.
+        let cc = cc.min(w);
+        let mut ultimo = cr.min(out.len().saturating_sub(1));
+        for (idx, fila) in out.iter().enumerate() {
+            if fila.cells_slice().iter().any(|c| *c != crate::Cell::new()) {
+                ultimo = ultimo.max(idx);
+            }
+        }
+        out.truncate(ultimo + 1);
+
+        // 4. La pantalla son las últimas `alto` filas; lo anterior pasa al historial (el más antiguo se descarta).
+        let alto = usize::from(size.rows());
+        let top = out.len().saturating_sub(alto);
+        let mut resto = out.split_off(top);
+        let arriba = out;
+        resto.resize_with(alto, || crate::row::Row::new(size.cols()));
+        if let Some(last) = resto.last_mut() {
+            last.wrap(false);
+        }
+        if let Some(scrollback) = &mut self.scrollback {
+            scrollback.unbounded_len = arriba.len();
+            let cap = scrollback.capacity;
+            let mut historial: alloc::collections::VecDeque<crate::row::Row> = arriba.into_iter().collect();
+            while historial.len() > cap {
+                historial.pop_front();
+            }
+            scrollback.rows = historial;
+            scrollback.offset = 0;
+        }
+        self.rows = resto;
+        self.size = size;
+        self.scroll_bottom = size.rows() - 1;
+        self.pos = Pos {
+            row: u16::try_from(cr.saturating_sub(top)).unwrap_or(u16::MAX).min(size.rows() - 1),
+            col: u16::try_from(cc).unwrap_or(u16::MAX),
+        };
+        debug_assert!(self.pos.row < size.rows());
+        self.saved_pos.row = self.saved_pos.row.min(size.rows() - 1);
+        self.saved_pos.col = self.saved_pos.col.min(size.cols() - 1);
     }
 
     pub fn pos(&self) -> Pos {
@@ -941,4 +1082,224 @@ impl Size {
 pub struct Pos {
     pub row: u16,
     pub col: u16,
+}
+
+/// GALGO (reflow): pruebas del reacomodo al cambiar el ancho. Ver PATCH-GALGO.md.
+#[cfg(test)]
+mod reflow_tests {
+    use crate::Parser;
+    use core::num::NonZeroU16;
+
+    fn nz(n: u16) -> NonZeroU16 {
+        NonZeroU16::new(n).unwrap()
+    }
+
+    /// Texto de cada fila (historial y pantalla), sin el relleno final, y si la fila sigue en la siguiente.
+    fn filas(p: &Parser) -> Vec<(String, bool)> {
+        let g = p.screen().grid();
+        let mut out = Vec::new();
+        let sb = g.scrollback.as_ref().map(|s| s.rows.iter().collect::<Vec<_>>()).unwrap_or_default();
+        for fila in sb.into_iter().chain(g.rows.iter()) {
+            let mut t = String::new();
+            for c in fila.cells_slice() {
+                if c.is_wide_continuation() {
+                    continue;
+                }
+                t.push_str(if c.has_contents() { c.contents() } else { " " });
+            }
+            out.push((t.trim_end().to_string(), fila.wrapped()));
+        }
+        out
+    }
+
+    /// Filas con contenido, sin los vacíos del final: lo que el usuario lee.
+    fn texto(p: &Parser) -> Vec<String> {
+        let mut v: Vec<String> = filas(p).into_iter().map(|(t, _)| t).collect();
+        while v.last().is_some_and(|t| t.is_empty()) {
+            v.pop();
+        }
+        v
+    }
+
+    fn cursor(p: &Parser) -> (u16, u16) {
+        p.screen().cursor_position()
+    }
+
+    #[test]
+    fn ancho_estrecho_y_vuelta_devuelve_el_mismo_texto_y_cursor() {
+        let mut p = Parser::new(nz(4), nz(10), 100);
+        p.process(b"abcdefghijklmnopqrstuvwxyz0123456789 fin");
+        let antes = (texto(&p), cursor(&p));
+        p.set_size(nz(4), nz(5));
+        p.set_size(nz(4), nz(10));
+        assert_eq!((texto(&p), cursor(&p)), antes);
+        // Un paso intermedio con otro ancho también debe reconstruirse igual al volver.
+        p.set_size(nz(4), nz(7));
+        p.set_size(nz(4), nz(3));
+        p.set_size(nz(4), nz(10));
+        assert_eq!((texto(&p), cursor(&p)), antes);
+    }
+
+    #[test]
+    fn el_cursor_sigue_a_su_posicion_logica_dentro_de_la_linea() {
+        let mut p = Parser::new(nz(6), nz(12), 100);
+        p.process(b"hola mundo largo para envolver");
+        // Cursor a mitad de la segunda fila envuelta.
+        p.process(b"\x1b[2;4H");
+        let antes = cursor(&p);
+        let bajo = |p: &Parser| {
+            let (r, c) = cursor(p);
+            p.screen().cell(r, c).map(|x| x.contents().to_string())
+        };
+        let letra = bajo(&p);
+        p.set_size(nz(6), nz(6));
+        // Dentro de la misma línea lógica: el carácter bajo el cursor sigue siendo el mismo.
+        assert_eq!(bajo(&p), letra);
+        p.set_size(nz(6), nz(12));
+        assert_eq!(cursor(&p), antes);
+    }
+
+    #[test]
+    fn los_caracteres_anchos_no_se_parten() {
+        let texto_cjk = "漢字漢字漢字漢字漢字";
+        for ancho in 1..=12u16 {
+            let mut p = Parser::new(nz(3), nz(12), 100);
+            p.process(texto_cjk.as_bytes());
+            let antes = texto(&p);
+            p.set_size(nz(3), nz(ancho));
+            let g = p.screen().grid();
+            let w = usize::from(ancho);
+            for fila in g.rows.iter().chain(g.scrollback.as_ref().map(|s| s.rows.iter()).into_iter().flatten()) {
+                let celdas = fila.cells_slice();
+                for (i, c) in celdas.iter().enumerate() {
+                    if c.is_wide() && ancho >= 2 {
+                        assert!(i + 1 < w, "un carácter ancho acaba en la última columna (ancho {ancho})");
+                        assert!(celdas[i + 1].is_wide_continuation(), "ancho sin continuación (ancho {ancho})");
+                    }
+                }
+            }
+            p.set_size(nz(3), nz(12));
+            assert_eq!(texto(&p), antes, "ancho {ancho}");
+        }
+    }
+
+    #[test]
+    fn los_emoji_tambien_son_anchos() {
+        let mut p = Parser::new(nz(4), nz(8), 100);
+        p.process("😀a😀b😀c😀d".as_bytes());
+        let antes = texto(&p);
+        p.set_size(nz(4), nz(3));
+        p.set_size(nz(4), nz(8));
+        assert_eq!(texto(&p), antes);
+    }
+
+    #[test]
+    fn el_historial_lleno_se_reacomoda_y_vuelve_igual() {
+        let mut p = Parser::new(nz(10), nz(80), 2000);
+        let mut bytes = Vec::new();
+        for n in 0..300 {
+            bytes.extend_from_slice(format!("línea {n} con bastante texto para que envuelva en la pantalla de ochenta columnas y algo más\r\n").as_bytes());
+        }
+        p.process(&bytes);
+        let antes = texto(&p);
+        assert!(antes.len() > 290, "el historial tiene que estar lleno");
+        p.set_size(nz(10), nz(30));
+        assert_eq!(texto(&p).join("\n").replace('\n', "").len(), antes.join("").len(), "mismo texto total");
+        p.set_size(nz(10), nz(80));
+        assert_eq!(texto(&p), antes);
+    }
+
+    #[test]
+    fn el_historial_del_tope_respeta_la_capacidad() {
+        let mut p = Parser::new(nz(4), nz(40), 50);
+        let mut bytes = Vec::new();
+        for n in 0..200 {
+            bytes.extend_from_slice(format!("fila {n:03} relleno relleno relleno relleno\r\n").as_bytes());
+        }
+        p.process(&bytes);
+        p.set_size(nz(4), nz(12));
+        p.set_size(nz(4), nz(40));
+        assert!(p.screen().grid().scrollback.as_ref().unwrap().rows.len() <= 50, "no más filas que la capacidad");
+    }
+
+    #[test]
+    fn el_sgr_se_conserva_al_reacomodar() {
+        let mut p = Parser::new(nz(4), nz(10), 100);
+        p.process(b"\x1b[1;31mROJOROJOROJO\x1b[0m fin");
+        p.set_size(nz(4), nz(4));
+        p.set_size(nz(4), nz(10));
+        let c = p.screen().cell(0, 0).unwrap();
+        assert_eq!(c.contents(), "R");
+        assert!(c.bold());
+        assert_eq!(c.fgcolor(), crate::Color::Idx(1));
+    }
+
+    #[test]
+    fn la_pantalla_alternativa_no_se_reacomoda() {
+        let mut p = Parser::new(nz(3), nz(10), 100);
+        p.process(b"\x1b[?1049habcdefghijklmnopqrstuvwxyz");
+        p.set_size(nz(3), nz(4));
+        // Sin reacomodo: cada línea se corta al ancho nuevo, sin envolver en la siguiente fila.
+        assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "a");
+        assert_eq!(p.screen().cell(0, 3).unwrap().contents(), "d");
+        // La fila siguiente empieza donde terminaba su línea original: se corta, no se reacomoda.
+        assert_eq!(p.screen().cell(1, 0).unwrap().contents(), "k");
+        p.set_size(nz(3), nz(10));
+        p.process(b"\x1b[?1049l");
+    }
+
+    /// Ida y vuelta por todos los anchos con texto mezclado (ASCII, CJK, emoji, SGR) y el cursor al final.
+    #[test]
+    fn ida_y_vuelta_en_todos_los_anchos() {
+        let base = "uno 漢字 dos😀tres 四五六七八九十 cuatro\x1b[31m rojo 漢\x1b[0m fin";
+        let mut p = Parser::new(nz(6), nz(24), 500);
+        for n in 0..12 {
+            p.process(format!("{base} {n}\r\n").as_bytes());
+        }
+        // Cursor al final, como en un prompt. Con el cursor más arriba y mucho contenido debajo no cabe en la
+        // pantalla: ver PATCH-GALGO.md (límite del reflow).
+        let antes = (texto(&p), cursor(&p));
+        for ancho in (2..=40u16).rev() {
+            p.set_size(nz(6), nz(ancho));
+        }
+        for ancho in 2..=40u16 {
+            p.set_size(nz(6), nz(ancho));
+            p.set_size(nz(6), nz(24));
+            assert_eq!((texto(&p), cursor(&p)), antes, "ancho intermedio {ancho}");
+        }
+    }
+
+    #[test]
+    fn cambiar_solo_el_alto_no_altera_el_contenido() {
+        let mut p = Parser::new(nz(5), nz(12), 100);
+        p.process(b"uno dos tres cuatro cinco seis siete ocho nueve diez");
+        let antes = filas(&p);
+        p.set_size(nz(8), nz(12));
+        let despues: Vec<String> = filas(&p).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(despues.iter().filter(|t| !t.is_empty()).cloned().collect::<Vec<_>>(), antes.iter().map(|(t, _)| t.clone()).filter(|t| !t.is_empty()).collect::<Vec<_>>());
+    }
+
+    /// Rendimiento (no es una prueba de corrección): historial lleno y arrastre de divisor, ancho que va y vuelve.
+    /// Se ejecuta con `cargo test -p vt100 reflow_rendimiento -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn reflow_rendimiento() {
+        let mut p = Parser::new(nz(40), nz(200), 2000);
+        let mut bytes = Vec::new();
+        for n in 0..4000 {
+            bytes.extend_from_slice(format!("{n:05} {}\r\n", "x".repeat(180 + n % 40)).as_bytes());
+        }
+        p.process(&bytes);
+        let mut tiempos = Vec::new();
+        for paso in 0..200u16 {
+            let ancho = if paso % 2 == 0 { 120 } else { 200 };
+            let t0 = std::time::Instant::now();
+            p.set_size(nz(40), nz(ancho));
+            tiempos.push(t0.elapsed());
+        }
+        tiempos.sort();
+        let mediana = tiempos[tiempos.len() / 2];
+        let max = tiempos[tiempos.len() - 1];
+        println!("reflow historial 2000 filas x ancho 200<->120: mediana {:?}, máximo {:?} (200 cambios)", mediana, max);
+    }
 }

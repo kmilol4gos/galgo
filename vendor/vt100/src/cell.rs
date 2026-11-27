@@ -128,7 +128,8 @@ impl Cell {
         self.len & IS_WIDE_CONTINUATION != 0
     }
 
-    fn set_wide(&mut self, wide: bool) {
+    /// GALGO (reflow): marca de carácter ancho; el reflow la quita cuando un ancho doble queda en una fila de ancho 1.
+    pub(crate) fn set_wide(&mut self, wide: bool) {
         if wide {
             self.len |= IS_WIDE;
         } else {

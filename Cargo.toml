@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/galgo-proto", "crates/galgo-daemon", "crates/galgo-cli", "crates/galgo-mcp", "crates/galgo-usage"]
+members = ["crates/galgo-proto", "crates/galgo-daemon", "crates/galgo-cli", "crates/galgo-mcp", "crates/galgo-usage", "vendor/vt100"]
 exclude = ["crates/galgo-gui"]
 
 [workspace.package]

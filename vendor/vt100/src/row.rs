@@ -171,6 +171,16 @@ impl Row {
         self.wrapped
     }
 
+    /// GALGO (reflow): las celdas de la fila, tal cual.
+    pub(crate) fn cells_slice(&self) -> &[crate::Cell] {
+        &self.cells
+    }
+
+    /// GALGO (reflow): una fila nueva con esas celdas (su largo es el ancho de la fila).
+    pub(crate) fn from_cells(cells: Vec<crate::Cell>, wrapped: bool) -> Self {
+        Self { cells, wrapped }
+    }
+
     pub fn clear_wide(&mut self, col: u16) {
         let col_idx = usize::from(col);
         let cell = &self.cells[col_idx];
