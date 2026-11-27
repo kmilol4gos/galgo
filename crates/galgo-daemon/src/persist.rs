@@ -273,7 +273,7 @@ pub fn snapshot(st: &State) -> Saved {
                 cmd: p.cmd.clone(),
                 manager: p.manager,
                 workspace: p.workspace.clone(),
-                cwd: p.cwd.clone(),
+                cwd: p.cwd_vivo(),
                 alive: !p.ghost && !p.exited,
                 inbox: p
                     .inbox

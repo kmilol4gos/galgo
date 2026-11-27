@@ -1,5 +1,6 @@
 //! galgod: daemon que posee los PTYs, el estado de pantalla y la entrega de mensajes entre agentes.
 
+mod cwd;
 mod persist;
 mod usage;
 
@@ -96,7 +97,10 @@ struct Pane {
     ghost: bool,
     /// Workspace del panel ("<proyecto>/<rama>" o un nombre libre) y su directorio de trabajo.
     workspace: Option<String>,
+    /// Directorio de trabajo declarado al crear el panel. El vivo sale de `cwd_vivo`.
     cwd: Option<String>,
+    /// Último directorio anunciado por el shell con OSC 7 (lo escribe el hilo lector).
+    osc_cwd: Arc<Mutex<Option<String>>>,
     /// Uso del transcript (lo rellena el hilo de sondeo) y último informe del agente. Solo en memoria.
     usage: Option<PaneUsage>,
     usage_report: Option<usage::ReportData>,
@@ -133,6 +137,21 @@ impl ChildKiller for GhostKiller {
 }
 
 impl Pane {
+    /// Directorio de trabajo vivo: el del proceso en primer plano del pty (su grupo de procesos), luego el del
+    /// líder de sesión (el shell), luego lo último que anunció OSC 7 y, por último, el declarado al crear el panel.
+    fn cwd_vivo(&self) -> Option<String> {
+        if !self.ghost && !self.exited {
+            let en_primer_plano = self._master.as_ref().and_then(|m| m.process_group_leader());
+            if let Some(c) = en_primer_plano.and_then(cwd::cwd_de_pid) {
+                return Some(c);
+            }
+            if let Some(c) = self.pid.and_then(|p| cwd::cwd_de_pid(p as i32)) {
+                return Some(c);
+            }
+        }
+        self.osc_cwd.lock().ok().and_then(|g| g.clone()).or_else(|| self.cwd.clone())
+    }
+
     /// Panel restaurado: sin PTY. Las órdenes que lo necesitan fallan con un error claro.
     fn ghost(
         id: u32,
@@ -164,6 +183,7 @@ impl Pane {
             ghost: true,
             workspace,
             cwd,
+            osc_cwd: Arc::new(Mutex::new(None)),
             usage: None,
             usage_report: None,
             inbox,
@@ -460,7 +480,7 @@ impl State {
             waiting_on: p.waiting_on.and_then(|(t, _)| self.panes.get(&t)).map(|t| t.name.clone()),
             waiting_secs: p.waiting_on.map(|(_, at)| at.elapsed().as_secs()),
             workspace: p.workspace.clone(),
-            cwd: p.cwd.clone(),
+            cwd: p.cwd_vivo(),
             usage: usage::merged(p.usage.as_ref(), p.usage_report.as_ref()),
             title: p.title.clone(),
             agent: p.hooked || is_agent_cmd(&p.cmd) || p.usage.is_some() || p.usage_report.is_some(),
@@ -957,6 +977,8 @@ impl Daemon {
         let screen = Arc::new(Mutex::new(vt100::Parser::new(v_rows, v_cols, 2000)));
         let gen = Arc::new(AtomicU64::new(fresh_gen()));
         let changed = Arc::new(Notify::new());
+        let osc_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let osc_hilo = Arc::clone(&osc_cwd);
 
         let (input, input_rx) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
         std::thread::spawn(move || {
@@ -985,6 +1007,7 @@ impl Daemon {
             ghost: false,
             workspace,
             cwd: cwd_saved,
+            osc_cwd,
             usage: None,
             usage_report: None,
             inbox: Vec::new(),
@@ -1014,10 +1037,14 @@ impl Daemon {
         let d = Arc::clone(self);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
+            let mut osc7 = cwd::Osc7::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if let Some(dir) = osc7.feed(&buf[..n]) {
+                            *osc_hilo.lock().unwrap() = Some(dir);
+                        }
                         let mut parser = screen.lock().unwrap();
                         parser.process(&buf[..n]);
                         gen.fetch_add(1, Ordering::SeqCst);
@@ -1425,7 +1452,7 @@ impl Daemon {
                 // Si el panel trabaja en un worktree de tarea, el resultado lleva los cambios para el manager.
                 let cwd = {
                     let st = self.state.lock().unwrap();
-                    st.resolve(&pane).ok().and_then(|id| st.panes[&id].cwd.clone())
+                    st.resolve(&pane).ok().and_then(|id| st.panes[&id].cwd_vivo())
                 };
                 let cambios = tokio::task::spawn_blocking(move || cwd.as_deref().and_then(|c| resumen_de_cambios(c, Some(15))))
                     .await?;
@@ -1627,7 +1654,7 @@ impl Daemon {
                     if !t.status.abierta() {
                         bail!("la tarea {id} ya está cerrada");
                     }
-                    (st.panes.get(&from_id).and_then(|p| p.cwd.clone()), from_id)
+                    (st.panes.get(&from_id).and_then(|p| p.cwd_vivo()), from_id)
                 };
                 let files = tokio::task::spawn_blocking(move || cwd.map(|c| archivos_cambiados(&c)).unwrap_or_default()).await?;
                 let manager = {
@@ -1670,7 +1697,7 @@ impl Daemon {
                 let (cwd, ocupado) = {
                     let st = self.state.lock().unwrap();
                     let p = &st.panes[&st.resolve(&pane)?];
-                    (p.cwd.clone(), matches!(p.status, Status::Working | Status::Blocked))
+                    (p.cwd_vivo(), matches!(p.status, Status::Working | Status::Blocked))
                 };
                 let cwd = cwd.ok_or_else(|| anyhow!("el panel no tiene directorio de trabajo"))?;
                 let v = tokio::task::spawn_blocking(move || worktree_accion(&cwd, action, confirm, ocupado))
