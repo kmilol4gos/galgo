@@ -1321,10 +1321,50 @@ async fn watch_once(pane: u32, salida: &mut iced::futures::channel::mpsc::Sender
 }
 
 /// Abre una URL o una ruta con el visor del sistema (`open`). Un fallo se avisa y no detiene la app.
-fn open_target(objetivo: &str) {
-    if let Err(e) = std::process::Command::new("open").arg(objetivo).spawn() {
-        eprintln!("galgo-gui: no pude abrir {objetivo}: {e}");
+fn open_target(objetivo: &str) -> Result<(), String> {
+    if objetivo.starts_with("http://") || objetivo.starts_with("https://") {
+        return std::process::Command::new("open").arg(objetivo).spawn().map(|_| ()).map_err(|e| format!("no pude abrir el enlace: {e}"));
     }
+    let ruta = std::path::Path::new(objetivo);
+    let meta = std::fs::metadata(ruta).map_err(|_| format!("no existe: {objetivo}"))?;
+    let comando = match accion_para(ruta, &meta)? {
+        AccionRuta::Abrir => "abrir",
+        AccionRuta::Revelar => "revelar",
+    };
+    let mut cmd = std::process::Command::new("open");
+    if comando == "revelar" {
+        cmd.arg("-R");
+    }
+    cmd.arg(ruta).spawn().map(|_| ()).map_err(|e| format!("no pude abrir {objetivo}: {e}"))
+}
+
+/// Qué hace Cmd+clic con una ruta: abrir un documento conocido, o mostrarla en el Finder (sin ejecutarla).
+#[derive(Debug, PartialEq)]
+enum AccionRuta {
+    Abrir,
+    Revelar,
+}
+
+/// review-15 M2: `open` ejecuta bundles y scripts de ejecución (`.command`, `.tool`, `.app`…), así que Cmd+clic nunca los
+/// ejecuta: se rechazan. Un ejecutable cualquiera tampoco se lanza. Un documento conocido se abre; el resto se revela.
+fn accion_para(ruta: &std::path::Path, meta: &std::fs::Metadata) -> Result<AccionRuta, String> {
+    const BUNDLES: [&str; 6] = ["app", "command", "tool", "terminal", "workflow", "pkg"];
+    const DOCUMENTOS: [&str; 22] = [
+        "pdf", "txt", "md", "png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "json", "toml", "yaml", "yml", "csv", "log", "html", "mp4", "mov", "docx", "xlsx", "pptx",
+    ];
+    let ext = ruta.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let dentro_de_bundle = ruta.components().any(|c| c.as_os_str().to_string_lossy().to_lowercase().ends_with(".app"));
+    if BUNDLES.contains(&ext.as_str()) || dentro_de_bundle {
+        return Err(format!("no abro {} desde Cmd+clic: son programas que se ejecutan", ruta.display()));
+    }
+    if meta.is_dir() {
+        return Ok(AccionRuta::Abrir);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o111 != 0 {
+        return Err(format!("{} es ejecutable: Cmd+clic no lo lanza", ruta.display()));
+    }
+    Ok(if DOCUMENTOS.contains(&ext.as_str()) { AccionRuta::Abrir } else { AccionRuta::Revelar })
 }
 
 /// Título de una pestaña: el que declaró la tarea (`galgo title`), o proceso y cwd («zsh ~/.config/rex»).
@@ -1399,7 +1439,8 @@ fn token_en(chars: &[char], col: u16) -> Option<String> {
         Some(resto) => std::path::PathBuf::from(home_dir()).join(resto),
         None => std::path::PathBuf::from(texto),
     };
-    ruta.exists().then(|| texto.to_string())
+    // La ruta ya expandida (`~` es el inicio del usuario): es lo que se abre, sin depender de una shell.
+    ruta.exists().then(|| ruta.to_string_lossy().into_owned())
 }
 
 /// Texto de la selección. Las filas que continúan en la siguiente (soft wrap) se unen sin salto de
@@ -2454,7 +2495,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 // Cmd+clic en una URL o una ruta existente: se abre con el visor del sistema; no empieza selección.
                 if app.mods.command() {
                     if let Some(objetivo) = shown(app).and_then(|snap| token_en(&row_chars(snap, cell.0), cell.1)) {
-                        open_target(&objetivo);
+                        app.error = open_target(&objetivo).err();
                         return Task::none();
                     }
                 }
@@ -3208,6 +3249,32 @@ mod tests {
         assert_eq!(titulo_pestana(&p), "zsh ~/Development/nexo");
         p.title = Some("bug de ventas".into());
         assert_eq!(titulo_pestana(&p), "bug de ventas", "el título de la tarea manda");
+    }
+
+    /// review-15 M2: Cmd+clic no ejecuta bundles ni ejecutables; un documento se abre y lo demás se revela en el Finder.
+    #[test]
+    fn cmd_clic_no_ejecuta_programas() {
+        let dir = std::env::temp_dir().join(format!("galgo-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Demo.app")).unwrap();
+        std::fs::write(dir.join("leeme.command"), "#!/bin/sh\necho hola\n").unwrap();
+        std::fs::write(dir.join("notas.md"), "hola").unwrap();
+        std::fs::write(dir.join("datos.bin"), "x").unwrap();
+        let script = dir.join("script");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let meta = |p: &std::path::Path| std::fs::metadata(p).unwrap();
+        assert!(accion_para(&dir.join("Demo.app"), &meta(&dir.join("Demo.app"))).is_err(), "un .app no se abre");
+        assert!(accion_para(&dir.join("leeme.command"), &meta(&dir.join("leeme.command"))).is_err(), "un .command no se ejecuta");
+        assert!(accion_para(&script, &meta(&script)).is_err(), "un ejecutable no se lanza");
+        assert_eq!(accion_para(&dir.join("notas.md"), &meta(&dir.join("notas.md"))), Ok(AccionRuta::Abrir));
+        assert_eq!(accion_para(&dir.join("datos.bin"), &meta(&dir.join("datos.bin"))), Ok(AccionRuta::Revelar));
+        std::fs::create_dir_all(dir.join("Demo.app/Contents")).unwrap();
+        std::fs::write(dir.join("Demo.app/Contents/Info.plist"), "<plist/>").unwrap();
+        assert!(open_target(&dir.join("Demo.app/Contents/Info.plist").to_string_lossy()).is_err(), "nada dentro de un bundle (el archivo existe)");
+        assert!(open_target("/no/existe/x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Selección y apertura en el terminal: palabra, URL, ruta y el entrecomillado de rutas al arrastrar.
