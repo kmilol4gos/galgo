@@ -18,6 +18,9 @@ mod prefs;
 mod recents;
 mod settings;
 mod sidebar;
+mod workspace;
+
+use std::collections::BTreeMap;
 mod term;
 mod theme;
 mod usage;
@@ -235,6 +238,16 @@ struct App {
     refresh_wanted: bool,
     /// La suscripción al panel enfocado no funciona: se sondea su pantalla hasta que vuelva a funcionar.
     watch_down: bool,
+    /// Workspaces explícitos (con nombre y carpeta propios): clave → carpeta. Los demás salen de la etiqueta del repo.
+    explicit: BTreeMap<String, String>,
+    /// El próximo workspace que se abra es explícito (Cmd+Shift+N).
+    new_ws_explicit: bool,
+    /// Ya se aplicó lo guardado. Antes no se escribe nada: un primer listado incompleto borraría los layouts.
+    ws_restored: bool,
+    /// Último estado de workspaces escrito en disco (para no escribir si no cambió).
+    ws_saved: String,
+    /// Cerrar un workspace pide dos clics: el primero deja aquí su clave.
+    ws_close_armed: Option<String>,
     /// Modificadores del teclado (para Cmd+clic) y el último clic (para doble y triple clic: celda, instante, n).
     mods: keyboard::Modifiers,
     clicks: Option<(Cell, std::time::Instant, u8)>,
@@ -343,6 +356,10 @@ enum Message {
     PaneChanged(u32, u64),
     /// No hubo forma de suscribirse al panel: mientras tanto, la pantalla se sondea.
     WatchDown(u32),
+    /// Nuevo workspace con nombre propio (Cmd+Shift+N): se agrupa en la barra superior y se guarda.
+    OpenNewNamedWorkspace,
+    /// Cierra el grupo de un workspace explícito y sus paneles (dos clics).
+    CloseWorkspace(String),
     /// Cmd+K: limpia la pantalla del panel enfocado (Ctrl+L al shell).
     ClearScreen,
     /// Un archivo arrastrado a la ventana: su ruta se pega en el panel enfocado.
@@ -435,8 +452,9 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 23] = [
+    let commands: [(&str, &str, Message); 24] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
+        ("Nuevo workspace con grupo…", "Cmd+Shift+N", Message::OpenNewNamedWorkspace),
         ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
         ("Lanzar agente…", "Cmd+Shift+L", Message::OpenLauncher),
@@ -483,6 +501,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("k", false) => Some(Message::ClearScreen),
         (",", false) => Some(Message::OpenSettings),
         ("n", false) => Some(Message::OpenNewWorkspace),
+        ("n", true) => Some(Message::OpenNewNamedWorkspace),
         ("o", false) => Some(Message::PickFolder),
         ("t", false) => Some(Message::NewTab),
         ("w", false) => Some(Message::CloseFocused),
@@ -519,7 +538,7 @@ fn shortcut_in_state(app: &App, key: &Key, modifiers: keyboard::Modifiers) -> Op
     }
     match message {
         Message::CloseFocused => Some(Message::CancelForm),
-        Message::OpenNewWorkspace => Some(message),
+        Message::OpenNewWorkspace | Message::OpenNewNamedWorkspace => Some(message),
         _ => None,
     }
 }
@@ -636,9 +655,19 @@ fn names(app: &App) -> Vec<&str> {
 /// Crea un workspace en `path`: un shell en esa carpeta, con nombre libre y sin formulario.
 fn open_folder(app: &mut App, path: String) -> Task<Message> {
     let (rows, cols) = grid_for(app.window);
+    // Con Cmd+Shift+N el workspace tiene nombre propio (el de la carpeta, numerado si ya existe) y se agrupa.
+    let explicit = std::mem::take(&mut app.new_ws_explicit);
+    let grupo = explicit.then(|| {
+        let base = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "workspace".into());
+        let mut taken: Vec<&str> = app.explicit.keys().map(String::as_str).collect();
+        taken.extend(app.layouts.by_key.keys().map(String::as_str));
+        let nombre = launch::free_name(&base, &taken);
+        app.explicit.insert(nombre.clone(), path.clone());
+        nombre
+    });
     let name = launch::free_name("shell", &names(app));
     app.spawn_size = Some((rows, cols));
-    let req = launch::shell_request(&name, &login_shell(), &path, None, rows, cols);
+    let req = launch::shell_request(&name, &login_shell(), &path, grupo, rows, cols);
     Task::perform(
         async move {
             let result = tokio::task::spawn_blocking(move || request(req)).await.map_err(|e| e.to_string()).and_then(|r| r);
@@ -1229,7 +1258,27 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     let task = update_inner(app, message);
     keep_focus_visible(app);
     sync_chrome(app);
+    persist_workspaces(app);
     task
+}
+
+/// Guarda pestañas, splits y grupos explícitos cuando cambian. Solo después de restaurar, y con los nombres de los
+/// paneles reales (un panel sin nombre conocido sale de su árbol).
+fn persist_workspaces(app: &mut App) {
+    if !app.ws_restored || !app.started {
+        return;
+    }
+    let nombres: std::collections::HashMap<u32, String> = app.panes.iter().map(|p| (p.id, p.name.clone())).collect();
+    let v = workspace::snapshot(&app.layouts.by_key, &app.explicit, &|id| nombres.get(&id).cloned());
+    let texto = v.to_string();
+    if texto == app.ws_saved {
+        return;
+    }
+    if let Some(path) = &app.prefs_path {
+        if prefs::set(path, "workspaces", v).is_ok() {
+            app.ws_saved = texto;
+        }
+    }
 }
 
 /// Invariante (G1): el panel seleccionado está en la pestaña activa de su workspace. Si no lo está, la pestaña
@@ -1672,8 +1721,25 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             // B3: el foco va al buscador: lo que se escribe, y Enter, llegan ahí.
             iced::widget::text_input::focus(new_ws_input_id())
         }
+        Message::OpenNewNamedWorkspace => {
+            app.new_ws = Some(String::new());
+            app.new_ws_explicit = true;
+            Task::none()
+        }
+        Message::CloseWorkspace(key) => {
+            if app.ws_close_armed.as_deref() != Some(key.as_str()) {
+                app.ws_close_armed = Some(key);
+                return Task::none();
+            }
+            app.ws_close_armed = None;
+            app.explicit.remove(&key);
+            let ids: Vec<u32> = app.panes.iter().filter(|p| p.workspace.as_deref() == Some(key.as_str())).map(|p| p.id).collect();
+            app.layouts.by_key.remove(&key);
+            Task::batch(ids.into_iter().map(|id| send_request(Request::Kill { pane: id.to_string() }, |_| Message::Echo)))
+        }
         Message::CloseNewWorkspace => {
             app.new_ws = None;
+            app.new_ws_explicit = false;
             Task::none()
         }
         Message::NewWsQuery(query) => {
@@ -1729,8 +1795,18 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 Err(_) => load_panes(),
             }
         }
-        Message::WorkspaceOpened(_, Err(e)) => {
+        Message::WorkspaceOpened(path, Err(e)) => {
             app.error = Some(e);
+            // Un grupo explícito que no llegó a tener paneles se deshace: no se quedan grupos vacíos.
+            let vacios: Vec<String> = app
+                .explicit
+                .iter()
+                .filter(|(k, f)| **f == path && !app.panes.iter().any(|p| p.workspace.as_deref() == Some(k.as_str())))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in vacios {
+                app.explicit.remove(&k);
+            }
             Task::none()
         }
         Message::Limits(Ok(limits)) => {
@@ -1749,6 +1825,18 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 Ok(panes) => {
                     app.error = None;
                     app.panes = panes;
+                    // Primer listado: se restauran los workspaces guardados (pestañas, splits y grupos explícitos).
+                    if !app.ws_restored {
+                        app.ws_restored = true;
+                        if let Some(v) = app.prefs_path.as_ref().and_then(|p| prefs::get(p, "workspaces")) {
+                            let ids: std::collections::HashMap<String, u32> = app.panes.iter().map(|p| (p.name.clone(), p.id)).collect();
+                            let r = workspace::restore(&v, &|n| ids.get(n).copied());
+                            app.explicit = r.explicit;
+                            for (k, ws) in r.by_key {
+                                app.layouts.by_key.insert(k, ws);
+                            }
+                        }
+                    }
                     // Abrir la app ya es un terminal: si el daemon no tiene paneles, un shell en ~ (la bienvenida queda
                     // solo para cuando no se puede crear el panel).
                     if !app.started {
@@ -2774,6 +2862,46 @@ mod tests {
         assert!(!app.loading, "un panel que no está enfocado no se pide");
         let _ = update(&mut app, Message::PaneChanged(1, 9));
         assert!(app.loading, "el panel enfocado pide su pantalla nueva");
+    }
+
+    /// Workspace nativo: Cmd+Shift+N abre uno explícito; cerrarlo pide dos clics; y lo guardado vuelve al arrancar
+    /// (pestañas, splits y el grupo) cuando el daemon lista de nuevo sus paneles.
+    #[test]
+    fn workspace_explicito_se_guarda_y_se_restaura() {
+        let dir = std::env::temp_dir().join(format!("galgo-ws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prefs_path = dir.join("gui-prefs.json");
+        let _ = std::fs::remove_file(&prefs_path);
+        let mut app = App { prefs_path: Some(prefs_path.clone()), ..Default::default() };
+        // Cmd+Shift+N: el siguiente workspace abierto es explícito.
+        assert!(matches!(shortcut(&Key::Character("N".into()), keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenNewNamedWorkspace)));
+        let _ = update(&mut app, Message::OpenNewNamedWorkspace);
+        assert!(app.new_ws.is_some() && app.new_ws_explicit);
+        // Primer listado: arranque hecho, sin nada guardado todavía. Los paneles llevan la etiqueta de su workspace.
+        let en_nexo = |id: u32, name: &str| {
+            let mut p = pane_info(id, name, Status::Idle);
+            p.workspace = Some("nexo".into());
+            p
+        };
+        let _ = update(&mut app, Message::Panes(Ok(vec![en_nexo(1, "shell"), en_nexo(2, "claude")])));
+        app.layouts.new_tab("nexo", 1);
+        app.layouts.split(1, true, 2);
+        app.explicit.insert("nexo".into(), "/tmp/nexo".into());
+        let _ = update(&mut app, Message::Echo);
+        let guardado = prefs::get(&prefs_path, "workspaces").expect("el estado se guarda");
+        assert!(guardado.to_string().contains("\"explicit\":true"), "{guardado}");
+        // Reinicio: el daemon lista los mismos paneles y el layout vuelve.
+        let mut nueva = App { prefs_path: Some(prefs_path.clone()), ..Default::default() };
+        let _ = update(&mut nueva, Message::Panes(Ok(vec![en_nexo(1, "shell"), en_nexo(2, "claude")])));
+        assert_eq!(nueva.explicit.get("nexo").map(String::as_str), Some("/tmp/nexo"));
+        let ws = nueva.layouts.by_key.get("nexo").expect("el workspace vuelve");
+        assert_eq!(ws.tabs[0].root.ids().len(), 2, "el split vuelve con sus dos paneles");
+        // Cerrar el grupo: el primer clic avisa, el segundo lo cierra.
+        let _ = update(&mut nueva, Message::CloseWorkspace("nexo".into()));
+        assert!(nueva.explicit.contains_key("nexo"), "el primer clic solo avisa");
+        let _ = update(&mut nueva, Message::CloseWorkspace("nexo".into()));
+        assert!(!nueva.explicit.contains_key("nexo"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la

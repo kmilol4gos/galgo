@@ -8,7 +8,7 @@ use std::path::Path;
 /// Mapa de preferencias tal como está en disco. Un archivo ausente, ilegible o demasiado grande cuenta como vacío.
 fn read(path: &Path) -> serde_json::Map<String, serde_json::Value> {
     let Ok(meta) = std::fs::symlink_metadata(path) else { return Default::default() };
-    if !meta.file_type().is_file() || meta.len() > 4096 {
+    if !meta.file_type().is_file() || meta.len() > 262_144 {
         return Default::default();
     }
     std::fs::read_to_string(path)

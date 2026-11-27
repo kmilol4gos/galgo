@@ -206,6 +206,16 @@ pub fn overlay(_: &Theme) -> container::Style {
     }
 }
 
+/// Píldora de grupo: el workspace explícito que agrupa sus terminales en la barra superior.
+pub fn group(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(HOVER)),
+        text_color: Some(TEXT),
+        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: RADIUS_PANEL.into() },
+        ..Default::default()
+    }
+}
+
 /// Pestaña de la barra superior: la activa toma el fondo del terminal (se funde con él) y el texto claro.
 pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {

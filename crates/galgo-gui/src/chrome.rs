@@ -284,8 +284,27 @@ pub fn sidebar_view(app: &App) -> Element<'_, Message> {
 // ---------------------------------------------------------------------------------------------------------------
 
 /// Barra superior del área de terminales: dónde estás (proyecto / rama), las pestañas del workspace y las acciones.
+/// Píldora de un workspace explícito: su nombre, sus pestañas y el cierre del grupo (dos clics: el primero avisa).
+fn group_pill<'a>(app: &'a App, key: String, pestanas: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    let armed = app.ws_close_armed.as_deref() == Some(key.as_str());
+    let cerrar = theme::btn(
+        text(if armed { "¿cerrar grupo?" } else { "×" })
+            .size(if armed { theme::SMALL_SIZE } else { 13.0 })
+            .color(if armed { theme::FAILED } else { theme::DIM }),
+    )
+    .padding([0, 4])
+    .on_press(Message::CloseWorkspace(key.clone()));
+    let mut fila = row![text(key.clone()).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT)].spacing(6).align_y(Alignment::Center);
+    for p in pestanas {
+        fila = fila.push(p);
+    }
+    fila = fila.push(cerrar);
+    container(fila).padding([0, 8]).height(Length::Fixed(TABS_H - 8.0)).center_y(Length::Fixed(TABS_H - 8.0)).style(theme::group).into()
+}
+
 pub fn tabs_bar(app: &App) -> Element<'_, Message> {
     let key = focus_key(app);
+    let mut pestanas: Vec<Element<'_, Message>> = Vec::new();
     // Una sola fila (terminal primero): sin miga; el hueco de los semáforos de macOS arrastra la ventana.
     let mut bar = row![mouse_area(Space::with_width(78.0)).on_press(Message::DragWindow)].spacing(4).align_y(Alignment::Center).height(TABS_H - 1.0);
     if let Some(ws) = key.as_ref().and_then(|k| app.layouts.by_key.get(k)) {
@@ -319,7 +338,16 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
                 .padding(0)
                 .on_press(Message::SelectTab(i))
                 .style(theme::tab(active));
-            bar = bar.push(b);
+            pestanas.push(b.into());
+        }
+    }
+    // Workspace explícito (con nombre): sus terminales van dentro de una píldora de grupo; el resto, sueltos.
+    match key.as_ref().filter(|k| app.explicit.contains_key(*k)) {
+        Some(k) => bar = bar.push(group_pill(app, k.clone(), pestanas)),
+        None => {
+            for p in pestanas {
+                bar = bar.push(p);
+            }
         }
     }
     bar = bar
