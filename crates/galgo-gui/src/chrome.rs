@@ -286,20 +286,8 @@ pub fn sidebar_view(app: &App) -> Element<'_, Message> {
 /// Barra superior del área de terminales: dónde estás (proyecto / rama), las pestañas del workspace y las acciones.
 pub fn tabs_bar(app: &App) -> Element<'_, Message> {
     let key = focus_key(app);
-    // Punto 5: sin workspace, la miga muestra la carpeta del panel enfocado (o `~`).
-    let (project, branch) = match key.as_deref().filter(|k| !k.is_empty()) {
-        Some(k) => sidebar::split_label(Some(k)),
-        None => {
-            let cwd = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).and_then(|p| p.cwd.clone());
-            let l = sidebar::folder_label(cwd.as_deref(), &home_dir());
-            (l.clone(), l)
-        }
-    };
-    let crumb = row![text(project).size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text("/").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text(branch).size(theme::SMALL_SIZE + 1.0).color(MUTED).font(theme::MONO)]
-        .spacing(4)
-        .align_y(Alignment::Center);
-    // Pestañas como píldoras separadas por espacio (sin divisores verticales).
-    let mut bar = row![container(crumb).padding([0, 14])].spacing(4).align_y(Alignment::Center).height(TABS_H - 1.0);
+    // Una sola fila (terminal primero): sin miga; el hueco de los semáforos de macOS arrastra la ventana.
+    let mut bar = row![mouse_area(Space::with_width(78.0)).on_press(Message::DragWindow)].spacing(4).align_y(Alignment::Center).height(TABS_H - 1.0);
     if let Some(ws) = key.as_ref().and_then(|k| app.layouts.by_key.get(k)) {
         for (i, tab) in ws.tabs.iter().enumerate() {
             let pane = app.panes.iter().find(|p| p.id == tab.focus);
@@ -327,7 +315,9 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
     }
     bar = bar
         .push(icon_button(text("+").size(16).color(MUTED).into(), "Nueva pestaña  ⌘T", Message::NewTab))
-        .push(Space::with_width(Length::Fill));
+        .push(mouse_area(Space::with_width(Length::Fill)).on_press(Message::DragWindow))
+        .push(icon_button(text("⌘").size(14).color(MUTED).into(), "Paleta de comandos  ⌘⇧P", Message::OpenPalette))
+        .push(Space::with_width(8));
     column![container(bar).width(Length::Fill).style(theme::surface(SIDEBAR)), theme::rule(false)].into()
 }
 

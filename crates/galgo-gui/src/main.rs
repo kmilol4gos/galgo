@@ -14,6 +14,7 @@ mod fonts;
 mod layout;
 mod newpane;
 mod palette;
+mod prefs;
 mod recents;
 mod settings;
 mod sidebar;
@@ -80,7 +81,52 @@ const HEADER_H: f32 = 26.0;
 /// Desde el borde del hueco hasta el primer renglón del terminal.
 const LEAF_TOP: f32 = LEAF_PAD + HEADER_H;
 /// Origen de la cuadrícula de un panel único (referencia de las pruebas); un split usa el de su rectángulo.
-const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + LEAF_PAD, 2.0 * TABS_H + LEAF_TOP);
+/// Geometría del marco según lo visible. La fija `sync_chrome` tras cada actualización; el resto la lee con estas
+/// funciones. Por defecto (terminal primero): sin barra lateral, sin barra de estado y una sola fila superior.
+#[derive(Clone, Copy)]
+struct Marco {
+    sidebar: bool,
+    status: bool,
+    filas_top: u8,
+}
+static MARCO: std::sync::RwLock<Marco> = std::sync::RwLock::new(Marco { sidebar: false, status: false, filas_top: 1 });
+
+fn marco() -> Marco {
+    *MARCO.read().unwrap()
+}
+fn sidebar_w() -> f32 {
+    if marco().sidebar { SIDEBAR_W } else { 0.0 }
+}
+fn status_h() -> f32 {
+    if marco().status { STATUS_H } else { 0.0 }
+}
+/// Alto de la zona superior: una fila de pestañas, o dos si hay varios workspaces (la de sesiones arriba).
+fn top_h() -> f32 {
+    marco().filas_top as f32 * TABS_H
+}
+fn term_origin() -> (f32, f32) {
+    (sidebar_w() + LEAF_PAD, top_h() + LEAF_TOP)
+}
+
+/// Geometría del marco que corresponde al estado de la app (función pura, para probarla).
+fn marco_para(app: &App) -> Marco {
+    let filas_top = if sidebar::workspaces(&app.panes).len() > 1 { 2 } else { 1 };
+    Marco { sidebar: app.sidebar, status: app.status, filas_top }
+}
+
+/// Fija la geometría del marco según el estado de la app.
+fn sync_chrome(app: &App) {
+    *MARCO.write().unwrap() = marco_para(app);
+}
+
+/// Guarda una preferencia de la GUI junto al socket (si hay dónde guardarla). Un fallo no detiene la app.
+fn save_pref(app: &App, key: &str, value: serde_json::Value) {
+    if let Some(path) = &app.prefs_path {
+        if let Err(e) = prefs::set(path, key, value) {
+            eprintln!("galgo-gui: no pude guardar la preferencia {key}: {e}");
+        }
+    }
+}
 /// Primera opción del desplegable de manager del formulario: ningún manager.
 const NO_MANAGER: &str = "(ninguno)";
 
@@ -184,6 +230,9 @@ struct App {
     error: Option<String>,
     loading: bool,
     listing: bool,
+    /// Barra lateral y barra de estado visibles (por defecto, ocultas: terminal primero). Se recuerdan en las preferencias.
+    sidebar: bool,
+    status: bool,
     /// Ya llegó la primera lista de paneles (el arranque solo decide una vez si abre un shell).
     started: bool,
     window: (f32, f32),
@@ -282,6 +331,9 @@ enum Message {
     SubmitForm,
     Spawned(Result<serde_json::Value, String>),
     AskClose,
+    /// Muestra u oculta la barra lateral (Cmd+B) y la barra de estado (Cmd+/). Se recuerda la preferencia.
+    ToggleSidebar,
+    ToggleStatus,
     CancelClose,
     ConfirmClose,
     Killed(Result<serde_json::Value, String>),
@@ -367,7 +419,7 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 20] = [
+    let commands: [(&str, &str, Message); 22] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
         ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
@@ -378,6 +430,8 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         ("Lanzar Codex aquí", "", Message::Launch(launch::Agent::Codex)),
         ("Lanzar PI aquí", "", Message::Launch(launch::Agent::Pi)),
         ("Nuevo panel con formulario", "", Message::OpenForm),
+        ("Mostrar u ocultar la barra lateral", "Cmd+B", Message::ToggleSidebar),
+        ("Mostrar u ocultar la barra de estado", "Cmd+/", Message::ToggleStatus),
         ("Dividir a la derecha", "Cmd+D", Message::SplitFocused(true)),
         ("Dividir hacia abajo", "Cmd+Shift+D", Message::SplitFocused(false)),
         ("Pestaña siguiente", "Cmd+]", Message::NextTab(1)),
@@ -417,6 +471,8 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("[", false) => Some(Message::NextTab(-1)),
         ("]", false) => Some(Message::NextTab(1)),
         ("d", false) => Some(Message::SplitFocused(true)),
+        ("b", false) => Some(Message::ToggleSidebar),
+        ("/", false) => Some(Message::ToggleStatus),
         ("d", true) => Some(Message::SplitFocused(false)),
         ("l", true) => Some(Message::OpenLauncher),
         ("u", true) => Some(Message::NextAttention),
@@ -771,9 +827,9 @@ fn select(app: &mut App, id: u32) -> Task<Message> {
 /// `extra_top` y `extra_bottom` quedan para franjas futuras; hoy nada cambia la geometría (errores, uso y
 /// confirmaciones van en la barra de estado), así el terminal no salta de tamaño.
 fn terminal_area(window: (f32, f32), extra_top: f32, extra_bottom: f32) -> layout::Rect {
-    let x = SIDEBAR_W;
-    let y = 2.0 * TABS_H + extra_top;
-    layout::Rect { x, y, w: (window.0 - x).max(0.0), h: (window.1 - y - STATUS_H - extra_bottom).max(0.0) }
+    let x = sidebar_w();
+    let y = top_h() + extra_top;
+    layout::Rect { x, y, w: (window.0 - x).max(0.0), h: (window.1 - y - status_h() - extra_bottom).max(0.0) }
 }
 
 /// Cuadrícula de texto que cabe en un rectángulo de panel (con su margen interior).
@@ -828,7 +884,7 @@ fn origin_in(rect: layout::Rect) -> (f32, f32) {
 
 /// Origen de la cuadrícula del panel enfocado; sin rectángulo conocido, el de referencia.
 fn focus_origin(app: &App) -> (f32, f32) {
-    app.selected.and_then(|id| pane_rect(app, id)).map_or(TERM_ORIGIN, origin_in)
+    app.selected.and_then(|id| pane_rect(app, id)).map_or(term_origin(), origin_in)
 }
 
 /// Panel visible bajo el puntero, si hay alguno.
@@ -1013,6 +1069,7 @@ fn app_title(app: &App) -> String {
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let task = update_inner(app, message);
     keep_focus_visible(app);
+    sync_chrome(app);
     task
 }
 
@@ -1072,6 +1129,16 @@ fn keep_focus_visible(app: &mut App) {
 
 fn update_inner(app: &mut App, message: Message) -> Task<Message> {
     match message {
+        Message::ToggleSidebar => {
+            app.sidebar = !app.sidebar;
+            save_pref(app, "sidebar", serde_json::json!(app.sidebar));
+            Task::none()
+        }
+        Message::ToggleStatus => {
+            app.status = !app.status;
+            save_pref(app, "status", serde_json::json!(app.status));
+            Task::none()
+        }
         Message::ToggleMaximize => {
             app.maximized = match (app.maximized, app.selected) {
                 (Some(_), _) => None,
@@ -1983,12 +2050,17 @@ fn view(app: &App) -> Element<'_, Message> {
     let main: Element<'_, Message> = if app.panes.is_empty() {
         chrome::welcome_view(app)
     } else {
-        column![chrome::tabs_bar(app), container(chrome::layout_view(app)).width(Length::Fill).height(Length::Fill).style(theme::surface(theme::TERM_BG)), chrome::status_bar(app)].into()
+        let mut col = column![container(chrome::layout_view(app)).width(Length::Fill).height(Length::Fill).style(theme::surface(theme::TERM_BG))];
+        if marco().status {
+            col = col.push(chrome::status_bar(app));
+        }
+        col.into()
     };
     // Rex: la barra de sesiones va arriba del todo, sobre la barra lateral y el cuerpo.
     let base: Element<'_, Message> = container(column![
-        chrome::session_bar(app),
-        row![chrome::sidebar_view(app), main],
+        if marco().filas_top == 2 { chrome::session_bar(app) } else { iced::widget::Space::new(Length::Fill, Length::Shrink).into() },
+        chrome::tabs_bar(app),
+        if marco().sidebar { row![chrome::sidebar_view(app), main].into() } else { main },
     ])
     .width(Length::Fill)
     .height(Length::Fill)
@@ -2051,15 +2123,20 @@ fn main() -> iced::Result {
             let installed: Vec<&'static str> = fonts::detect(&fonts::font_dirs());
             let elegida = fonts::load(&prefs).and_then(|name| fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == name).filter(|f| installed.contains(f)));
             fonts::set_current(elegida.unwrap_or_else(|| fonts::automatic(&installed)));
+            // Barra lateral y barra de estado: como se dejaron (por defecto, ocultas).
+            let flag = |clave: &str| prefs::get(&prefs, clave).and_then(|v| v.as_bool()).unwrap_or(false);
             let app = App {
                 window: (1100.0, 700.0),
                 focused: true,
                 recents: recents::load(&file),
                 recents_path: Some(file),
                 font_installed: installed,
+                sidebar: flag("sidebar"),
+                status: flag("status"),
                 prefs_path: Some(prefs),
                 ..Default::default()
             };
+            sync_chrome(&app);
             // Símbolos Nerd Font empaquetados: se cargan en el sistema de fuentes antes de usarse.
             let simbolos = iced::font::load(std::borrow::Cow::Borrowed(SYMBOLS_FONT)).map(|_| Message::Echo);
             (app, Task::batch([load_panes(), load_limits(), simbolos]))
@@ -2091,33 +2168,33 @@ mod tests {
 
     /// Píxel del centro de la celda (row, col).
     fn center(row: u16, col: u16) -> (f32, f32) {
-        (TERM_ORIGIN.0 + (col as f32 + 0.5) * CELL_W, TERM_ORIGIN.1 + (row as f32 + 0.5) * LINE_H)
+        (term_origin().0 + (col as f32 + 0.5) * CELL_W, term_origin().1 + (row as f32 + 0.5) * LINE_H)
     }
 
     #[test]
     fn pixel_a_celda_dentro_de_la_cuadricula() {
         let (x, y) = center(2, 3);
-        assert_eq!(pixel_to_cell(TERM_ORIGIN, x, y, (10, 80)), Some((2, 3)));
+        assert_eq!(pixel_to_cell(term_origin(), x, y, (10, 80)), Some((2, 3)));
         // Esquina superior izquierda del área del terminal.
-        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1, (10, 80)), Some((0, 0)));
+        assert_eq!(pixel_to_cell(term_origin(), term_origin().0, term_origin().1, (10, 80)), Some((0, 0)));
     }
 
     #[test]
     fn pixel_a_celda_recorta_al_borde_y_rechaza_fuera_por_la_izquierda() {
-        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0 + 10_000.0, TERM_ORIGIN.1 + 10_000.0, (10, 80)), Some((9, 79)));
-        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0 - 1.0, TERM_ORIGIN.1 + 5.0, (10, 80)), None);
-        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0 + 5.0, TERM_ORIGIN.1 - 1.0, (10, 80)), None);
-        assert_eq!(pixel_to_cell(TERM_ORIGIN, 50.0, 50.0, (10, 80)), None);
-        assert_eq!(pixel_to_cell(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1, (0, 80)), None);
+        assert_eq!(pixel_to_cell(term_origin(), term_origin().0 + 10_000.0, term_origin().1 + 10_000.0, (10, 80)), Some((9, 79)));
+        assert_eq!(pixel_to_cell(term_origin(), term_origin().0 - 1.0, term_origin().1 + 5.0, (10, 80)), None);
+        assert_eq!(pixel_to_cell(term_origin(), term_origin().0 + 5.0, term_origin().1 - 1.0, (10, 80)), None);
+        assert_eq!(pixel_to_cell(term_origin(), 50.0, 50.0, (10, 80)), None);
+        assert_eq!(pixel_to_cell(term_origin(), term_origin().0, term_origin().1, (0, 80)), None);
     }
 
     /// B3: la rueda y el clic solo cuentan dentro de la cuadrícula.
     #[test]
     fn dentro_de_la_cuadricula_solo() {
-        assert!(inside_grid(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1, (10, 80)));
-        assert!(!inside_grid(TERM_ORIGIN, TERM_ORIGIN.0 + 10_000.0, TERM_ORIGIN.1, (10, 80)));
-        assert!(!inside_grid(TERM_ORIGIN, TERM_ORIGIN.0, TERM_ORIGIN.1 + 10.0 * LINE_H, (10, 80)));
-        assert!(!inside_grid(TERM_ORIGIN, 50.0, 300.0, (10, 80)));
+        assert!(inside_grid(term_origin(), term_origin().0, term_origin().1, (10, 80)));
+        assert!(!inside_grid(term_origin(), term_origin().0 + 10_000.0, term_origin().1, (10, 80)));
+        assert!(!inside_grid(term_origin(), term_origin().0, term_origin().1 + 10.0 * LINE_H, (10, 80)));
+        assert!(!inside_grid(term_origin(), 50.0, 300.0, (10, 80)));
     }
 
     #[test]
@@ -2388,6 +2465,21 @@ mod tests {
         let _ = update(&mut app, Message::Limits(Err("sin daemon".into())));
         assert_eq!(app.limits.len(), 1, "las últimas cuotas se conservan");
         assert_eq!(app.limits_error.as_deref(), Some("sin daemon"));
+    }
+
+    /// Terminal primero: sin barra lateral ni de estado, y una sola fila superior mientras haya un workspace.
+    #[test]
+    fn marco_por_defecto_es_terminal_primero() {
+        let mut app = App::default();
+        app.panes = vec![pane_info(1, "shell", Status::Idle)];
+        let m = marco_para(&app);
+        assert!(!m.sidebar && !m.status);
+        assert_eq!(m.filas_top, 1);
+        app.sidebar = true;
+        assert!(marco_para(&app).sidebar);
+        app.panes.push(pane_info(2, "otro", Status::Idle));
+        app.panes[1].workspace = Some("otro/rama".into());
+        assert_eq!(marco_para(&app).filas_top, 2, "dos workspaces: la fila de sesiones aparece");
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la
@@ -2677,12 +2769,12 @@ mod tests {
     fn geometria_del_panel_unico_y_del_split() {
         let mut app = App { panes: vec![pane_info(1, "uno", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
         app.layouts.sync(&pane_keys(&app));
-        assert_eq!(focus_origin(&app), TERM_ORIGIN, "un panel sin split usa el origen de referencia");
+        assert_eq!(focus_origin(&app), term_origin(), "un panel sin split usa el origen de referencia");
         app.layouts.split(1, true, 2);
         app.panes.push(pane_info(2, "dos", Status::Idle));
         app.selected = Some(2);
         let (x, _) = focus_origin(&app);
-        assert!(x > TERM_ORIGIN.0, "el panel de la derecha empieza más a la derecha");
+        assert!(x > term_origin().0, "el panel de la derecha empieza más a la derecha");
         let (rows, cols) = grid_in(pane_rect(&app, 2).unwrap());
         assert!(cols < grid_for((1100.0, 700.0)).1, "y tiene menos columnas que la ventana entera");
         assert!(rows > 5);

@@ -95,25 +95,12 @@ pub fn metrics_from_file(path: &Path) -> Option<(f32, f32)> {
 
 /// Elección guardada del usuario ("automática" = no hay elección). Archivo junto al socket, 0600.
 pub fn load(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > 4096 {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value.get("terminal_font").and_then(|v| v.as_str()).map(str::to_string)
+    crate::prefs::get(path, "terminal_font")?.as_str().map(str::to_string)
 }
 
+/// Guarda la fuente elegida (`None` = automática). Conserva el resto de preferencias.
 pub fn save(path: &Path, family: Option<&str>) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let body = serde_json::json!({ "terminal_font": family }).to_string();
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-    f.write_all(body.as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    crate::prefs::set(path, "terminal_font", family.map_or(serde_json::Value::Null, |f| serde_json::json!(f)))
 }
 
 #[cfg(test)]
