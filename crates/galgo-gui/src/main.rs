@@ -403,7 +403,10 @@ enum Message {
     /// Atajos (B): pestaña nueva en el workspace actual, workspace por número, siguiente que necesita atención,
     /// cerrar el panel enfocado, lanzador de agentes.
     NewTab,
-    SelectWorkspaceAt(usize),
+    /// Cmd+1..9: la pestaña n-ésima de la fila (por posición, de izquierda a derecha).
+    SelectRowAt(usize),
+    /// Clic central en una pestaña: la selecciona y pide cerrarla como Cmd+W (con la misma confirmación).
+    CloseTabIn(String, usize),
     NextAttention,
     CloseFocused,
     OpenLauncher,
@@ -532,6 +535,9 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("w", false) => Some(Message::CloseFocused),
         ("[", false) => Some(Message::NextTab(-1)),
         ("]", false) => Some(Message::NextTab(1)),
+        // Con Shift, el teclado da «{» y «}» (o «[» y «]» según la distribución).
+        ("{", _) | ("[", true) => Some(Message::NextTab(-1)),
+        ("}", _) | ("]", true) => Some(Message::NextTab(1)),
         ("d", false) => Some(Message::SplitFocused(true)),
         ("f", false) => Some(Message::OpenSearch),
         ("b", false) => Some(Message::ToggleSidebar),
@@ -543,7 +549,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("-", false) => Some(Message::Zoom(-1)),
         ("0", false) => Some(Message::Zoom(0)),
         (d, false) => match d.parse::<usize>() {
-            Ok(n @ 1..=9) => Some(Message::SelectWorkspaceAt(n - 1)),
+            Ok(n @ 1..=9) => Some(Message::SelectRowAt(n - 1)),
             _ => None,
         },
         _ => None,
@@ -583,12 +589,6 @@ fn successor(app: &App, id: u32) -> Option<u32> {
 
 /// Workspace n-ésimo (0 = primero) en el orden de la barra lateral; se selecciona su primer panel.
 /// M5: el panel que enfoca Cmd+n es el de la pestaña activa de ese workspace; sin layout, el primero.
-fn workspace_at(panes: &[PaneInfo], layouts: &layout::Layouts, n: usize) -> Option<u32> {
-    let ws = sidebar::workspaces(panes).into_iter().nth(n)?;
-    let key = ws.label.clone().unwrap_or_default();
-    let activo = layouts.active_tab(&key).map(|t| t.focus).filter(|f| ws.panes.iter().any(|p| p.id == *f));
-    activo.or_else(|| ws.panes.first().map(|p| p.id))
-}
 
 /// Siguiente panel, en orden de la lista y dando la vuelta, que necesita atención (insignia visible).
 fn next_attention(panes: &[PaneInfo], selected: Option<u32>, unread: impl Fn(u32) -> bool) -> Option<u32> {
@@ -2072,10 +2072,15 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             app.error = Some(e);
             Task::none()
         }
-        Message::SelectWorkspaceAt(n) => match workspace_at(&app.panes, &app.layouts, n) {
-            Some(id) => select(app, id),
+        Message::SelectRowAt(n) => match app.layouts.en_orden().get(n).map(|(k, i)| ((*k).clone(), *i)) {
+            Some((key, i)) => update(app, Message::SelectTabIn(key, i)),
             None => Task::none(),
         },
+        Message::CloseTabIn(key, i) => {
+            let seleccion = update(app, Message::SelectTabIn(key, i));
+            let cerrar = update(app, Message::CloseFocused);
+            Task::batch([seleccion, cerrar])
+        }
         Message::NextAttention => {
             // B7: en el orden de la barra lateral, como Cmd+1..9 y la paleta.
             let ordenados: Vec<PaneInfo> = sidebar::workspaces(&app.panes).into_iter().flat_map(|w| w.panes.into_iter().cloned()).collect();
@@ -3983,7 +3988,9 @@ mod tests {
         assert!(matches!(shortcut(&k("w"), cmd), Some(Message::CloseFocused)));
         assert!(matches!(shortcut(&k("U"), shift), Some(Message::NextAttention)));
         assert!(matches!(shortcut(&k("l"), shift), Some(Message::OpenLauncher)));
-        assert!(matches!(shortcut(&k("3"), cmd), Some(Message::SelectWorkspaceAt(2))));
+        assert!(matches!(shortcut(&k("3"), cmd), Some(Message::SelectRowAt(2))));
+        assert!(matches!(shortcut(&k("{"), cmd | shift), Some(Message::NextTab(-1))), "Cmd+Shift+[ va a la anterior");
+        assert!(matches!(shortcut(&k("}"), cmd | shift), Some(Message::NextTab(1))), "Cmd+Shift+] va a la siguiente");
         assert!(matches!(shortcut(&k("0"), cmd), Some(Message::Zoom(0))), "Cmd+0 vuelve al tamaño de letra normal");
         assert!(shortcut(&k("9"), cmd).is_some());
     }
@@ -4069,10 +4076,14 @@ mod tests {
         let mut c = pane_info(3, "c", Status::Idle);
         c.workspace = Some("repo/main".into());
         let panes = vec![a, b, c];
-        // El orden es el de la barra lateral: alfabético por workspace (otro/dev antes que repo/main).
-        assert_eq!(workspace_at(&panes, &layout::Layouts::default(), 0), Some(2), "otro/dev va primero");
-        assert_eq!(workspace_at(&panes, &layout::Layouts::default(), 1), Some(1), "repo/main, con su primer panel");
-        assert_eq!(workspace_at(&panes, &layout::Layouts::default(), 2), None);
+        // Cmd+1..9 es la posición en la fila de pestañas (la del orden de creación), no el workspace de la barra lateral.
+        let mut l = layout::Layouts::default();
+        l.new_tab("repo/main", 1);
+        l.new_tab("otro/dev", 2);
+        l.new_tab("repo/main", 3);
+        let fila: Vec<u32> = l.en_orden().into_iter().map(|(k, i)| l.by_key[k].tabs[i].focus).collect();
+        assert_eq!(fila, vec![1, 2, 3], "la fila sigue el orden de creación");
+        let _ = &panes;
     }
 
     /// B: Cmd+Shift+U recorre los paneles que necesitan atención, dando la vuelta.
@@ -4372,8 +4383,8 @@ mod tests {
         app.layouts.sync_nombrado(&pane_nombres(&app));
         let _ = update(&mut app, Message::Select(3));
         assert_eq!(app.layouts.active_tab("w").unwrap().focus, 3);
-        let _ = update(&mut app, Message::SelectWorkspaceAt(0));
-        assert_eq!(app.selected, Some(3), "se queda en la pestaña activa, no en el panel 1");
+        let _ = update(&mut app, Message::SelectRowAt(0));
+        assert_eq!(app.selected, Some(1), "Cmd+1 va a la primera pestaña de la fila, aunque sea de otro workspace");
     }
 
     /// r13 B1+B2: dos splits en vuelo reciben nombres distintos, y cada respuesta cae en su split aunque lleguen al revés.

@@ -307,7 +307,8 @@ fn boton_pestana<'a>(app: &'a App, key: &str, i: usize, tab: &layout::Tab, activ
         .padding(0)
         .on_press(Message::SelectTabIn(key.to_string(), i))
         .style(theme::tab(active));
-    b.into()
+    // Clic central: cierra la pestaña como Cmd+W (con su confirmación).
+    mouse_area(b).on_middle_press(Message::CloseTabIn(key.to_string(), i)).into()
 }
 
 pub fn tabs_bar(app: &App) -> Element<'_, Message> {
