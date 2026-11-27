@@ -411,6 +411,12 @@ pub struct PaneInfo {
     /// Directorio de trabajo del panel. Ausente en daemons anteriores.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Programa en primer plano del panel (`vim`, `claude`, o el shell libre). Ausente en daemons anteriores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub programa: Option<String>,
+    /// Título que el programa anunció por OSC 0/2. Ausente si no anunció ninguno.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub titulo_osc: Option<String>,
     /// Uso vivo del panel (tokens, contexto, coste). Ausente si el panel no tiene fuente de uso.
     #[serde(default)]
     pub usage: Option<galgo_usage::PaneUsage>,
@@ -511,6 +517,7 @@ mod tests_grupos {
             waiting_secs: None,
             workspace: ws.map(String::from),
             cwd: None,
+            programa: None, titulo_osc: None,
             usage: None,
             title: None,
             agent: false, hooked: false,

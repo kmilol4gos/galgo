@@ -29,6 +29,29 @@ pub fn cwd_de_pid(pid: i32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Nombre del ejecutable de un proceso (`vim`, `claude`, `zsh`…). macOS: `proc_pidpath`; Linux: `/proc/<pid>/comm`.
+#[cfg(target_os = "macos")]
+pub fn nombre_de_pid(pid: i32) -> Option<String> {
+    use std::os::raw::{c_char, c_int, c_void};
+    extern "C" {
+        fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+    // PROC_PIDPATHINFO_MAXSIZE = 4 * MAXPATHLEN.
+    let mut buf = vec![0 as c_char; 4096];
+    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buf[..n as usize].iter().map(|&c| c as u8).collect();
+    let ruta = std::path::PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
+    ruta.file_name().map(|f| f.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn nombre_de_pid(pid: i32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Ruta de una URI `file://host/ruta` (OSC 7), con los `%XX` decodificados. El host se ignora.
 pub fn ruta_de_osc7(uri: &str) -> Option<String> {
     let resto = uri.strip_prefix("file://")?;
@@ -51,10 +74,17 @@ pub fn ruta_de_osc7(uri: &str) -> Option<String> {
     (texto.len() > 1).then_some(texto)
 }
 
-/// Busca `ESC ] 7 ; <uri> (BEL | ESC \)` en el flujo de salida del pty. Guarda el estado entre lecturas, así
-/// que una secuencia partida entre dos trozos también sale.
+/// Lo que anuncia el programa por OSC: su directorio (OSC 7) o su título (OSC 0 y 2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tipo {
+    Cwd,
+    Titulo,
+}
+
+/// Busca `ESC ] 7 ; <uri>` (cwd) y `ESC ] 0|2 ; <texto>` (título) en el flujo de salida del pty, terminados en BEL o
+/// `ESC \`. Guarda el estado entre lecturas, así que una secuencia partida entre dos trozos también sale.
 #[derive(Default)]
-pub struct Osc7 {
+pub struct Osc {
     st: Estado,
 }
 
@@ -65,20 +95,44 @@ enum Estado {
     Esc,
     /// Tras `ESC ]`, leyendo el número antes de `;`.
     Numero(Vec<u8>),
-    /// OSC 7: leyendo la URI.
-    Uri(Vec<u8>),
+    /// OSC 7 o 0/2: leyendo el contenido.
+    Carga(Tipo, Vec<u8>),
     /// Otra OSC: se descarta hasta su terminador.
     Otra,
-    /// Dentro de una OSC acaba de llegar un ESC: si sigue `\`, termina. Lleva la URI si era OSC 7.
-    FinEsc(Option<Vec<u8>>),
+    /// Dentro de una OSC acaba de llegar un ESC: si sigue `\`, termina. Lleva el contenido si era una que importa.
+    FinEsc(Option<(Tipo, Vec<u8>)>),
 }
 
-const MAX_URI: usize = 4096;
+/// Lo último que anunció el programa en un trozo de salida.
+#[derive(Debug, Default, PartialEq)]
+pub struct Anuncios {
+    pub cwd: Option<String>,
+    pub titulo: Option<String>,
+}
 
-impl Osc7 {
-    /// Devuelve la última ruta de OSC 7 encontrada en `bytes`, si hubo alguna.
-    pub fn feed(&mut self, bytes: &[u8]) -> Option<String> {
-        let mut ultima = None;
+const MAX_CARGA: usize = 4096;
+
+fn cierra(tipo: Tipo, carga: &[u8], out: &mut Anuncios) {
+    let texto = String::from_utf8_lossy(carga).into_owned();
+    match tipo {
+        Tipo::Cwd => {
+            if let Some(d) = ruta_de_osc7(&texto) {
+                out.cwd = Some(d);
+            }
+        }
+        Tipo::Titulo => {
+            let t = texto.trim();
+            if !t.is_empty() {
+                out.titulo = Some(t.to_string());
+            }
+        }
+    }
+}
+
+impl Osc {
+    /// Devuelve lo último que se anunció en `bytes`.
+    pub fn feed(&mut self, bytes: &[u8]) -> Anuncios {
+        let mut out = Anuncios::default();
         for &b in bytes {
             let anterior = std::mem::take(&mut self.st);
             self.st = match anterior {
@@ -89,7 +143,8 @@ impl Osc7 {
                     _ => Estado::Normal,
                 },
                 Estado::Numero(mut n) => match b {
-                    b';' if n == b"7" => Estado::Uri(Vec::new()),
+                    b';' if n == b"7" => Estado::Carga(Tipo::Cwd, Vec::new()),
+                    b';' if n == b"0" || n == b"2" => Estado::Carga(Tipo::Titulo, Vec::new()),
                     b';' => Estado::Otra,
                     0x07 => Estado::Normal,
                     0x1b => Estado::FinEsc(None),
@@ -99,17 +154,17 @@ impl Osc7 {
                     }
                     _ => Estado::Otra,
                 },
-                Estado::Uri(mut u) => match b {
+                Estado::Carga(tipo, mut c) => match b {
                     0x07 => {
-                        ultima = ruta_de_osc7(&String::from_utf8_lossy(&u)).or(ultima);
+                        cierra(tipo, &c, &mut out);
                         Estado::Normal
                     }
-                    0x1b => Estado::FinEsc(Some(u)),
+                    0x1b => Estado::FinEsc(Some((tipo, c))),
                     _ => {
-                        if u.len() < MAX_URI {
-                            u.push(b);
+                        if c.len() < MAX_CARGA {
+                            c.push(b);
                         }
-                        Estado::Uri(u)
+                        Estado::Carga(tipo, c)
                     }
                 },
                 Estado::Otra => match b {
@@ -117,27 +172,31 @@ impl Osc7 {
                     0x1b => Estado::FinEsc(None),
                     _ => Estado::Otra,
                 },
-                Estado::FinEsc(uri) => {
+                Estado::FinEsc(carga) => {
                     if b == b'\\' {
-                        if let Some(u) = uri {
-                            ultima = ruta_de_osc7(&String::from_utf8_lossy(&u)).or(ultima);
+                        if let Some((tipo, c)) = carga {
+                            cierra(tipo, &c, &mut out);
                         }
                         Estado::Normal
                     } else if b == 0x1b {
-                        Estado::FinEsc(uri)
+                        Estado::FinEsc(carga)
                     } else {
                         Estado::Normal
                     }
                 }
             };
         }
-        ultima
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cwd(a: &Anuncios) -> Option<&str> {
+        a.cwd.as_deref()
+    }
 
     #[test]
     fn osc7_decodifica_la_ruta_e_ignora_el_host() {
@@ -149,27 +208,35 @@ mod tests {
 
     #[test]
     fn osc7_con_bel_y_con_st() {
-        let mut o = Osc7::default();
-        assert_eq!(o.feed(b"hola\x1b]7;file://h/a/b\x07mundo").as_deref(), Some("/a/b"));
-        assert_eq!(o.feed(b"\x1b]7;file://h/c\x1b\\").as_deref(), Some("/c"));
-        assert_eq!(o.feed(b"sin secuencias"), None);
+        let mut o = Osc::default();
+        assert_eq!(cwd(&o.feed(b"hola\x1b]7;file://h/a/b\x07mundo")), Some("/a/b"));
+        assert_eq!(cwd(&o.feed(b"\x1b]7;file://h/c\x1b\\")), Some("/c"));
+        assert_eq!(o.feed(b"sin secuencias"), Anuncios::default());
     }
 
     #[test]
     fn osc7_partida_entre_lecturas_tambien_sale() {
-        let mut o = Osc7::default();
-        assert_eq!(o.feed(b"\x1b]7;file://h/Users/x"), None);
-        assert_eq!(o.feed(b"/nexo\x07"), Some("/Users/x/nexo".into()));
-        assert_eq!(o.feed(b"\x1b"), None);
-        assert_eq!(o.feed(b"]7;file://h/tmp\x1b"), None);
-        assert_eq!(o.feed(b"\\"), Some("/tmp".into()));
+        let mut o = Osc::default();
+        assert_eq!(o.feed(b"\x1b]7;file://h/Users/x"), Anuncios::default());
+        assert_eq!(cwd(&o.feed(b"/nexo\x07")), Some("/Users/x/nexo"));
+        assert_eq!(o.feed(b"\x1b"), Anuncios::default());
+        assert_eq!(o.feed(b"]7;file://h/tmp\x1b"), Anuncios::default());
+        assert_eq!(cwd(&o.feed(b"\\")), Some("/tmp"));
     }
 
     #[test]
-    fn otras_osc_no_cuentan_como_cwd() {
-        let mut o = Osc7::default();
-        assert_eq!(o.feed(b"\x1b]0;titulo\x07\x1b]8;;file://h/no\x07"), None);
-        assert_eq!(o.feed(b"\x1b]7;file://h/si\x07"), Some("/si".into()));
+    fn otras_osc_no_cuentan_como_cwd_ni_titulo() {
+        let mut o = Osc::default();
+        assert_eq!(o.feed(b"\x1b]8;;file://h/no\x07\x1b]52;c;aGk=\x07"), Anuncios::default());
+        assert_eq!(cwd(&o.feed(b"\x1b]7;file://h/si\x07")), Some("/si"));
+    }
+
+    #[test]
+    fn osc_0_y_2_dan_el_titulo_del_programa() {
+        let mut o = Osc::default();
+        assert_eq!(o.feed(b"\x1b]0;vim: main.rs\x07").titulo.as_deref(), Some("vim: main.rs"));
+        assert_eq!(o.feed(b"\x1b]2;\xe2\x9c\xb3 Claude Code\x1b\\").titulo.as_deref(), Some("✳ Claude Code"));
+        assert_eq!(o.feed(b"\x1b]2;   \x07").titulo, None, "un título vacío no cuenta");
     }
 
     #[test]
@@ -178,5 +245,12 @@ mod tests {
         let leido = cwd_de_pid(std::process::id() as i32).expect("cwd del propio proceso");
         assert_eq!(std::path::PathBuf::from(leido).canonicalize().unwrap(), esperado);
         assert_eq!(cwd_de_pid(-1), None);
+    }
+
+    #[test]
+    fn el_nombre_del_proceso_propio_es_el_del_binario() {
+        let nombre = nombre_de_pid(std::process::id() as i32).expect("nombre del propio proceso");
+        let esperado = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(nombre, esperado);
     }
 }

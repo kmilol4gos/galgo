@@ -101,6 +101,8 @@ struct Pane {
     cwd: Option<String>,
     /// Último directorio anunciado por el shell con OSC 7 (lo escribe el hilo lector).
     osc_cwd: Arc<Mutex<Option<String>>>,
+    /// Último título que el programa anunció por OSC 0/2 (lo escribe el hilo lector).
+    osc_titulo: Arc<Mutex<Option<String>>>,
     /// Uso del transcript (lo rellena el hilo de sondeo) y último informe del agente. Solo en memoria.
     usage: Option<PaneUsage>,
     usage_report: Option<usage::ReportData>,
@@ -137,6 +139,15 @@ impl ChildKiller for GhostKiller {
 }
 
 impl Pane {
+    /// Nombre del programa en primer plano (`vim`, `claude`, o el shell si está libre).
+    fn programa(&self) -> Option<String> {
+        if self.ghost || self.exited {
+            return None;
+        }
+        let en_primer_plano = self._master.as_ref().and_then(|m| m.process_group_leader());
+        en_primer_plano.and_then(cwd::nombre_de_pid).or_else(|| self.pid.and_then(|p| cwd::nombre_de_pid(p as i32)))
+    }
+
     /// Directorio de trabajo vivo: el del proceso en primer plano del pty (su grupo de procesos), luego el del
     /// líder de sesión (el shell), luego lo último que anunció OSC 7 y, por último, el declarado al crear el panel.
     fn cwd_vivo(&self) -> Option<String> {
@@ -184,6 +195,7 @@ impl Pane {
             workspace,
             cwd,
             osc_cwd: Arc::new(Mutex::new(None)),
+            osc_titulo: Arc::new(Mutex::new(None)),
             usage: None,
             usage_report: None,
             inbox,
@@ -481,6 +493,8 @@ impl State {
             waiting_secs: p.waiting_on.map(|(_, at)| at.elapsed().as_secs()),
             workspace: p.workspace.clone(),
             cwd: p.cwd_vivo(),
+            programa: p.programa(),
+            titulo_osc: p.osc_titulo.lock().ok().and_then(|g| g.clone()),
             usage: usage::merged(p.usage.as_ref(), p.usage_report.as_ref()),
             title: p.title.clone(),
             agent: p.hooked || is_agent_cmd(&p.cmd) || p.usage.is_some() || p.usage_report.is_some(),
@@ -867,8 +881,30 @@ fn workspace_name(top: &str, branch: &str) -> String {
 }
 
 fn is_session_marker(key: &str) -> bool {
-    const EXACT: [&str; 11] = [
+    // Variables que dejan la sesión de Claude Code, el terminal o el multiplexor que lanzó el daemon: un panel que las
+    // hereda se cree otro terminal o otra sesión. TERM_PROGRAM y su versión se fijan después, para galgo.
+    const EXACT: &[&str] = &[
         "CLAUDECODE",
+        "CLAUDE_EFFORT",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "TERM_SESSION_ID",
+        "TERMINFO",
+        "TERMINFO_DIRS",
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+        "WT_SESSION",
+        "VTE_VERSION",
+        "ITERM_SESSION_ID",
+        "ITERM_PROFILE",
+        "KITTY_WINDOW_ID",
+        "KITTY_PID",
+        "WEZTERM_PANE",
+        "WEZTERM_UNIX_SOCKET",
+        "GHOSTTY_RESOURCES_DIR",
+        "ALACRITTY_SOCKET",
+        "ALACRITTY_WINDOW_ID",
         "CLAUDE_PID",
         "CLAUDE_CODE_ENTRYPOINT",
         "CLAUDE_CODE_SESSION_ID",
@@ -881,7 +917,8 @@ fn is_session_marker(key: &str) -> bool {
         "CLAUDE_CODE_SSE_PORT",
     ];
     // Todas las variables de herdr describen el panel de herdr donde nació el daemon.
-    EXACT.contains(&key) || key.starts_with("HERDR_")
+    const PREFIJOS: [&str; 6] = ["HERDR_", "ITERM_", "KITTY_", "WEZTERM_", "GHOSTTY_", "ALACRITTY_"];
+    EXACT.contains(&key) || PREFIJOS.iter().any(|p| key.starts_with(p))
 }
 
 fn to_response(res: Result<Value>) -> Response {
@@ -958,6 +995,9 @@ impl Daemon {
             }
         }
         builder.env("TERM", "xterm-256color");
+        // galgo es el terminal de estos paneles: los programas que miran TERM_PROGRAM lo ven a él, no a quien lo lanzó.
+        builder.env("TERM_PROGRAM", "galgo");
+        builder.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         builder.env("GALGO_PANE", id.to_string());
         builder.env("GALGO_PANE_NAME", &name);
         builder.env("GALGO_SOCKET", self.socket.as_os_str());
@@ -979,6 +1019,8 @@ impl Daemon {
         let changed = Arc::new(Notify::new());
         let osc_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let osc_hilo = Arc::clone(&osc_cwd);
+        let osc_titulo: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let titulo_hilo = Arc::clone(&osc_titulo);
 
         let (input, input_rx) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
         std::thread::spawn(move || {
@@ -1008,6 +1050,7 @@ impl Daemon {
             workspace,
             cwd: cwd_saved,
             osc_cwd,
+            osc_titulo,
             usage: None,
             usage_report: None,
             inbox: Vec::new(),
@@ -1037,13 +1080,17 @@ impl Daemon {
         let d = Arc::clone(self);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
-            let mut osc7 = cwd::Osc7::default();
+            let mut osc = cwd::Osc::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if let Some(dir) = osc7.feed(&buf[..n]) {
+                        let anuncios = osc.feed(&buf[..n]);
+                        if let Some(dir) = anuncios.cwd {
                             *osc_hilo.lock().unwrap() = Some(dir);
+                        }
+                        if let Some(titulo) = anuncios.titulo {
+                            *titulo_hilo.lock().unwrap() = Some(titulo);
                         }
                         let mut parser = screen.lock().unwrap();
                         parser.process(&buf[..n]);
@@ -2173,10 +2220,10 @@ mod tests_sesion {
     /// M2/M3: solo se quitan marcadores de sesión; la configuración del usuario se conserva.
     #[test]
     fn marcadores_de_sesion_si_configuracion_no() {
-        for k in ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_TOKEN", "HERDR_PANE_ID", "HERDR_ENV"] {
+        for k in ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_TOKEN", "HERDR_PANE_ID", "HERDR_ENV", "CLAUDE_EFFORT", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERMINFO", "TMUX", "ITERM_SESSION_ID", "KITTY_WINDOW_ID", "WEZTERM_PANE"] {
             assert!(is_session_marker(k), "{k} debe quitarse");
         }
-        for k in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_EFFORT", "HOME", "PATH", "GALGO_DEBUG"] {
+        for k in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "HOME", "PATH", "GALGO_DEBUG", "COLORTERM", "LANG"] {
             assert!(!is_session_marker(k), "{k} debe conservarse");
         }
     }

@@ -280,6 +280,8 @@ mod tests {
             waiting_secs: None,
             workspace: Some("inventia/cotizacion".into()),
             cwd: Some("/Users/alguien/secreto".into()),
+            programa: None,
+            titulo_osc: None,
             usage,
             title: None,
             agent: false, hooked: false,
