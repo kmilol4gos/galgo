@@ -416,6 +416,8 @@ enum Message {
     /// Pestañas y splits (E): cambiar de pestaña, elegir una, dividir el panel enfocado, mover el foco por direcciones.
     NextTab(isize),
     SelectTab(usize),
+    /// Una pestaña de cualquier workspace (la barra es plana): selecciona su grupo y esa pestaña.
+    SelectTabIn(String, usize),
     SplitFocused(bool),
     FocusDir(layout::Dir),
     /// Pantalla de un panel visible sin el foco.
@@ -1850,6 +1852,17 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         Message::NextTab(delta) => {
             let Some(key) = focus_key(app) else { return Task::none() };
             app.layouts.cycle(&key, delta);
+            match app.layouts.active_tab(&key).map(|t| t.focus) {
+                Some(id) => select(app, id),
+                None => Task::none(),
+            }
+        }
+        Message::SelectTabIn(key, index) => {
+            if let Some(ws) = app.layouts.by_key.get_mut(&key) {
+                if index < ws.tabs.len() {
+                    ws.active = index;
+                }
+            }
             match app.layouts.active_tab(&key).map(|t| t.focus) {
                 Some(id) => select(app, id),
                 None => Task::none(),
@@ -3395,6 +3408,21 @@ mod tests {
         let _ = update(&mut app, Message::Panes(Ok(vec![en_nexo(1, "shell"), en_nexo(2, "claude")])));
         assert!(app.ws_restored && app.ws_pendiente.is_none());
         assert_eq!(app.layouts.by_key.get("nexo").expect("la pestaña vuelve").tabs[0].root.ids().len(), 2);
+    }
+
+    /// P0: una pestaña de otro workspace (deducido por git, no creado por el usuario) se puede enfocar desde la barra plana.
+    #[test]
+    fn pestana_de_otro_workspace_se_enfoca() {
+        let en = |id: u32, name: &str, ws: &str| {
+            let mut p = pane_info(id, name, Status::Idle);
+            p.workspace = Some(ws.into());
+            p
+        };
+        let mut app = App { panes: vec![en(1, "shell", "nexo/main"), en(2, "otro", "tmp")], ..Default::default() };
+        app.layouts.sync(&[(1, "nexo/main".into()), (2, "tmp".into())]);
+        app.selected = Some(1);
+        let _ = update(&mut app, Message::SelectTabIn("tmp".into(), 0));
+        assert_eq!(app.selected, Some(2), "el panel de tmp pasa a ser el enfocado");
     }
 
     /// Daemon vacío al abrir la GUI con una disposición en disco: se espera a sus paneles, no se abre un shell en ~

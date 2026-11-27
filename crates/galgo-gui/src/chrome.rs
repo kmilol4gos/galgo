@@ -279,15 +279,17 @@ fn group_pill<'a>(app: &'a App, key: String, pestanas: Vec<Element<'a, Message>>
 }
 
 pub fn tabs_bar(app: &App) -> Element<'_, Message> {
-    let key = focus_key(app);
-    let mut pestanas: Vec<Element<'_, Message>> = Vec::new();
+    let focus = focus_key(app);
     // Una sola fila (terminal primero): sin miga; el hueco de los semáforos de macOS arrastra la ventana.
     let mut bar = row![mouse_area(Space::with_width(78.0)).on_press(Message::DragWindow)].spacing(4).align_y(Alignment::Center).height(TABS_H - 1.0);
-    if let Some(ws) = key.as_ref().and_then(|k| app.layouts.by_key.get(k)) {
+    // P0: salen TODAS las pestañas de todos los workspaces. Solo se agrupan (píldora) los workspaces que el usuario
+    // creó con nombre; los deducidos por git (nexo/main…) son pestañas sueltas en la misma fila.
+    for (key, ws) in &app.layouts.by_key {
+        let mut pestanas: Vec<Element<'_, Message>> = Vec::new();
         for (i, tab) in ws.tabs.iter().enumerate() {
             let pane = app.panes.iter().find(|p| p.id == tab.focus);
             let name = pane.map_or("?".to_string(), titulo_pestana);
-            let active = i == ws.active;
+            let active = focus.as_deref() == Some(key.as_str()) && i == ws.active;
             let n = tab.root.ids().len();
             // Un shell normal es solo su nombre. Un agente real (lanzado por galgo o con hooks) suma su estado y, si
             // espera algo de ti, un contador de pendientes.
@@ -311,22 +313,20 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
             let label = row![text(">_").size(theme::SMALL_SIZE).color(theme::DIM), label].spacing(6).align_y(Alignment::Center);
             let b = theme::btn(container(label).padding([0, 14]).center_y(Length::Fixed(TABS_H - 6.0)))
                 .padding(0)
-                .on_press(Message::SelectTab(i))
+                .on_press(Message::SelectTabIn(key.clone(), i))
                 .style(theme::tab(active));
             pestanas.push(b.into());
         }
-    }
-    // Workspace explícito (con nombre): sus terminales van dentro de una píldora de grupo; el resto, sueltos.
-    match key.as_ref().filter(|k| app.explicit.contains_key(*k)) {
-        Some(k) => bar = bar.push(group_pill(app, k.clone(), pestanas)),
-        None => {
+        if app.explicit.contains_key(key) {
+            bar = bar.push(group_pill(app, key.clone(), pestanas));
+        } else {
             for p in pestanas {
                 bar = bar.push(p);
             }
         }
     }
     // Con un solo panel no hay cabecera en el marco: sus acciones de split van aquí, en la barra superior.
-    let un_panel = key.as_ref().and_then(|k| app.layouts.active_tab(k)).is_some_and(|t| matches!(t.root, layout::Node::Leaf(_)));
+    let un_panel = focus.as_ref().and_then(|k| app.layouts.active_tab(k)).is_some_and(|t| matches!(t.root, layout::Node::Leaf(_)));
     if un_panel {
         bar = bar
             .push(icon_button(split_icon(true), "Dividir a la derecha  ⌘D", Message::SplitFocused(true)))
