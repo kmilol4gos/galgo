@@ -27,3 +27,7 @@ iced_graphics = "0.13"
 iced_runtime = "0.13"
 iced_tiny_skia = "0.13"
 tiny-skia = "0.11"
+
+# iced_winit con el método de entrada activo (tildes con tecla muerta): ver vendor/iced_winit/PATCH-GALGO.md
+[patch.crates-io]
+iced_winit = { path = "../../vendor/iced_winit" }
