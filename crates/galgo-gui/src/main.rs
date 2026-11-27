@@ -287,6 +287,8 @@ struct App {
     scroll: u16,
     /// Búsqueda abierta (Cmd+F) en el panel enfocado.
     buscar: Option<Busqueda>,
+    /// Identidad del socket del daemon con el que se habló por última vez (para detectar un daemon nuevo).
+    socket_id: Option<(u64, u64)>,
     /// Nombre que se muestra en la píldora de cada workspace (solo en la GUI; la clave del daemon no cambia).
     alias: std::collections::BTreeMap<String, String>,
     /// Edición del nombre de una píldora: (clave, texto escrito hasta ahora).
@@ -2522,9 +2524,13 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.error = None;
                     // Un daemon nuevo no tiene ninguno de los paneles que conocíamos (ids y nombres). Entonces las pestañas
                     // guardadas en memoria no sirven: se vuelve a aplicar la disposición del disco, relanzando sus paneles.
-                    let reinicio = app.ws_restored
-                        && !app.panes.is_empty()
-                        && !app.panes.iter().any(|v| panes.iter().any(|p| p.id == v.id && p.name == v.name));
+                    // Reinicio = otro daemon, señal explícita: el socket es otro archivo (otro inodo). Un listado vacío por sí
+                    // solo no basta: al cerrar el último panel también llega vacío, y no hay que relanzarlo (A1).
+                    let ahora = socket_id();
+                    let reinicio = es_reinicio(app.ws_restored, !app.panes.is_empty(), app.socket_id, ahora);
+                    if ahora.is_some() {
+                        app.socket_id = ahora;
+                    }
                     if reinicio {
                         app.ws_restored = false;
                         app.ws_pendiente = None;
@@ -3176,6 +3182,18 @@ fn traza_una_vez(bit: u8, fase: &str) {
     }
 }
 
+/// Identidad del socket del daemon (dispositivo e inodo): cambia cuando se arranca un daemon nuevo.
+fn socket_id() -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(galgo_proto::socket_path()).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Un daemon nuevo: había disposición restaurada y paneles en pantalla, y el socket que vemos ya no es el de antes.
+/// Sin socket anterior (primer listado) o con el mismo, no lo es, aunque el listado llegue vacío.
+fn es_reinicio(restaurado: bool, hay_paneles: bool, antes: Option<(u64, u64)>, ahora: Option<(u64, u64)>) -> bool {
+    restaurado && hay_paneles && antes.is_some() && ahora.is_some() && antes != ahora
+}
+
 fn main() -> iced::Result {
     T0.get_or_init(std::time::Instant::now);
     traza("main");
@@ -3375,6 +3393,16 @@ mod tests {
         }
         let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
         assert!(app.alias.get("proyecto").is_none());
+    }
+
+    /// A1: cerrar el último panel no relanza su shell (el listado llega vacío, pero el daemon es el mismo).
+    #[test]
+    fn cerrar_el_ultimo_panel_no_es_reinicio() {
+        assert!(!es_reinicio(true, true, Some((1, 9)), Some((1, 9))), "mismo socket: no hay daemon nuevo");
+        assert!(es_reinicio(true, true, Some((1, 9)), Some((1, 12))), "otro socket: daemon nuevo");
+        assert!(!es_reinicio(true, true, None, Some((1, 12))), "primer listado: no hay anterior");
+        assert!(!es_reinicio(false, true, Some((1, 9)), Some((1, 12))), "sin disposición restaurada no hay nada que relanzar");
+        assert!(!es_reinicio(true, false, Some((1, 9)), Some((1, 12))), "sin paneles en pantalla no hay nada que relanzar");
     }
 
     /// Cmd+F: lo que se escribe va a la consulta y nunca al panel; Esc cierra y la vista vuelve en vivo.
