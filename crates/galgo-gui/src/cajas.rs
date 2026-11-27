@@ -35,8 +35,11 @@ pub fn primitivas(ch: char, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
         }
         return Some(v);
     }
+    if let Some(v) = discontinua(c, w, h, ligero) {
+        return Some(v);
+    }
     if (0x2550..=0x256C).contains(&c) {
-        return doble(c, w, h, ligero);
+        return mezcla(c, w, h, ligero);
     }
     let (izq, der, arr, aba) = brazos(c)?;
     let (cx, cy) = (w / 2.0, h / 2.0);
@@ -62,60 +65,120 @@ pub fn es_dibujable(ch: char) -> bool {
     primitivas(ch, 1.0, 1.0, 1.0).is_some()
 }
 
-/// Líneas dobles puras (U+2550–U+256C de solo líneas dobles): dos trazos paralelos por brazo, a ±d del centro. Cada
-/// trazo arranca donde se une con el trazo del brazo perpendicular que le corresponde (la regla: el trazo en el
-/// lado `s` de un brazo se une con el del otro eje en `s·sy·o`, y en el medio se cruza sin hueco si el brazo es
-/// continuo). Las mezclas con líneas simples no están aquí: siguen con la fuente.
-fn doble(c: u32, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
-    // (izquierda, derecha, arriba, abajo) con líneas dobles.
+/// Discontinuas (U+2504–U+250B, U+254C–U+254F): cada brazo se parte en 2, 3 o 4 trazos con huecos.
+fn discontinua(c: u32, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
+    // (trazos, pesado, horizontal)
+    let (n, pesado, horizontal) = match c {
+        0x2504 => (3, false, true),
+        0x2505 => (3, true, true),
+        0x2506 => (3, false, false),
+        0x2507 => (3, true, false),
+        0x2508 => (4, false, true),
+        0x2509 => (4, true, true),
+        0x250A => (4, false, false),
+        0x250B => (4, true, false),
+        0x254C => (2, false, true),
+        0x254D => (2, true, true),
+        0x254E => (2, false, false),
+        0x254F => (2, true, false),
+        _ => return None,
+    };
+    let grosor = if pesado { ligero * 2.0 } else { ligero };
+    let largo = if horizontal { w } else { h };
+    let paso = largo / n as f32;
+    let (x_hueco, y_hueco) = (w / 2.0, h / 2.0);
+    let mut v = Vec::new();
+    for i in 0..n {
+        let a = i as f32 * paso + paso * 0.2;
+        let b = (i as f32 + 1.0) * paso - paso * 0.2;
+        v.push(if horizontal {
+            Prim::Linea { a: (a, y_hueco), b: (b, y_hueco), grosor }
+        } else {
+            Prim::Linea { a: (x_hueco, a), b: (x_hueco, b), grosor }
+        });
+    }
+    Some(v)
+}
+
+/// Líneas dobles (U+2550–U+256C), puras o mezcladas con simples. Cada brazo es uno o dos trazos (dos si es doble) y se
+/// engancha en la barra perpendicular del mismo modo en todos los casos:
+/// - un brazo horizontal arranca en `x0`: en la línea interior de la barra vertical si esa barra es doble en los dos
+///   lados; en la exterior si solo lo es en un lado; en el centro si no hay barra doble. Lo mismo, en vertical, con `y0`.
+/// - los dobles van a `±d` del centro; los simples llegan al centro o al borde de la barra que cruzan.
+/// Así las esquinas (╔ ╗ ╚ ╝), las uniones (╠ ╣ ╦ ╩) y las cruces (╬ ╪ ╫) cierran sin huecos.
+fn mezcla(c: u32, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
+    // (izquierda, derecha, arriba, abajo): 0 = no hay, 1 = simple, 2 = doble.
     let (l, r, u, d) = match c {
-        0x2550 => (true, true, false, false),
-        0x2551 => (false, false, true, true),
-        0x2554 => (false, true, false, true),
-        0x2557 => (true, false, false, true),
-        0x255A => (false, true, true, false),
-        0x255D => (true, false, true, false),
-        0x2560 => (false, true, true, true),
-        0x2563 => (true, false, true, true),
-        0x2566 => (true, true, false, true),
-        0x2569 => (true, true, true, false),
-        0x256C => (true, true, true, true),
+        0x2550 => (2, 2, 0, 0), 0x2551 => (0, 0, 2, 2),
+        0x2552 => (0, 2, 0, 1), 0x2553 => (0, 1, 0, 2), 0x2554 => (0, 2, 0, 2),
+        0x2555 => (2, 0, 0, 1), 0x2556 => (1, 0, 0, 2), 0x2557 => (2, 0, 0, 2),
+        0x2558 => (0, 2, 1, 0), 0x2559 => (0, 1, 2, 0), 0x255A => (0, 2, 2, 0),
+        0x255B => (2, 0, 1, 0), 0x255C => (1, 0, 2, 0), 0x255D => (2, 0, 2, 0),
+        0x255E => (0, 2, 1, 1), 0x255F => (0, 1, 2, 2), 0x2560 => (0, 2, 2, 2),
+        0x2561 => (2, 0, 1, 1), 0x2562 => (1, 0, 2, 2), 0x2563 => (2, 0, 2, 2),
+        0x2564 => (2, 2, 0, 1), 0x2565 => (1, 1, 0, 2), 0x2566 => (2, 2, 0, 2),
+        0x2567 => (2, 2, 1, 0), 0x2568 => (1, 1, 2, 0), 0x2569 => (2, 2, 2, 0),
+        0x256A => (2, 2, 1, 1), 0x256B => (1, 1, 2, 2), 0x256C => (2, 2, 2, 2),
         _ => return None,
     };
     let (cx, cy) = (w / 2.0, h / 2.0);
     let (dx, dy) = ((w / 4.0).max(ligero * 2.0), (h / 4.0).max(ligero * 2.0));
-    let (hs, vs): (Vec<f32>, Vec<f32>) = (
-        [(l, -1.0f32), (r, 1.0)].iter().filter(|(p, _)| *p).map(|(_, s)| *s).collect(),
-        [(u, -1.0f32), (d, 1.0)].iter().filter(|(p, _)| *p).map(|(_, s)| *s).collect(),
-    );
-    // Elige el punto de unión de un trazo: el más interior (máximo) en el lado derecho, el más interior en el izquierdo (mínimo).
-    let elegir = |sx: f32, valores: Vec<f32>| -> f32 {
-        if sx > 0.0 {
-            valores.into_iter().fold(f32::MIN, f32::max)
+    let h_ambos = l == 2 && r == 2;
+    let h_una = (l == 2) != (r == 2);
+    let v_ambos = u == 2 && d == 2;
+    let v_una = (u == 2) != (d == 2);
+    let trazo = |a: (f32, f32), b: (f32, f32)| Prim::Linea { a, b, grosor: ligero };
+    let mut v = Vec::new();
+    // Dos simples opuestos que cruzan sin cortarse en la barra se dibujan como una sola línea (no solapados).
+    let h_entera = l == 1 && r == 1 && !v_ambos;
+    let v_entera = u == 1 && d == 1 && !h_ambos;
+    if h_entera {
+        v.push(trazo((0.0, cy), (w, cy)));
+    }
+    if v_entera {
+        v.push(trazo((cx, 0.0), (cx, h)));
+    }
+    for (p, sx) in [(l, -1.0f32), (r, 1.0)] {
+        if p == 0 || h_entera {
+            continue;
+        }
+        let x0 = if v_ambos {
+            cx + sx * dx
+        } else if v_una {
+            cx - sx * dx
         } else {
-            valores.into_iter().fold(f32::MAX, f32::min)
-        }
-    };
-    let mut out = Vec::new();
-    let medio = ligero / 2.0;
-    for &sx in &hs {
-        for o in [-1.0f32, 1.0] {
-            let inicio = if vs.is_empty() { 0.0 } else { elegir(sx, vs.iter().map(|&sy| sx * sy * o).collect()) };
-            let x0 = cx + inicio * dx;
-            // Desde el borde hasta el punto de unión (con medio grosor de solape para no dejar muesca).
-            let (a, b) = if sx < 0.0 { (0.0, x0 + medio) } else { (x0 - medio, w) };
-            out.push(Prim::Linea { a: (a, cy + o * dy), b: (b, cy + o * dy), grosor: ligero });
+            cx
+        };
+        let (a, b) = if sx < 0.0 { (0.0, x0) } else { (x0, w) };
+        if p == 2 {
+            for o in [-dy, dy] {
+                v.push(trazo((a, cy + o), (b, cy + o)));
+            }
+        } else {
+            v.push(trazo((a, cy), (b, cy)));
         }
     }
-    for &sy in &vs {
-        for p in [-1.0f32, 1.0] {
-            let inicio = if hs.is_empty() { 0.0 } else { elegir(sy, hs.iter().map(|&sx| sy * sx * p).collect()) };
-            let y0 = cy + inicio * dy;
-            let (a, b) = if sy < 0.0 { (0.0, y0 + medio) } else { (y0 - medio, h) };
-            out.push(Prim::Linea { a: (cx + p * dx, a), b: (cx + p * dx, b), grosor: ligero });
+    for (p, sy) in [(u, -1.0f32), (d, 1.0)] {
+        if p == 0 || v_entera {
+            continue;
+        }
+        let y0 = if h_ambos {
+            cy + sy * dy
+        } else if h_una {
+            cy - sy * dy
+        } else {
+            cy
+        };
+        let (a, b) = if sy < 0.0 { (0.0, y0) } else { (y0, h) };
+        if p == 2 {
+            for o in [-dx, dx] {
+                v.push(trazo((cx + o, a), (cx + o, b)));
+            }
+        } else {
+            v.push(trazo((cx, a), (cx, b)));
         }
     }
-    Some(out)
+    Some(v)
 }
 
 /// Brazos (izquierda, derecha, arriba, abajo) de un carácter de cajas: 0 = no hay, 1 = ligero, 2 = pesado.
@@ -301,21 +364,31 @@ mod tests {
 mod tests_dobles {
     use super::*;
 
-    /// Las líneas dobles puras dibujan dos trazos por brazo; la esquina ╔ tiene su trazo exterior en el borde izquierdo
-    /// y el superior, y el interior en el derecho y el inferior.
+    /// La esquina ╔ en 10×20 con trazo 1: la línea superior doble va de x = cx − dx = 2.5 a la derecha, a y = 5 (cy − dy)
+    /// y a y = 15; la izquierda, de y = 5 hacia abajo, a x = 2.5 y a x = 7.5. Así el contorno cierra en (2.5, 5).
     #[test]
     fn la_esquina_doble_cierra_su_contorno() {
         let v = primitivas('╔', 10.0, 20.0, 1.0).unwrap();
         assert_eq!(v.len(), 4, "dos trazos horizontales y dos verticales");
-        // Trazo horizontal exterior (y = cy - dy = 5) empieza en x = cx - dx = 5 - 2.5 = 2.5.
-        assert!(v.contains(&Prim::Linea { a: (2.5 - 0.5, 10.0 - 5.0), b: (10.0, 5.0), grosor: 1.0 }), "{v:?}");
+        assert!(v.contains(&Prim::Linea { a: (2.5, 5.0), b: (10.0, 5.0), grosor: 1.0 }), "{v:?}");
+        assert!(v.contains(&Prim::Linea { a: (2.5, 5.0), b: (2.5, 20.0), grosor: 1.0 }), "{v:?}");
     }
 
     #[test]
-    fn la_recta_doble_es_continua_y_la_mezcla_no_se_dibuja() {
+    fn la_recta_doble_es_continua_y_las_mezclas_se_dibujan() {
         assert_eq!(primitivas('═', 10.0, 20.0, 1.0).unwrap().len(), 4);
         assert_eq!(primitivas('║', 10.0, 20.0, 1.0).unwrap().len(), 4);
-        assert!(primitivas('╒', 10.0, 20.0, 1.0).is_none(), "las mezclas siguen con la fuente");
-        assert!(primitivas('╬', 10.0, 20.0, 1.0).unwrap().len() == 8, "la cruz doble tiene ocho trazos");
+        assert_eq!(primitivas('╒', 10.0, 20.0, 1.0).unwrap().len(), 3, "doble a la derecha, simple abajo");
+        assert_eq!(primitivas('╬', 10.0, 20.0, 1.0).unwrap().len(), 8, "la cruz doble tiene ocho trazos");
+        assert!(primitivas('╡', 10.0, 20.0, 1.0).is_some());
+    }
+
+    /// Todos los caracteres de líneas dobles del rango son dibujables; ninguno cae a la fuente.
+    #[test]
+    fn todo_el_rango_doble_se_dibuja() {
+        for c in 0x2550u32..=0x256C {
+            let ch = char::from_u32(c).unwrap();
+            assert!(primitivas(ch, 8.0, 16.0, 1.0).is_some(), "U+{c:04X} {ch}");
+        }
     }
 }
