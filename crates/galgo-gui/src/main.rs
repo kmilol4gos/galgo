@@ -208,14 +208,17 @@ fn outbox() -> &'static mpsc::Sender<Request> {
     })
 }
 
-/// Texto que se envía al pegar. Con bracketed paste activo se envuelve en `ESC[200~ … ESC[201~` y se
-/// quita del texto cualquier `ESC[201~` (cerraría el pegado antes de tiempo). Sin él, se quitan los ESC.
+/// Texto que se envía al pegar. Se quitan TODOS los ESC (revisión 21): quitar solo `ESC[201~` una vez permitía que
+/// una carga anidada lo volviera a formar y cerrara el pegado antes de tiempo, y el portapapeles puede venir de un
+/// programa (OSC 52). Con bracketed paste activo el texto se envuelve en `ESC[200~ … ESC[201~`.
 fn paste_bytes(text: &str, bracketed: bool) -> String {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    // También el CSI de un byte (U+009B), que algunos programas interpretan como ESC[.
+    let text = text.replace(['\x1b', '\u{9b}'], "");
     if bracketed {
-        format!("\x1b[200~{}\x1b[201~", text.replace("\x1b[201~", ""))
+        format!("\x1b[200~{text}\x1b[201~")
     } else {
-        text.replace('\x1b', "")
+        text
     }
 }
 
@@ -1471,11 +1474,20 @@ fn raton_boton(b: mouse::Button) -> Option<u8> {
     }
 }
 
+/// El ratón solo se entrega si en primer plano no está el shell: un programa que muere sin apagar su modo (o un `cat`
+/// con esas secuencias) lo deja activo, y el shell recibiría basura con cada movimiento y flechas con la rueda.
+fn shell_en_primer_plano(app: &App) -> bool {
+    app.selected
+        .and_then(|id| app.panes.iter().find(|p| p.id == id))
+        .and_then(|p| p.programa.as_deref())
+        .is_some_and(|n| SHELLS.contains(&n))
+}
+
 /// Secuencia de ratón para `gesto` en `celda`, si el programa del panel enfocado pide seguimiento de ratón.
 /// No mira la geometría: quien pulsa la comprueba antes; soltar y arrastrar usan la celda ya conocida.
 fn secuencia_raton_en(app: &App, gesto: raton::Gesto, (fila, col): Cell) -> Option<String> {
     let snap = app.snap.as_ref()?;
-    if app.scroll != 0 {
+    if app.scroll != 0 || shell_en_primer_plano(app) {
         return None;
     }
     let mods = raton::Mods { shift: app.mods.shift(), alt: app.mods.alt(), ctrl: app.mods.control() };
@@ -2972,7 +2984,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             // Un programa con ratón recibe la rueda como botones 64/65; uno en pantalla alternativa sin ratón, flechas
             // (como Terminal.app). Solo si el puntero está sobre la cuadrícula y no hay historial desplazado.
             if steps != 0 && app.scroll == 0 && pointer_in_grid(app) {
-                let (raton_on, alt) = app.snap.as_ref().map_or((false, false), |s| (s.mouse != MouseTracking::None, s.alt_screen));
+                let (raton_on, alt) = app.snap.as_ref().filter(|_| !shell_en_primer_plano(app)).map_or((false, false), |s| (s.mouse != MouseTracking::None, s.alt_screen));
                 if raton_on {
                     if let Some((seq, _)) = secuencia_raton_pulsa(app, raton::Gesto::Rueda { arriba: steps > 0 }) {
                         for _ in 0..steps.unsigned_abs().min(20) {
@@ -3716,7 +3728,7 @@ mod tests {
     fn pegado_con_y_sin_bracketed_paste() {
         assert_eq!(paste_bytes("uno\ndos", true), "\x1b[200~uno\rdos\x1b[201~");
         // Un ESC[201~ dentro del texto no puede cerrar el pegado antes de tiempo.
-        assert_eq!(paste_bytes("a\x1b[201~b", true), "\x1b[200~ab\x1b[201~");
+        assert_eq!(paste_bytes("a\x1b[201~b", true), "\x1b[200~a[201~b\x1b[201~");
         // Sin bracketed paste no hay envoltorio, y los ESC del texto se quitan.
         assert_eq!(paste_bytes("uno\ndos", false), "uno\rdos");
         assert_eq!(paste_bytes("a\x1b[2Jb", false), "a[2Jb");
@@ -4623,6 +4635,28 @@ mod tests {
         assert!(reenviar_evento(clic, event::Status::Ignored).is_some());
         let rueda = Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 } });
         assert!(reenviar_evento(rueda, event::Status::Captured).is_none());
+    }
+
+    /// Revisión 21: una carga anidada no puede cerrar el pegado entre corchetes antes de tiempo.
+    #[test]
+    fn el_pegado_no_se_puede_romper() {
+        let hostil = "\x1b[20\x1b[201~1~\nrm -rf x\n\u{9b}201~";
+        let enviado = paste_bytes(hostil, true);
+        assert_eq!(enviado.matches('\x1b').count(), 2, "solo la apertura y el cierre: {enviado:?}");
+        assert!(enviado.starts_with("\x1b[200~") && enviado.ends_with("\x1b[201~"));
+        assert!(!enviado.contains('\u{9b}'));
+        assert!(!paste_bytes(hostil, false).contains('\x1b'));
+    }
+
+    /// Revisión 21: con el shell en primer plano no se envía ratón, aunque haya quedado el modo activo.
+    #[test]
+    fn el_shell_no_recibe_raton() {
+        let mut p = pane_info(1, "p", Status::Idle);
+        p.programa = Some("zsh".into());
+        let mut app = App { panes: vec![p], selected: Some(1), ..Default::default() };
+        assert!(shell_en_primer_plano(&app));
+        app.panes[0].programa = Some("vim".into());
+        assert!(!shell_en_primer_plano(&app));
     }
 
     /// C: la paleta lista workspaces, paneles y acciones; la búsqueda los filtra y Enter ejecuta el elegido.
