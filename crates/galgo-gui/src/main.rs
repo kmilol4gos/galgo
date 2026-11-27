@@ -436,6 +436,10 @@ enum Message {
     SearchStep(isize),
     /// Clic en el nombre de una píldora; dos en menos de 500 ms abren el renombrado.
     PillPress(String),
+    /// Cmd+V con una caja abierta (búsqueda o renombrado): el texto del portapapeles va a la caja, no al terminal.
+    PasteCaja(Option<String>),
+    /// Cmd+⌫ con una caja abierta: vacía la caja.
+    BorrarCaja,
     /// Una pestaña de cualquier workspace (la barra es plana): selecciona su grupo y esa pestaña.
     SelectTabIn(String, usize),
     SplitFocused(bool),
@@ -2644,6 +2648,27 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::PasteCaja(texto) => {
+            let limpio: String = texto.unwrap_or_default().chars().filter(|c| !c.is_control()).collect();
+            if let Some(b) = app.buscar.as_mut() {
+                b.consulta.push_str(&limpio);
+                return buscar_cambio(app);
+            }
+            if let Some((_, buf)) = app.renombrando.as_mut() {
+                buf.push_str(&limpio);
+            }
+            Task::none()
+        }
+        Message::BorrarCaja => {
+            if let Some(b) = app.buscar.as_mut() {
+                b.consulta.clear();
+                return buscar_cambio(app);
+            }
+            if let Some((_, buf)) = app.renombrando.as_mut() {
+                buf.clear();
+            }
+            Task::none()
+        }
         Message::OpenSearch => {
             let Some(id) = app.selected else { return Task::none() };
             if app.buscar.is_none() {
@@ -2746,6 +2771,19 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             // Con la búsqueda abierta, el teclado es suyo: Enter/Shift+Enter, Esc, y lo que se escribe a la consulta.
             if app.buscar.is_some() && !modifiers.command() {
                 return buscar_tecla(app, &key, modifiers, text.as_deref());
+            }
+            // A2: con una caja abierta, los atajos con Cmd no llegan al terminal. Pegar y borrar van a la caja; Cmd+C
+            // solo copia la selección; el resto se ignora (los atajos de la ventana ya se atendieron arriba).
+            if (app.buscar.is_some() || app.renombrando.is_some()) && modifiers.command() {
+                if matches!(&key, Key::Character(c) if c.as_str() == "v") {
+                    return iced::clipboard::read().map(Message::PasteCaja);
+                }
+                if matches!(&key, Key::Named(Named::Backspace)) {
+                    return update(app, Message::BorrarCaja);
+                }
+                if !matches!(&key, Key::Character(c) if c.as_str() == "c") {
+                    return Task::none();
+                }
             }
             // Cmd+Opt+flechas: el foco se mueve al split vecino.
             if modifiers.command() && modifiers.alt() {
@@ -3403,6 +3441,22 @@ mod tests {
         assert!(!es_reinicio(true, true, None, Some((1, 12))), "primer listado: no hay anterior");
         assert!(!es_reinicio(false, true, Some((1, 9)), Some((1, 12))), "sin disposición restaurada no hay nada que relanzar");
         assert!(!es_reinicio(true, false, Some((1, 9)), Some((1, 12))), "sin paneles en pantalla no hay nada que relanzar");
+    }
+
+    /// A2: con la búsqueda abierta, Cmd+⌫ vacía la caja, Cmd+X no hace nada y el pegado va a la consulta.
+    #[test]
+    fn con_la_caja_abierta_los_atajos_con_cmd_no_llegan_al_panel() {
+        let mut app = App { window: (1100.0, 700.0), panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
+        app.snap = Some(snap(&["aaaa"], 4));
+        let _ = update(&mut app, Message::OpenSearch);
+        let _ = update(&mut app, Message::Event(key_press(Key::Character("e".into()), Some("e"))));
+        let _ = update(&mut app, Message::Event(key_press(Key::Character("x".into()), None)));
+        assert_eq!(app.buscar.as_ref().unwrap().consulta, "e", "Cmd+X no escribe en la caja");
+        let _ = update(&mut app, Message::PasteCaja(Some("rror\n".into())));
+        assert_eq!(app.buscar.as_ref().unwrap().consulta, "error", "el pegado va a la consulta; los saltos de línea se quitan");
+        let _ = update(&mut app, Message::BorrarCaja);
+        assert_eq!(app.buscar.as_ref().unwrap().consulta, "", "Cmd+⌫ vacía la caja");
+        assert!(app.buscar.is_some(), "la búsqueda sigue abierta");
     }
 
     /// Cmd+F: lo que se escribe va a la consulta y nunca al panel; Esc cierra y la vista vuelve en vivo.
