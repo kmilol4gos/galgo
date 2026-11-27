@@ -807,6 +807,12 @@ fn manager_of(app: &App, key: Option<&str>) -> Option<String> {
         .map(|p| p.name.clone())
 }
 
+/// Un diálogo tiene el teclado: cualquier vista que no sea el terminal o la bienvenida. Es la única fuente de verdad
+/// para decidir si una tecla llega a un panel.
+fn overlay_owns_keyboard(app: &App) -> bool {
+    !matches!(body_mode(app), Body::Screen | Body::Welcome)
+}
+
 /// Qué ocupa el cuerpo de la ventana: bienvenida, «Nuevo workspace», formulario o el terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Body {
@@ -2293,8 +2299,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     _ => Task::none(),
                 };
             }
-            // Atajos de la ventana (Cmd+…), salvo mientras «Nuevo workspace» está abierto.
-            if modifiers.command() && app.new_ws.is_none() && !app.launcher && app.settings.is_none() {
+            // Atajos de la ventana (Cmd+…), salvo mientras hay un diálogo abierto (ninguno puede actuar sobre el panel de detrás).
+            if modifiers.command() && app.new_ws.is_none() && !app.launcher && app.settings.is_none() && !overlay_owns_keyboard(app) {
                 if let Some(message) = shortcut_in_state(app, &key, modifiers) {
                     return update(app, message);
                 }
@@ -2317,6 +2323,15 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 return Task::none();
             }
             if app.form.is_some() {
+                return Task::none();
+            }
+            // Un diálogo nuevo (formulario de agente, confirmación de equipo) es dueño del teclado: nada de lo que se
+            // escribe llega al panel de detrás. Esc lo cierra (review-15 A1).
+            if overlay_owns_keyboard(app) {
+                if matches!(&key, Key::Named(Named::Escape)) {
+                    app.agent_form = None;
+                    app.team_pending = None;
+                }
                 return Task::none();
             }
             // Cmd+Opt+flechas: el foco se mueve al split vecino.
@@ -3348,6 +3363,38 @@ mod tests {
         assert_eq!(tab.root.ids(), vec![10, 11]);
         assert_eq!(tab.focus, 10, "el foco va al manager");
         assert!(matches!(tab.root, layout::Node::Split { vertical: true, .. }));
+    }
+
+    /// review-15 A1: con el formulario de agente abierto, Cmd+W no pide cerrar el panel de detrás y las teclas no llegan
+    /// a él; Esc lo cierra y el teclado vuelve al terminal.
+    #[test]
+    fn dialogo_abierto_es_dueno_del_teclado() {
+        let mut app = App::default();
+        app.panes = vec![pane_info(1, "shell", Status::Idle)];
+        app.layouts.sync(&pane_keys(&app));
+        app.selected = Some(1);
+        app.agent_form = Some(AgentForm::para(&app));
+        assert!(overlay_owns_keyboard(&app));
+        let cmd_w = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Character("w".into()),
+            modified_key: Key::Character("w".into()),
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::COMMAND,
+            text: None,
+        });
+        let _ = update(&mut app, Message::Event(cmd_w));
+        assert!(!app.confirm_close, "Cmd+W no actúa sobre el panel de detrás");
+        let esc = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Escape),
+            modified_key: Key::Named(Named::Escape),
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+        });
+        let _ = update(&mut app, Message::Event(esc));
+        assert!(app.agent_form.is_none() && !overlay_owns_keyboard(&app), "Esc cierra el diálogo");
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la
