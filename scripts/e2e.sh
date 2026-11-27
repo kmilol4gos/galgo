@@ -1583,6 +1583,38 @@ grep -qx '"portapapeles":"otro"' "$TMP/c150/copias"; check "también con termina
 galgo kill osc150 --remove >/dev/null; galgo stop >/dev/null 2>&1
 export GALGO_SOCKET="$TMP/galgo.sock"
 
+echo "152. reflow: al estrechar la pantalla una línea larga se parte y al ensancharla vuelve a una fila"
+export GALGO_SOCKET="$TMP/c152/g.sock"; mkdir -p "$TMP/c152" && chmod 700 "$TMP/c152"
+galgo spawn rs152 -- bash --norc >/dev/null
+rpc152() { python3 -c 'import json,os,socket,sys
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["GALGO_SOCKET"]); s.sendall((sys.argv[1] + "\n").encode()); buf = b""
+while not buf.endswith(b"\n"):
+    d = s.recv(65536)
+    if not d:
+        break
+    buf += d
+print(buf.decode().strip())' "$1"; }
+# Cuenta las filas con una tanda de x (no el comando del prompt, que también tiene una x) y dice cuántas x tiene la
+# más larga de esas filas.
+x152() { rpc152 '{"op":"snapshot","pane":"rs152","offset":0}' | python3 -c '
+import json,sys,re
+d=json.loads(sys.stdin.read())["data"]
+filas=["".join(r["t"] for r in l).rstrip() for l in d["lines"]]
+xs=[len(m) for t in filas for m in re.findall(r"x{10,}", t)]
+print(len(xs), max(xs) if xs else 0)'; }
+rpc152 '{"op":"resize","pane":"rs152","rows":20,"cols":50}' >/dev/null
+galgo send rs152 "printf 'x%.0s' \$(seq 1 120); echo; echo FIN152" >/dev/null
+ok=0; for i in $(seq 1 50); do galgo read rs152 2>/dev/null | grep -q "^FIN152" && { ok=1; break; }; sleep 0.2; done
+[ $ok = 1 ]; check "la salida de prueba llegó" $?
+read -r filas_estrecho maxima_estrecho <<< "$(x152)"
+[ "$filas_estrecho" -ge 3 ] && [ "$maxima_estrecho" -le 50 ]; check "a 50 columnas la línea de 120 x se parte en al menos 3 filas" $?
+rpc152 '{"op":"resize","pane":"rs152","rows":20,"cols":160}' >/dev/null
+sleep 0.5
+read -r filas_ancho maxima_ancho <<< "$(x152)"
+[ "$filas_ancho" = 1 ] && [ "$maxima_ancho" = 120 ]; check "al ensancharla vuelve a una sola fila de 120 x" $?
+galgo kill rs152 --remove >/dev/null 2>&1; galgo stop >/dev/null 2>&1
+export GALGO_SOCKET="$TMP/galgo.sock"
+
 # Ningún daemon de esta corrida puede quedar vivo: se comprueba (y se para) lo que quede bajo $TMP.
 echo "148. cerrar una pestaña quita el panel; kill a secas lo deja como exited"
 export GALGO_SOCKET="$TMP/c148/g.sock"; mkdir -p "$TMP/c148" && chmod 700 "$TMP/c148"
