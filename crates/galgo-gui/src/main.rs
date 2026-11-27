@@ -75,8 +75,12 @@ const STATUS_H: f32 = 26.0;
 const PANEL_GUTTER: f32 = 6.0;
 const PANEL_PAD: f32 = 16.0;
 const LEAF_PAD: f32 = PANEL_GUTTER + PANEL_PAD;
+/// Cabecera de cada panel (icono, proceso, cwd y acciones). Va dentro del padding superior: el texto empieza debajo.
+const HEADER_H: f32 = 26.0;
+/// Desde el borde del hueco hasta el primer renglón del terminal.
+const LEAF_TOP: f32 = LEAF_PAD + HEADER_H;
 /// Origen de la cuadrícula de un panel único (referencia de las pruebas); un split usa el de su rectángulo.
-const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + LEAF_PAD, 2.0 * TABS_H + LEAF_PAD);
+const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + LEAF_PAD, 2.0 * TABS_H + LEAF_TOP);
 /// Primera opción del desplegable de manager del formulario: ningún manager.
 const NO_MANAGER: &str = "(ninguno)";
 
@@ -778,7 +782,7 @@ const COLS_MARGIN: u16 = 2;
 
 fn grid_in(rect: layout::Rect) -> (u16, u16) {
     let cols = ((rect.w - 2.0 * LEAF_PAD) / cell_w()).floor().max(20.0) as u16;
-    (((rect.h - 2.0 * LEAF_PAD) / line_h()).floor().max(5.0) as u16, cols.saturating_sub(COLS_MARGIN).max(20))
+    (((rect.h - LEAF_PAD - LEAF_TOP) / line_h()).floor().max(5.0) as u16, cols.saturating_sub(COLS_MARGIN).max(20))
 }
 
 /// Cuadrícula de la ventana entera (un panel nuevo sin split).
@@ -817,7 +821,7 @@ fn pane_rect(app: &App, id: u32) -> Option<layout::Rect> {
 
 /// Origen de la cuadrícula de un rectángulo de panel (su margen de 10 px).
 fn origin_in(rect: layout::Rect) -> (f32, f32) {
-    (rect.x + LEAF_PAD, rect.y + LEAF_PAD)
+    (rect.x + LEAF_PAD, rect.y + LEAF_TOP)
 }
 
 /// Origen de la cuadrícula del panel enfocado; sin rectángulo conocido, el de referencia.
@@ -1832,7 +1836,26 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
 enum Mark {
     Normal,
     Cursor,
+    /// Cursor de un panel sin foco: tenue, sin parpadeo.
+    CursorIdle,
     Selected,
+}
+
+/// Cómo se dibuja el cursor de un panel: el enfocado parpadea, el de una ventana sin foco queda tenue, y los
+/// paneles que no son el activo no lo muestran.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorStyle {
+    Off,
+    Blink,
+    Idle,
+}
+
+/// Fase del parpadeo del cursor: visible la mitad de cada 1,06 s. Se recalcula en cada tick de pantalla.
+pub fn blink_on() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis() / 530) % 2 == 0)
+        .unwrap_or(true)
 }
 
 /// Fondo de la selección: el acento translúcido sobre el fondo del terminal, con el texto en su color.
@@ -1866,6 +1889,8 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
     // Cursor de bloque: el acento semitransparente bajo el carácter, que sigue con su color (no se invierte).
     if mark == Mark::Cursor {
         bg = Some(theme::CURSOR);
+    } else if mark == Mark::CursorIdle {
+        bg = Some(theme::CURSOR_IDLE);
     }
     if mark == Mark::Selected {
         bg = Some(SELECTION_BG);
@@ -1886,7 +1911,7 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
     sp
 }
 
-fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>) -> Vec<Span<'static, Message>> {
+fn spans_for_line(runs: &[Run], cursor: Option<(u16, Mark)>, sel: Option<(u16, u16)>) -> Vec<Span<'static, Message>> {
     let mut out = Vec::new();
     let mut col: u16 = 0;
     for r in runs {
@@ -1894,8 +1919,8 @@ fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>
         let mut chunk_mark = Mark::Normal;
         let mut chunk_symbol = false;
         for ch in r.t.chars() {
-            let mark = if cursor_col == Some(col) {
-                Mark::Cursor
+            let mark = if cursor.is_some_and(|(c, _)| c == col) {
+                cursor.map_or(Mark::Cursor, |(_, m)| m)
             } else if sel.is_some_and(|(a, b)| (a..=b).contains(&col)) {
                 Mark::Selected
             } else {
@@ -1920,12 +1945,19 @@ fn spans_for_line(runs: &[Run], cursor_col: Option<u16>, sel: Option<(u16, u16)>
 }
 
 /// Pantalla de un panel. `cursor`: se dibuja el cursor (solo el panel enfocado, con la ventana activa).
-fn screen_view(snap: &Snapshot, sel: Option<Selection>, cursor: bool) -> Element<'static, Message> {
+fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle) -> Element<'static, Message> {
     let mut lines = column![].spacing(0);
-    // El cursor solo se dibuja en la pantalla en vivo.
-    let live = cursor && snap.scrollback == 0;
+    // El cursor solo se dibuja en la pantalla en vivo y si el panel lo muestra.
+    let live = snap.scrollback == 0 && !snap.cursor_hidden;
+    let visible = live
+        && match style {
+            CursorStyle::Off => false,
+            CursorStyle::Blink => blink_on(),
+            CursorStyle::Idle => true,
+        };
+    let mark = if style == CursorStyle::Idle { Mark::CursorIdle } else { Mark::Cursor };
     for (r, runs) in snap.lines.iter().enumerate() {
-        let cursor = (live && !snap.cursor_hidden && snap.cursor.0 as usize == r).then_some(snap.cursor.1);
+        let cursor = (visible && snap.cursor.0 as usize == r).then_some((snap.cursor.1, mark));
         let selected = sel.and_then(|s| selected_cols(s, r as u16, snap.cols));
         let spans = spans_for_line(runs, cursor, selected);
         lines = lines.push(

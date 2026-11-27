@@ -26,6 +26,8 @@ pub const DIM: Color = Color::from_rgb(0.420, 0.388, 0.345);
 pub const ACCENT: Color = Color::from_rgb(0.435, 0.608, 0.820);
 /// Relleno del cursor de bloque: el acento con transparencia, para no tapar el carácter bajo él.
 pub const CURSOR: Color = Color { a: 0.55, ..ACCENT };
+/// Cursor de un panel sin foco: el mismo acento, más tenue, para que se vea dónde está sin competir.
+pub const CURSOR_IDLE: Color = Color { a: 0.22, ..ACCENT };
 pub const WORKING: Color = Color::from_rgb(0.435, 0.659, 0.784);
 pub const BLOCKED: Color = Color::from_rgb(0.878, 0.659, 0.290);
 pub const DONE: Color = Color::from_rgb(0.561, 0.749, 0.498);

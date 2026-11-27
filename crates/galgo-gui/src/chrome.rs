@@ -301,7 +301,8 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
     let crumb = row![text(project).size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text("/").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text(branch).size(theme::SMALL_SIZE + 1.0).color(MUTED)]
         .spacing(4)
         .align_y(Alignment::Center);
-    let mut bar = row![container(crumb).padding([0, 14])].align_y(Alignment::Center).height(TABS_H - 1.0);
+    // Pestañas como píldoras separadas por espacio (sin divisores verticales).
+    let mut bar = row![container(crumb).padding([0, 14])].spacing(4).align_y(Alignment::Center).height(TABS_H - 1.0);
     if let Some(ws) = key.as_ref().and_then(|k| app.layouts.by_key.get(k)) {
         for (i, tab) in ws.tabs.iter().enumerate() {
             let pane = app.panes.iter().find(|p| p.id == tab.focus);
@@ -318,31 +319,18 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
                 // Cerrar el panel enfocado de la pestaña (con confirmación en la barra de estado si sigue vivo).
                 label = label.push(theme::btn(text("×").size(13).color(theme::DIM)).padding([0, 4]).on_press(Message::AskClose));
             }
-            let top = container(Space::new(Length::Fill, Length::Fixed(2.0))).style(theme::tab_underline(active));
             // Icono de terminal (>_) delante del título: el proceso y el cwd se leen de un vistazo.
             let label = row![text(">_").size(theme::SMALL_SIZE).color(theme::DIM), label].spacing(6).align_y(Alignment::Center);
-            let b = theme::btn(container(label).padding([0, 14]).center_y(Length::Fixed(TABS_H - 3.0)))
+            let b = theme::btn(container(label).padding([0, 14]).center_y(Length::Fixed(TABS_H - 6.0)))
                 .padding(0)
                 .on_press(Message::SelectTab(i))
                 .style(theme::tab(active));
-            bar = bar.push(row![theme::rule(true), column![top, b].width(Length::Shrink)].height(TABS_H - 1.0));
+            bar = bar.push(b);
         }
-        bar = bar.push(theme::rule(true));
     }
     bar = bar
         .push(icon_button(text("+").size(16).color(MUTED).into(), "Nueva pestaña  ⌘T", Message::NewTab))
-        .push(Space::with_width(Length::Fill))
-        .push(
-            tooltip(
-                theme::btn(text("Agente").size(theme::SMALL_SIZE + 1.0).color(MUTED)).padding([4, 10]).on_press(Message::OpenLauncher),
-                container(text("Lanzar agente  ⌘⇧L").size(theme::SMALL_SIZE)).padding([4, 8]).style(theme::overlay),
-                tooltip::Position::Bottom,
-            ),
-        )
-        .push(icon_button(split_icon(true), "Dividir a la derecha  ⌘D", Message::SplitFocused(true)))
-        .push(icon_button(split_icon(false), "Dividir hacia abajo  ⌘⇧D", Message::SplitFocused(false)))
-        .push(text(clock_hm()).size(theme::SMALL_SIZE + 1.0).color(theme::DIM))
-        .push(Space::with_width(10));
+        .push(Space::with_width(Length::Fill));
     column![container(bar).width(Length::Fill).style(theme::surface(SIDEBAR)), theme::rule(false)].into()
 }
 
@@ -421,25 +409,60 @@ fn node_view<'a>(app: &'a App, node: &'a layout::Node, split: bool, path: &mut l
 /// y atenuados (como Ghostty), para que se vea dónde va el teclado. En un split, el enfocado lleva un borde de acento.
 fn leaf_view(app: &App, id: u32, split: bool) -> Element<'_, Message> {
     let focused = app.selected == Some(id);
+    // El cursor parpadea en el panel enfocado con la ventana activa; sin foco queda tenue; en los demás no aparece.
+    let style = match (focused, app.focused) {
+        (false, _) => CursorStyle::Off,
+        (true, true) => CursorStyle::Blink,
+        (true, false) => CursorStyle::Idle,
+    };
     let inner: Element<'_, Message> = if focused {
         match shown(app) {
-            // Con `lazy`, el árbol de la pantalla solo se reconstruye cuando cambia lo que se muestra.
+            // Con `lazy`, el árbol de la pantalla solo se reconstruye cuando cambia lo que se muestra (y en cada fase del cursor).
             Some(snap) => {
-                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen), app.focused, zoom());
+                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen), app.focused, zoom(), blink_on());
                 let sel = app.sel;
-                let cursor = app.focused;
-                lazy(key, move |_| screen_view(snap, sel, cursor)).into()
+                lazy(key, move |_| screen_view(snap, sel, style)).into()
             }
             None => placeholder("Esperando salida…"),
         }
     } else {
         match app.others.get(&id) {
-            Some(snap) => screen_view(snap, None, false),
+            Some(snap) => screen_view(snap, None, CursorStyle::Off),
             None => placeholder("Esperando salida…"),
         }
     };
+    // Cabecera del panel: icono, proceso y cwd tenues; a la derecha, las acciones (solo en el panel enfocado).
+    let pane = app.panes.iter().find(|p| p.id == id);
+    let nombre = pane.map_or(String::new(), |p| p.name.clone());
+    let cwd = pane.and_then(|p| p.cwd.as_deref()).map(tilde).unwrap_or_default();
+    let mut titulo = row![
+        text(">_").size(theme::SMALL_SIZE).color(theme::DIM),
+        text(nombre).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT).wrapping(iced::widget::text::Wrapping::None),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    if !cwd.is_empty() {
+        titulo = titulo.push(text(cwd).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None));
+    }
+    let mut acciones = row![].spacing(2).align_y(Alignment::Center);
+    if focused {
+        acciones = acciones
+            .push(icon_button(split_icon(true), "Dividir a la derecha  ⌘D", Message::SplitFocused(true)))
+            .push(icon_button(split_icon(false), "Dividir hacia abajo  ⌘⇧D", Message::SplitFocused(false)))
+            .push(icon_button(text("⤢").size(13).color(theme::DIM).into(), "Maximizar el panel", Message::ToggleMaximize))
+            .push(icon_button(text("×").size(15).color(theme::DIM).into(), "Cerrar el panel", Message::AskClose));
+    }
+    let header = container(
+        row![container(titulo).width(Length::Fill).clip(true), acciones].align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(HEADER_H));
     // Panel redondeado con borde sutil y padding generoso: el texto no pega con el marco.
-    let body = container(inner).width(Length::Fill).height(Length::Fill).padding(PANEL_PAD).clip(true);
+    let body = container(column![header, container(inner).width(Length::Fill).height(Length::Fill)])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(PANEL_PAD)
+        .clip(true);
     let panel = container(body).width(Length::Fill).height(Length::Fill).clip(true).style(move |_| container::Style {
         background: Some(theme::TERM_BG.into()),
         border: Border {
@@ -507,6 +530,7 @@ pub fn status_bar(app: &App) -> Element<'_, Message> {
             right = right.push(text(usage::detail_line(u)).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None));
         }
     }
+    right = right.push(text(clock_hm()).size(theme::SMALL_SIZE + 1.0).color(theme::DIM));
     let bar = row![container(left).clip(true), Space::with_width(Length::Fill), right]
         .spacing(12)
         .align_y(Alignment::Center)
