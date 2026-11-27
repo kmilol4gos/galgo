@@ -8,6 +8,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+# vt100 con dos atributos más (tachado y parpadeo): ver vendor/vt100/PATCH-GALGO.md
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

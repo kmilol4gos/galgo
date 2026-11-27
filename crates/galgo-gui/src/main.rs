@@ -2661,7 +2661,12 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
     if mark == Mark::Selected {
         bg = Some(SELECTION_BG);
     }
-    let mut sp: Span<'static, Message> = span(text).color(fg.unwrap_or(term::DEFAULT_FG)).underline(r.underline);
+    // Atenuado (SGR 2) y parpadeo en su mitad apagada (el tick de pantalla redibuja cada 250 ms): el color se
+    // atenúa. El tachado (SGR 9) es un atributo del texto.
+    let color = fg.unwrap_or(term::DEFAULT_FG);
+    let atenuado = r.dim || (r.blink && !blink_on());
+    let color = if atenuado { color.scale_alpha(0.55) } else { color };
+    let mut sp: Span<'static, Message> = span(text).color(color).underline(r.underline).strikethrough(r.strike);
     if let Some(b) = bg { sp = sp.background(b); }
     if symbol && !fonts::is_nerd(fonts::current()) {
         // La fuente de símbolos mide 1 em por glifo; la celda, `metrics().0` em. Se escala para que cada glifo
@@ -2876,7 +2881,7 @@ mod tests {
     use super::*;
 
     fn run(t: &str) -> Run {
-        Run { t: t.into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false }
+        Run { t: t.into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false, dim: false, strike: false, blink: false }
     }
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
@@ -4079,7 +4084,7 @@ mod render {
     }
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
-        let run = |t: &str| Run { t: t.into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false };
+        let run = |t: &str| Run { t: t.into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false, dim: false, strike: false, blink: false };
         Snapshot { gen: 0, rows: lines.len() as u16, cols, cursor: (0, 0), cursor_hidden: true, lines: lines.iter().map(|l| vec![run(l)]).collect(), scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![] }
     }
 
@@ -4105,7 +4110,7 @@ mod render {
     }
 
     fn colored(parts: &[(&str, galgo_proto::Color, bool)]) -> Vec<Run> {
-        parts.iter().map(|(t, fg, bold)| Run { t: (*t).into(), fg: *fg, bg: galgo_proto::Color::Default, bold: *bold, italic: false, underline: false, inverse: false }).collect()
+        parts.iter().map(|(t, fg, bold)| Run { t: (*t).into(), fg: *fg, bg: galgo_proto::Color::Default, bold: *bold, italic: false, underline: false, inverse: false, dim: false, strike: false, blink: false }).collect()
     }
 
     /// Pantalla de ejemplo con colores, como la de un agente trabajando.
@@ -4196,6 +4201,9 @@ mod render {
             italic: false,
             underline: false,
             inverse: false,
+            dim: false,
+            strike: false,
+            blink: false,
         };
         let azul = (0x3a, 0x5f, 0x8a);
         let gris = (0x5a, 0x6e, 0x82);
@@ -4657,7 +4665,7 @@ mod cajas_tests {
     /// Las cajas salen de la fila y se apuntan en su columna y fila exactas; el resto del texto no cambia.
     #[test]
     fn las_cajas_salen_de_la_fila_y_van_a_su_celda() {
-        let runs = vec![Run { t: "┌─x".into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false }];
+        let runs = vec![Run { t: "┌─x".into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false, dim: false, strike: false, blink: false }];
         let mut capa = cajas::Capa { cw: 8.0, lh: 18.0, ligero: 1.0, ..Default::default() };
         let sin = quitar_cajas(&runs, 3, &mut capa);
         assert_eq!(sin[0].t, "  x");

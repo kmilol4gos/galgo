@@ -2168,6 +2168,7 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
             let (fg, bg) = (conv_color(cell.fgcolor()), conv_color(cell.bgcolor()));
             let (bold, italic, underline, inverse) =
                 (cell.bold(), cell.italic(), cell.underline(), cell.inverse());
+            let (dim, strike, blink) = (cell.dim(), cell.strikethrough(), cell.blink());
             match runs.last_mut() {
                 Some(l)
                     if l.fg == fg
@@ -2175,11 +2176,14 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
                         && l.bold == bold
                         && l.italic == italic
                         && l.underline == underline
-                        && l.inverse == inverse =>
+                        && l.inverse == inverse
+                        && l.dim == dim
+                        && l.strike == strike
+                        && l.blink == blink =>
                 {
                     l.t.push_str(&t)
                 }
-                _ => runs.push(Run { t, fg, bg, bold, italic, underline, inverse }),
+                _ => runs.push(Run { t, fg, bg, bold, italic, underline, inverse, dim, strike, blink }),
             }
         }
         lines.push(runs);
@@ -2210,6 +2214,27 @@ mod tests {
         assert!(check_size(24, 0).is_err());
         assert!(check_size(MAX_ROWS + 1, 80).is_err());
         assert!(check_size(24, MAX_COLS + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_estilos {
+    use super::*;
+
+    /// P1.6: tachado (SGR 9), atenuado (SGR 2) y parpadeo (SGR 5) llegan al snapshot como atributos de cada tramo.
+    /// vt100 sin el parche los descartaba (vendor/vt100/PATCH-GALGO.md).
+    #[test]
+    fn tachado_atenuado_y_parpadeo_llegan_al_snapshot() {
+        use std::num::NonZeroU16;
+        let mut p = vt100::Parser::new(NonZeroU16::new(2).unwrap(), NonZeroU16::new(20).unwrap(), 0);
+        p.process(b"\x1b[9mA\x1b[29m\x1b[2mB\x1b[22m\x1b[5mC\x1b[25mD");
+        let snap = snapshot(p.screen());
+        let tramos = &snap.lines[0];
+        let de = |t: &str| tramos.iter().find(|r| r.t.starts_with(t)).unwrap_or_else(|| panic!("falta el tramo {t}: {tramos:?}"));
+        assert!(de("A").strike && !de("A").dim && !de("A").blink);
+        assert!(de("B").dim && !de("B").strike);
+        assert!(de("C").blink && !de("C").strike);
+        assert!(!de("D").strike && !de("D").dim && !de("D").blink);
     }
 }
 

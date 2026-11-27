@@ -317,6 +317,15 @@ pub struct Run {
     pub underline: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub inverse: bool,
+    /// Atenuado (SGR 2). Ausente en daemons anteriores.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dim: bool,
+    /// Tachado (SGR 9).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strike: bool,
+    /// Parpadeo (SGR 5): la GUI lo muestra atenuado en la mitad de cada ciclo del cursor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blink: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -460,7 +469,7 @@ mod tests {
     /// Un tramo sin estilo es solo su texto; los valores por defecto no se escriben, pero se leen.
     #[test]
     fn tramo_compacto() {
-        let plain = Run { t: "x".into(), fg: Color::Default, bg: Color::Default, bold: false, italic: false, underline: false, inverse: false };
+        let plain = Run { t: "x".into(), fg: Color::Default, bg: Color::Default, bold: false, italic: false, underline: false, inverse: false, dim: false, strike: false, blink: false };
         assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"t":"x"}"#);
         let styled = Run { fg: Color::Idx(1), bold: true, ..plain.clone() };
         assert_eq!(serde_json::to_string(&styled).unwrap(), r#"{"t":"x","fg":{"Idx":1},"bold":true}"#);
