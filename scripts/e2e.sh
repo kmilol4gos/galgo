@@ -1561,6 +1561,28 @@ ok=0; for i in $(seq 1 50); do snap149 | grep -q '"mouse":"none"' && { ok=1; bre
 galgo kill raton149 --remove >/dev/null; galgo stop >/dev/null 2>&1
 export GALGO_SOCKET="$TMP/galgo.sock"
 
+echo "150. OSC 52: un programa copia al portapapeles; la lectura (?) se ignora y cada copia sale una sola vez"
+export GALGO_SOCKET="$TMP/c150/g.sock"; mkdir -p "$TMP/c150" && chmod 700 "$TMP/c150"
+galgo spawn osc150 -- bash --norc >/dev/null
+galgo send osc150 "printf '\\033]52;c;?\\007'; printf '\\033]52;c;%s\\007' \"\$(printf 'copiado desde el programa' | base64)\"; sleep 1; printf '\\033]52;c;%s\\033\\\\' \"\$(printf 'otro' | base64)\"; sleep 1; printf '\\033]52;c;?\\033\\\\'" >/dev/null
+snap150() { python3 -c 'import json,os,socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["GALGO_SOCKET"])
+s.sendall(b"{\"op\":\"snapshot\",\"pane\":\"osc150\",\"offset\":0}\n"); buf = b""
+while not buf.endswith(b"\n"):
+    d = s.recv(65536)
+    if not d:
+        break
+    buf += d
+print(buf.decode())'; }
+# Cada snapshot con texto nuevo lo entrega una vez: se recogen los que lleguen y se comprueba el conjunto.
+: > "$TMP/c150/copias"
+for i in $(seq 1 40); do snap150 | grep -o '"portapapeles":"[^"]*"' >> "$TMP/c150/copias"; sleep 0.1; [ "$(sort -u "$TMP/c150/copias" | wc -l)" -ge 2 ] && break; done
+grep -qx '"portapapeles":"copiado desde el programa"' "$TMP/c150/copias"; check "el texto de OSC 52 llega en el snapshot" $?
+grep -qx '"portapapeles":"otro"' "$TMP/c150/copias"; check "también con terminador ST" $?
+[ "$(grep -c . "$TMP/c150/copias")" = 2 ]; check "cada texto se entrega una sola vez (y la lectura ? no entrega nada)" $?
+galgo kill osc150 --remove >/dev/null; galgo stop >/dev/null 2>&1
+export GALGO_SOCKET="$TMP/galgo.sock"
+
 # Ningún daemon de esta corrida puede quedar vivo: se comprueba (y se para) lo que quede bajo $TMP.
 echo "148. cerrar una pestaña quita el panel; kill a secas lo deja como exited"
 export GALGO_SOCKET="$TMP/c148/g.sock"; mkdir -p "$TMP/c148" && chmod 700 "$TMP/c148"

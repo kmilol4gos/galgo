@@ -108,6 +108,8 @@ struct Pane {
     orquestador: bool,
     /// Último título que el programa anunció por OSC 0/2 (lo escribe el hilo lector).
     osc_titulo: Arc<Mutex<Option<String>>>,
+    /// Texto pendiente de copiar al portapapeles (OSC 52). Lo escribe el hilo lector y lo entrega el próximo snapshot.
+    osc_portapapeles: Arc<Mutex<Option<String>>>,
     /// Uso del transcript (lo rellena el hilo de sondeo) y último informe del agente. Solo en memoria.
     usage: Option<PaneUsage>,
     usage_report: Option<usage::ReportData>,
@@ -262,6 +264,7 @@ impl Pane {
             cwd,
             osc_cwd: Arc::new(Mutex::new(None)),
             osc_titulo: Arc::new(Mutex::new(None)),
+            osc_portapapeles: Arc::new(Mutex::new(None)),
             usage: None,
             usage_report: None,
             inbox,
@@ -1307,6 +1310,8 @@ impl Daemon {
         let osc_hilo = Arc::clone(&osc_cwd);
         let osc_titulo: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let titulo_hilo = Arc::clone(&osc_titulo);
+        let osc_portapapeles: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let portapapeles_hilo = Arc::clone(&osc_portapapeles);
         let prompt = Arc::new(AtomicBool::new(false));
         let prompt_hilo = Arc::clone(&prompt);
 
@@ -1339,6 +1344,7 @@ impl Daemon {
             cwd: cwd_saved,
             osc_cwd,
             osc_titulo,
+            osc_portapapeles,
             prompt_libre: prompt,
             usage: None,
             usage_report: None,
@@ -1386,6 +1392,9 @@ impl Daemon {
                         }
                         if let Some(titulo) = anuncios.titulo {
                             *titulo_hilo.lock().unwrap() = Some(titulo);
+                        }
+                        if let Some(texto) = anuncios.portapapeles {
+                            *portapapeles_hilo.lock().unwrap() = Some(texto);
                         }
                         let mut parser = screen.lock().unwrap();
                         parser.process(&buf[..n]);
@@ -1816,13 +1825,13 @@ impl Daemon {
                 Ok(json!({ "matches": matches, "scrollback": l }))
             }
             Request::Snapshot { pane, offset, since } => {
-                let (screen, gen) = {
+                let (screen, gen, portapapeles) = {
                     let st = self.state.lock().unwrap();
                     let p = &st.panes[&st.resolve(&pane)?];
                     if p.ghost {
                         return Err(no_proceso(&p.name));
                     }
-                    (Arc::clone(&p.screen), Arc::clone(&p.gen))
+                    (Arc::clone(&p.screen), Arc::clone(&p.gen), Arc::clone(&p.osc_portapapeles))
                 };
                 let mut parser = screen.lock().unwrap();
                 let current = token(gen.load(Ordering::SeqCst), offset);
@@ -1834,6 +1843,8 @@ impl Daemon {
                 parser.screen_mut().set_scrollback(offset as usize);
                 let mut snap = snapshot(parser.screen());
                 snap.gen = current;
+                // El texto de OSC 52 se entrega una sola vez: el snapshot que lo lleva es el que se copia.
+                snap.portapapeles = portapapeles.lock().unwrap().take();
                 snap.scrollback = parser.screen().scrollback() as u16;
                 snap.scrollback_max = parser.screen().scrollback_len() as u16;
                 snap.bracketed_paste = parser.screen().bracketed_paste();
@@ -2704,6 +2715,7 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
         },
         mouse_sgr: screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
         alt_screen: screen.alternate_screen(),
+        portapapeles: None,
     }
 }
 

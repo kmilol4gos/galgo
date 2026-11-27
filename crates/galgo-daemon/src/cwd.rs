@@ -79,11 +79,13 @@ pub fn ruta_de_osc7(uri: &str) -> Option<String> {
     (texto.len() > 1).then_some(texto)
 }
 
-/// Lo que anuncia el programa por OSC: su directorio (OSC 7) o su título (OSC 0 y 2).
+/// Lo que anuncia el programa por OSC: su directorio (OSC 7), su título (OSC 0 y 2) o un texto para el
+/// portapapeles (OSC 52, solo escritura).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tipo {
     Cwd,
     Titulo,
+    Portapapeles,
 }
 
 /// Busca `ESC ] 7 ; <uri>` (cwd) y `ESC ] 0|2 ; <texto>` (título) en el flujo de salida del pty, terminados en BEL o
@@ -113,9 +115,61 @@ enum Estado {
 pub struct Anuncios {
     pub cwd: Option<String>,
     pub titulo: Option<String>,
+    /// Texto que el programa pide copiar al portapapeles (OSC 52 con datos, nunca una lectura `?`).
+    pub portapapeles: Option<String>,
 }
 
 const MAX_CARGA: usize = 4096;
+/// Tope del base64 de OSC 52 (unos 100 KB de texto). Lo que pase de ahí se descarta entero.
+pub const MAX_PORTAPAPELES: usize = 140_000;
+
+/// Decodifica base64 estándar con relleno. `None` si hay un carácter fuera del alfabeto o el largo no cuadra.
+pub fn decodificar_base64(entrada: &[u8]) -> Option<Vec<u8>> {
+    fn valor(b: u8) -> Option<u32> {
+        Some(match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a') as u32 + 26,
+            b'0'..=b'9' => (b - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let sin_relleno = entrada.iter().rposition(|&b| b != b'=').map_or(&entrada[..0], |i| &entrada[..=i]);
+    if entrada.len() % 4 != 0 || entrada.len() - sin_relleno.len() > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(sin_relleno.len() * 3 / 4);
+    for trozo in sin_relleno.chunks(4) {
+        let mut acc = 0u32;
+        for &b in trozo {
+            acc = (acc << 6) | valor(b)?;
+        }
+        acc <<= 6 * (4 - trozo.len() as u32);
+        let bytes = acc.to_be_bytes();
+        match trozo.len() {
+            4 => out.extend_from_slice(&bytes[1..4]),
+            3 => out.extend_from_slice(&bytes[1..3]),
+            2 => out.push(bytes[1]),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// OSC 52: `c;<base64>` (o selección vacía). Una lectura (`?`) o un base64 roto no hacen nada.
+fn portapapeles_de(carga: &[u8]) -> Option<String> {
+    if carga.len() > MAX_PORTAPAPELES {
+        return None;
+    }
+    let corte = carga.iter().position(|&b| b == b';')?;
+    let (seleccion, datos) = (&carga[..corte], &carga[corte + 1..]);
+    if !(seleccion.is_empty() || seleccion.contains(&b'c')) || datos == b"?" {
+        return None;
+    }
+    let bytes = decodificar_base64(datos)?;
+    String::from_utf8(bytes).ok().filter(|t| !t.is_empty())
+}
 
 /// B4: un título no lleva controles ni caracteres de formato que alteren la pantalla (bidi, ancho cero).
 pub fn limpiar_titulo(t: &str) -> String {
@@ -143,6 +197,11 @@ fn cierra(tipo: Tipo, carga: &[u8], out: &mut Anuncios) {
                 out.titulo = Some(t.trim().to_string());
             }
         }
+        Tipo::Portapapeles => {
+            if let Some(t) = portapapeles_de(carga) {
+                out.portapapeles = Some(t);
+            }
+        }
     }
 }
 
@@ -162,6 +221,7 @@ impl Osc {
                 Estado::Numero(mut n) => match b {
                     b';' if n == b"7" => Estado::Carga(Tipo::Cwd, Vec::new()),
                     b';' if n == b"0" || n == b"2" => Estado::Carga(Tipo::Titulo, Vec::new()),
+                    b';' if n == b"52" => Estado::Carga(Tipo::Portapapeles, Vec::new()),
                     b';' => Estado::Otra,
                     0x07 => Estado::Normal,
                     0x1b => Estado::FinEsc(None),
@@ -178,7 +238,9 @@ impl Osc {
                     }
                     0x1b => Estado::FinEsc(Some((tipo, c))),
                     _ => {
-                        if c.len() < MAX_CARGA {
+                        // OSC 52 admite un poco más de un tope: así se sabe que se pasó y se descarta entero.
+                        let tope = if tipo == Tipo::Portapapeles { MAX_PORTAPAPELES + 1 } else { MAX_CARGA };
+                        if c.len() < tope {
                             c.push(b);
                         }
                         Estado::Carga(tipo, c)
@@ -244,7 +306,9 @@ mod tests {
     #[test]
     fn otras_osc_no_cuentan_como_cwd_ni_titulo() {
         let mut o = Osc::default();
-        assert_eq!(o.feed(b"\x1b]8;;file://h/no\x07\x1b]52;c;aGk=\x07"), Anuncios::default());
+        // OSC 8 no cuenta; OSC 52 sí, pero solo como texto para el portapapeles, no como cwd ni título.
+        let a = o.feed(b"\x1b]8;;file://h/no\x07\x1b]52;c;aGk=\x07");
+        assert_eq!((a.cwd, a.titulo, a.portapapeles.as_deref()), (None, None, Some("hi")));
         assert_eq!(cwd(&o.feed(b"\x1b]7;file://h/si\x07")), Some("/si"));
     }
 
@@ -280,5 +344,45 @@ mod tests {
         let nombre = nombre_de_pid(std::process::id() as i32).expect("nombre del propio proceso");
         let esperado = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(nombre, esperado);
+    }
+
+    fn portapapeles(a: &Anuncios) -> Option<&str> {
+        a.portapapeles.as_deref()
+    }
+
+    #[test]
+    fn base64_decodifica_con_y_sin_relleno() {
+        assert_eq!(decodificar_base64(b"aG9sYQ==").as_deref(), Some(&b"hola"[..]));
+        assert_eq!(decodificar_base64(b"aG9sYQ==").map(|v| String::from_utf8(v).unwrap()).as_deref(), Some("hola"));
+        assert_eq!(decodificar_base64(b"aG9sYQ").as_deref(), None);
+        assert_eq!(decodificar_base64(b"a===").as_deref(), None);
+        assert_eq!(decodificar_base64(b"aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(decodificar_base64(b"aG9s!w==").as_deref(), None);
+        assert_eq!(decodificar_base64(b"").as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn osc52_escribe_el_portapapeles_con_bel_y_con_st() {
+        let mut o = Osc::default();
+        assert_eq!(portapapeles(&o.feed(b"\x1b]52;c;aG9sYQ==\x07")), Some("hola"));
+        assert_eq!(portapapeles(&o.feed(b"\x1b]52;c;bXVuZG8=\x1b\\")), Some("mundo"));
+        assert_eq!(portapapeles(&o.feed(b"\x1b]52;;aG9sYQ==\x07")), Some("hola"));
+    }
+
+    #[test]
+    fn osc52_nunca_lee_y_descarta_lo_roto() {
+        let mut o = Osc::default();
+        assert_eq!(o.feed(b"\x1b]52;c;?\x07"), Anuncios::default());
+        assert_eq!(o.feed(b"\x1b]52;c;@@@@\x07"), Anuncios::default());
+        assert_eq!(o.feed(b"\x1b]52;p;aG9sYQ==\x07"), Anuncios::default());
+        let grande = "A".repeat(MAX_PORTAPAPELES + 8);
+        assert_eq!(o.feed(format!("\x1b]52;c;{grande}\x07").as_bytes()), Anuncios::default());
+    }
+
+    #[test]
+    fn osc52_partida_entre_lecturas() {
+        let mut o = Osc::default();
+        assert_eq!(o.feed(b"\x1b]52;c;aG9s"), Anuncios::default());
+        assert_eq!(portapapeles(&o.feed(b"YQ==\x07")), Some("hola"));
     }
 }

@@ -401,6 +401,10 @@ pub struct Snapshot {
     /// El programa usa la pantalla alternativa (vim, less, htop…).
     #[serde(default)]
     pub alt_screen: bool,
+    /// Texto que el programa pidió copiar al portapapeles (OSC 52). Solo llega una vez, en el snapshot que lo
+    /// entrega; el cliente lo escribe en el portapapeles del sistema y nunca lo lee de vuelta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portapapeles: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

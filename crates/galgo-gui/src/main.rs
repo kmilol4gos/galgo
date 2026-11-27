@@ -2126,9 +2126,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::OtherScreen(id, result) => {
             app.others_loading.remove(&id);
-            if let Ok(ScreenReply::Full(snap)) = result {
+            if let Ok(ScreenReply::Full(mut snap)) = result {
+                // Un panel en segundo plano que pidió copiar: el texto no se pierde al no estar enfocado.
+                let copiar = snap.portapapeles.take().map_or_else(Task::none, iced::clipboard::write);
                 app.others_gen.insert(id, snap.gen);
                 app.others.insert(id, snap);
+                return copiar;
             }
             Task::none()
         }
@@ -2702,6 +2705,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Screen(id, offset, sent_since, result) => {
             app.loading = false;
+            let mut copiar: Task<Message> = Task::none();
             let repetir = std::mem::take(&mut app.refresh_wanted);
             if app.selected == Some(id) {
                 match result {
@@ -2713,8 +2717,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                         let same_view = app.snap.is_some() && sent_since.is_some() && sent_since == app.snap_gen && offset == app.snap_offset;
                         app.snap_gen = if same_view { Some(gen) } else { None };
                     }
-                    Ok(ScreenReply::Full(snap)) => {
+                    Ok(ScreenReply::Full(mut snap)) => {
                         traza_una_vez(2, "primer snapshot recibido");
+                        // OSC 52 del programa: el texto va al portapapeles del sistema (solo escritura).
+                        if let Some(texto) = snap.portapapeles.take() {
+                            copiar = iced::clipboard::write(texto);
+                        }
                         app.error = None;
                         // El daemon puede haber recortado el desplazamiento al historial disponible.
                         app.scroll = app.scroll.min(snap.scrollback_max);
@@ -2733,9 +2741,9 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             if let (true, Some(sel)) = (repetir, app.selected) {
                 app.loading = true;
                 let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
-                return load_screen(sel, app.scroll, since);
+                return Task::batch([copiar, load_screen(sel, app.scroll, since)]);
             }
-            Task::none()
+            copiar
         }
         Message::Select(id) => select(app, id),
         Message::PillPress(key) => {
@@ -3500,6 +3508,7 @@ mod tests {
             mouse: Default::default(),
             mouse_sgr: false,
             alt_screen: false,
+            portapapeles: None,
         }
     }
 
@@ -4931,7 +4940,7 @@ mod render {
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
         let run = |t: &str| Run { t: t.into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false, dim: false, strike: false, blink: false };
-        Snapshot { gen: 0, rows: lines.len() as u16, cols, cursor: (0, 0), cursor_hidden: true, lines: lines.iter().map(|l| vec![run(l)]).collect(), scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false }
+        Snapshot { gen: 0, rows: lines.len() as u16, cols, cursor: (0, 0), cursor_hidden: true, lines: lines.iter().map(|l| vec![run(l)]).collect(), scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false, portapapeles: None }
     }
 
     pub fn render(app: &App, (w, h): (u32, u32), path: &std::path::Path) {
@@ -4979,7 +4988,7 @@ mod render {
         let rows = 40u16;
         let mut all = lines;
         while all.len() < rows as usize { all.push(vec![]); }
-        Snapshot { gen: 1, rows, cols, cursor: (1, 52), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false }
+        Snapshot { gen: 1, rows, cols, cursor: (1, 52), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false, portapapeles: None }
     }
 
     fn shell_snap(cols: u16) -> Snapshot {
@@ -4993,7 +5002,7 @@ mod render {
         let rows = 40u16;
         let mut all = lines;
         while all.len() < rows as usize { all.push(vec![]); }
-        Snapshot { gen: 1, rows, cols, cursor: (3, 23), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false }
+        Snapshot { gen: 1, rows, cols, cursor: (3, 23), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false, portapapeles: None }
     }
 
     fn usage(agent: &str, ctx: f32, cost: f64) -> galgo_usage::PaneUsage {
@@ -5079,6 +5088,7 @@ mod render {
             mouse: Default::default(),
             mouse_sgr: false,
             alt_screen: false,
+            portapapeles: None,
         }
     }
 
