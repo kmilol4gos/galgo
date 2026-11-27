@@ -294,11 +294,12 @@ fn group_pill<'a>(app: &'a App, key: String, pestanas: Vec<Element<'a, Message>>
     )
     .padding([0, 4])
     .on_press(Message::CloseWorkspace(key.clone()));
+    let agente = theme::btn(text("+ agente").size(theme::SMALL_SIZE).color(theme::TEXT_SOFT)).padding([0, 6]).on_press(Message::OpenAgentForm);
     let mut fila = row![text(key.clone()).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT)].spacing(6).align_y(Alignment::Center);
     for p in pestanas {
         fila = fila.push(p);
     }
-    fila = fila.push(cerrar);
+    fila = fila.push(agente).push(cerrar);
     container(fila).padding([0, 8]).height(Length::Fixed(TABS_H - 8.0)).center_y(Length::Fixed(TABS_H - 8.0)).style(theme::group).into()
 }
 
@@ -951,4 +952,67 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         .height(Length::Fixed(540.0))
         .style(theme::surface(SIDEBAR))
         .into()
+}
+
+/// Formulario «+ Agente…»: proveedor y modelo, rol, aislamiento y nombre. Solo lanza los agentes conocidos.
+pub fn agent_form_panel(app: &App) -> Element<'_, Message> {
+    let Some(f) = app.agent_form.as_ref() else { return column![].into() };
+    let target = focus_key(app).filter(|k| !k.is_empty()).unwrap_or_else(|| "sin workspace".into());
+    let chip = |label: &'static str, selected: bool, msg: Message| {
+        theme::btn(text(label).size(theme::SMALL_SIZE + 1.0).color(if selected { TEXT } else { theme::TEXT_SOFT }))
+            .padding([5, 10])
+            .on_press(msg)
+            .style(theme::tab(selected))
+    };
+    let proveedores = row(launch::Agent::ALL.iter().filter(|a| **a != launch::Agent::Shell).map(|a| {
+        chip(a.label(), f.agent == *a, Message::AgentFormPick(*a)).into()
+    }))
+    .spacing(6);
+    let modelos = f.agent.models();
+    let modelo: Element<'_, Message> = if modelos.is_empty() {
+        text("predeterminado del agente").size(theme::SMALL_SIZE).color(theme::DIM).into()
+    } else {
+        let options: Vec<String> = std::iter::once(launch::DEFAULT_MODEL.to_string()).chain(modelos.iter().map(|m| m.to_string())).collect();
+        pick_list(options, Some(f.model.clone()), Message::AgentFormModel)
+            .text_size(theme::SMALL_SIZE + 1.0)
+            .padding([4, 8])
+            .into()
+    };
+    let roles = row(launch::Role::ALL.iter().map(|r| chip(r.label(), f.role == *r, Message::AgentFormRole(*r)).into())).spacing(6);
+    let aislamiento = row(launch::Isolation::ALL.iter().map(|i| chip(i.label(), f.isolation == *i, Message::AgentFormIsolation(*i)).into())).spacing(6);
+    let nombre = text_input("nombre (vacío = automático)", &f.name)
+        .on_input(Message::AgentFormName)
+        .padding([6, 8])
+        .size(theme::BODY_SIZE)
+        .style(theme::field);
+    let mut cuerpo = column![
+        text("Proveedor").size(theme::SMALL_SIZE).color(theme::DIM),
+        proveedores,
+        row![text("Modelo").size(theme::SMALL_SIZE).color(theme::DIM), Space::with_width(Length::Fill), modelo].align_y(Alignment::Center),
+        text("Rol").size(theme::SMALL_SIZE).color(theme::DIM),
+        roles,
+        text("Dónde trabaja").size(theme::SMALL_SIZE).color(theme::DIM),
+        aislamiento,
+        text("Nombre").size(theme::SMALL_SIZE).color(theme::DIM),
+        nombre,
+    ]
+    .spacing(8);
+    if let Some(e) = &f.error {
+        cuerpo = cuerpo.push(text(e.clone()).size(theme::SMALL_SIZE).color(theme::FAILED));
+    }
+    let pie = row![
+        Space::with_width(Length::Fill),
+        theme::btn_secondary(text("Cancelar").size(theme::SMALL_SIZE + 1.0)).padding([5, 12]).on_press(Message::CloseAgentForm),
+        theme::btn_primary(text("Agregar").size(theme::SMALL_SIZE + 1.0).color(TEXT)).padding([5, 14]).on_press(Message::AgentFormSubmit),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    column![
+        container(column![text("Agregar agente").size(theme::TITLE_SIZE).color(TEXT), text(target).size(theme::SMALL_SIZE).color(theme::DIM)].spacing(4)).padding([14, 16]),
+        theme::rule(false),
+        container(cuerpo).padding([12, 16]),
+        theme::rule(false),
+        container(pie).padding([10, 16]),
+    ]
+    .into()
 }

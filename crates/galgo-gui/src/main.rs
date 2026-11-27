@@ -248,6 +248,10 @@ struct App {
     ws_saved: String,
     /// Cerrar un workspace pide dos clics: el primero deja aquí su clave.
     ws_close_armed: Option<String>,
+    /// Formulario «+ Agente…» abierto, y el rol de cada agente por nombre de panel (se guarda con el workspace).
+    agent_form: Option<AgentForm>,
+    roles: BTreeMap<String, String>,
+    roles_saved: String,
     /// Modificadores del teclado (para Cmd+clic) y el último clic (para doble y triple clic: celda, instante, n).
     mods: keyboard::Modifiers,
     clicks: Option<(Cell, std::time::Instant, u8)>,
@@ -356,6 +360,15 @@ enum Message {
     PaneChanged(u32, u64),
     /// No hubo forma de suscribirse al panel: mientras tanto, la pantalla se sondea.
     WatchDown(u32),
+    /// «+ Agente…»: abre el formulario, y sus campos.
+    OpenAgentForm,
+    AgentFormPick(launch::Agent),
+    AgentFormModel(String),
+    AgentFormRole(launch::Role),
+    AgentFormIsolation(launch::Isolation),
+    AgentFormName(String),
+    AgentFormSubmit,
+    CloseAgentForm,
     /// Nuevo workspace con nombre propio (Cmd+Shift+N): se agrupa en la barra superior y se guarda.
     OpenNewNamedWorkspace,
     /// Cierra el grupo de un workspace explícito y sus paneles (dos clics).
@@ -452,9 +465,10 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 24] = [
+    let commands: [(&str, &str, Message); 25] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
         ("Nuevo workspace con grupo…", "Cmd+Shift+N", Message::OpenNewNamedWorkspace),
+        ("Agregar agente al workspace…", "", Message::OpenAgentForm),
         ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
         ("Lanzar agente…", "Cmd+Shift+L", Message::OpenLauncher),
@@ -616,10 +630,53 @@ fn spawn_task_sized(app: &mut App, req: galgo_proto::Request, (rows, cols): (u16
     )
 }
 
+/// Estado del formulario «+ Agente…»: qué lanzar, con qué rol y dónde trabajar.
+#[derive(Debug, Clone)]
+struct AgentForm {
+    agent: launch::Agent,
+    model: String,
+    role: launch::Role,
+    isolation: launch::Isolation,
+    name: String,
+    error: Option<String>,
+}
+
+impl AgentForm {
+    /// Valores por defecto para el workspace enfocado: un manager si no lo hay todavía, si no, un worker.
+    fn para(app: &App) -> AgentForm {
+        let hay_manager = manager_of(app, focus_key(app).as_deref()).is_some();
+        AgentForm {
+            agent: launch::Agent::Claude,
+            model: launch::DEFAULT_MODEL.into(),
+            role: if hay_manager { launch::Role::Worker } else { launch::Role::Manager },
+            isolation: launch::Isolation::Shared,
+            name: String::new(),
+            error: None,
+        }
+    }
+}
+
+/// Muestra un error en el formulario abierto (no cierra nada).
+fn set_form_error(app: &mut App, msg: &str) {
+    if let Some(f) = app.agent_form.as_mut() {
+        f.error = Some(msg.to_string());
+    }
+}
+
+/// Manager del workspace `key` (el primer panel con rol manager en ese workspace), si lo hay.
+fn manager_of(app: &App, key: Option<&str>) -> Option<String> {
+    let key = key?;
+    app.panes
+        .iter()
+        .find(|p| p.workspace.as_deref() == Some(key) && app.roles.get(&p.name).map(String::as_str) == Some("manager"))
+        .map(|p| p.name.clone())
+}
+
 /// Qué ocupa el cuerpo de la ventana: bienvenida, «Nuevo workspace», formulario o el terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Body {
     Welcome,
+    AgentForm,
     NewWorkspace,
     Launcher,
     Palette,
@@ -638,6 +695,8 @@ fn body_mode(app: &App) -> Body {
         Body::NewWorkspace
     } else if app.launcher {
         Body::Launcher
+    } else if app.agent_form.is_some() {
+        Body::AgentForm
     } else if app.form.is_some() {
         Body::Form
     } else if app.panes.is_empty() {
@@ -1271,12 +1330,19 @@ fn persist_workspaces(app: &mut App) {
     let nombres: std::collections::HashMap<u32, String> = app.panes.iter().map(|p| (p.id, p.name.clone())).collect();
     let v = workspace::snapshot(&app.layouts.by_key, &app.explicit, &|id| nombres.get(&id).cloned());
     let texto = v.to_string();
-    if texto == app.ws_saved {
-        return;
+    if texto != app.ws_saved {
+        if let Some(path) = &app.prefs_path {
+            if prefs::set(path, "workspaces", v).is_ok() {
+                app.ws_saved = texto;
+            }
+        }
     }
-    if let Some(path) = &app.prefs_path {
-        if prefs::set(path, "workspaces", v).is_ok() {
-            app.ws_saved = texto;
+    let roles = serde_json::to_value(&app.roles).unwrap_or_default().to_string();
+    if roles != app.roles_saved {
+        if let Some(path) = &app.prefs_path {
+            if prefs::set(path, "agent_roles", serde_json::to_value(&app.roles).unwrap_or_default()).is_ok() {
+                app.roles_saved = roles;
+            }
         }
     }
 }
@@ -1721,6 +1787,71 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             // B3: el foco va al buscador: lo que se escribe, y Enter, llegan ahí.
             iced::widget::text_input::focus(new_ws_input_id())
         }
+        Message::OpenAgentForm => {
+            app.agent_form = Some(AgentForm::para(app));
+            Task::none()
+        }
+        Message::AgentFormPick(agent) => {
+            if let Some(f) = app.agent_form.as_mut() {
+                f.agent = agent;
+                f.model = launch::DEFAULT_MODEL.into();
+            }
+            Task::none()
+        }
+        Message::AgentFormModel(model) => {
+            if let Some(f) = app.agent_form.as_mut() {
+                f.model = model;
+            }
+            Task::none()
+        }
+        Message::AgentFormRole(role) => {
+            if let Some(f) = app.agent_form.as_mut() {
+                f.role = role;
+            }
+            Task::none()
+        }
+        Message::AgentFormIsolation(isolation) => {
+            if let Some(f) = app.agent_form.as_mut() {
+                f.isolation = isolation;
+            }
+            Task::none()
+        }
+        Message::AgentFormName(name) => {
+            if let Some(f) = app.agent_form.as_mut() {
+                f.name = name;
+                f.error = None;
+            }
+            Task::none()
+        }
+        Message::CloseAgentForm => {
+            app.agent_form = None;
+            Task::none()
+        }
+        Message::AgentFormSubmit => {
+            let Some(f) = app.agent_form.clone() else { return Task::none() };
+            let nombre = if f.name.trim().is_empty() { launch::free_name(f.agent.label(), &names(app)) } else { f.name.trim().to_string() };
+            if !launch::valid_agent_name(&nombre) {
+                set_form_error(app, "el nombre solo puede tener letras, cifras, - y _ (hasta 32)");
+                return Task::none();
+            }
+            if names(app).contains(&nombre.as_str()) {
+                set_form_error(app, "ya hay un panel con ese nombre");
+                return Task::none();
+            }
+            let key = focus_key(app);
+            let (rows, cols) = grid_for(app.window);
+            let cwd = key.as_deref().and_then(|k| app.explicit.get(k).cloned()).or_else(|| focus_context(app).1).unwrap_or_else(home_dir);
+            // Un worker o un revisor trabaja para el manager del workspace; si no hay, queda sin manager.
+            let manager = if f.role.needs_manager() { manager_of(app, key.as_deref()) } else { None };
+            let worktree = (f.isolation == launch::Isolation::Worktree).then(|| nombre.clone());
+            let model = (f.model != launch::DEFAULT_MODEL).then(|| f.model.clone());
+            let cmd = f.agent.command_with(&login_shell(), model.as_deref());
+            let workspace = key.filter(|k| !k.is_empty());
+            let req = launch::agent_request(&nombre, cmd, &cwd, workspace, manager, worktree, rows, cols);
+            app.roles.insert(nombre, f.role.label().to_string());
+            app.agent_form = None;
+            spawn_task(app, req)
+        }
         Message::OpenNewNamedWorkspace => {
             app.new_ws = Some(String::new());
             app.new_ws_explicit = true;
@@ -1836,7 +1967,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                                 app.layouts.by_key.insert(k, ws);
                             }
                         }
+                        if let Some(v) = app.prefs_path.as_ref().and_then(|p| prefs::get(p, "agent_roles")) {
+                            app.roles = v.as_object().into_iter().flatten().filter_map(|(n, r)| Some((n.clone(), r.as_str()?.to_string()))).collect();
+                        }
                     }
+                    // Los roles de paneles que ya no existen se olvidan.
+                    app.roles.retain(|n, _| app.panes.iter().any(|p| &p.name == n) || app.inflight.contains(n));
                     // Abrir la app ya es un terminal: si el daemon no tiene paneles, un shell en ~ (la bienvenida queda
                     // solo para cuando no se puede crear el panel).
                     if !app.started {
@@ -2397,6 +2533,7 @@ fn view(app: &App) -> Element<'_, Message> {
         Body::Palette => chrome::floating(base, chrome::palette_panel(app), 600.0, Message::ClosePalette),
         Body::NewWorkspace => chrome::floating(base, chrome::new_workspace_panel(app), 560.0, Message::CloseNewWorkspace),
         Body::Launcher => chrome::floating(base, chrome::launcher_panel(app), 440.0, Message::CloseLauncher),
+        Body::AgentForm => chrome::floating(base, chrome::agent_form_panel(app), 480.0, Message::CloseAgentForm),
         Body::Form => match &app.form {
             Some(f) => chrome::floating(base, chrome::form_panel(app, f), 460.0, Message::CancelForm),
             None => base,
@@ -2902,6 +3039,29 @@ mod tests {
         let _ = update(&mut nueva, Message::CloseWorkspace("nexo".into()));
         assert!(!nueva.explicit.contains_key("nexo"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// «+ Agente…»: el rol por defecto depende de si ya hay un manager; un nombre inválido no lanza nada; un worker se
+    /// enlaza al manager del workspace y su rol queda guardado con el nombre del panel.
+    #[test]
+    fn agente_se_agrega_con_rol_y_manager() {
+        let mut app = App::default();
+        let mut jefe = pane_info(1, "jefe", Status::Idle);
+        jefe.workspace = Some("ws".into());
+        app.panes = vec![jefe];
+        app.roles.insert("jefe".into(), "manager".into());
+        app.layouts.sync(&pane_keys(&app));
+        app.selected = Some(1);
+        let _ = update(&mut app, Message::OpenAgentForm);
+        assert_eq!(app.agent_form.as_ref().map(|f| f.role), Some(launch::Role::Worker), "ya hay manager: el rol por defecto es worker");
+        let _ = update(&mut app, Message::AgentFormName("con espacio".into()));
+        let _ = update(&mut app, Message::AgentFormSubmit);
+        assert!(app.agent_form.as_ref().is_some_and(|f| f.error.is_some()), "un nombre inválido no se envía");
+        let _ = update(&mut app, Message::AgentFormName("rev".into()));
+        let _ = update(&mut app, Message::AgentFormSubmit);
+        assert!(app.agent_form.is_none(), "un nombre válido cierra el formulario");
+        assert_eq!(app.roles.get("rev").map(String::as_str), Some("worker"));
+        assert_eq!(manager_of(&app, Some("ws")).as_deref(), Some("jefe"));
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la

@@ -147,3 +147,136 @@ mod tests {
         }
     }
 }
+
+/// Rol de un agente dentro de su workspace. El manager recibe los resultados de los demás; un worker o un revisor
+/// trabaja para un manager; un agente libre no tiene relación con ninguno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Manager,
+    Worker,
+    Reviewer,
+    Libre,
+}
+
+impl Role {
+    pub const ALL: [Role; 4] = [Role::Manager, Role::Worker, Role::Reviewer, Role::Libre];
+
+    /// Nombre estable (se guarda en las preferencias y en `team.toml`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Manager => "manager",
+            Role::Worker => "worker",
+            Role::Reviewer => "reviewer",
+            Role::Libre => "libre",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Role> {
+        Role::ALL.into_iter().find(|r| r.label() == text)
+    }
+
+    /// Un rol que trabaja para un manager (y por tanto necesita uno).
+    pub fn needs_manager(self) -> bool {
+        matches!(self, Role::Worker | Role::Reviewer)
+    }
+}
+
+/// Dónde trabaja un agente: en la carpeta del workspace, o en un worktree propio con su rama.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Isolation {
+    Shared,
+    Worktree,
+}
+
+impl Isolation {
+    pub const ALL: [Isolation; 2] = [Isolation::Shared, Isolation::Worktree];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Isolation::Shared => "misma carpeta",
+            Isolation::Worktree => "worktree propio",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Isolation> {
+        match text {
+            "shared" => Some(Isolation::Shared),
+            "worktree" => Some(Isolation::Worktree),
+            _ => None,
+        }
+    }
+}
+
+/// Nombre que puede dar un agente: letras, cifras, `-` y `_`, de 1 a 32 caracteres. Es también la rama del worktree.
+pub fn valid_agent_name(name: &str) -> bool {
+    (1..=32).contains(&name.chars().count()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Petición `Spawn` de un agente con rol y aislamiento: `manager` recibe sus resultados; con `worktree`, el daemon
+/// crea la rama de ese nombre y arranca el panel dentro.
+#[allow(clippy::too_many_arguments)]
+pub fn agent_request(
+    name: &str,
+    cmd: Vec<String>,
+    cwd: &str,
+    workspace: Option<String>,
+    manager: Option<String>,
+    worktree: Option<String>,
+    rows: u16,
+    cols: u16,
+) -> Request {
+    Request::Spawn {
+        name: name.to_string(),
+        cmd,
+        cwd: Some(cwd.to_string()),
+        manager,
+        inject: false,
+        rows,
+        cols,
+        workspace,
+        worktree,
+    }
+}
+
+#[cfg(test)]
+mod agente_tests {
+    use super::*;
+
+    /// Rol y aislamiento: nombres estables que van y vuelven; un valor desconocido no entra.
+    #[test]
+    fn roles_y_aislamiento_con_nombres_estables() {
+        for r in Role::ALL {
+            assert_eq!(Role::parse(r.label()), Some(r));
+        }
+        assert_eq!(Role::parse("jefe"), None);
+        assert!(Role::Worker.needs_manager() && Role::Reviewer.needs_manager());
+        assert!(!Role::Manager.needs_manager() && !Role::Libre.needs_manager());
+        assert_eq!(Isolation::parse("worktree"), Some(Isolation::Worktree));
+        assert_eq!(Isolation::parse("root"), None);
+    }
+
+    /// Nombres de agente: solo letras, cifras, `-` y `_`; vacío o con espacios o símbolos, no.
+    #[test]
+    fn nombres_de_agente_acotados() {
+        assert!(valid_agent_name("claude-manager_2"));
+        assert!(!valid_agent_name(""));
+        assert!(!valid_agent_name("con espacio"));
+        assert!(!valid_agent_name("a;rm -rf"));
+        assert!(!valid_agent_name(&"x".repeat(33)));
+    }
+
+    /// La petición lleva el manager y el worktree tal cual.
+    #[test]
+    fn la_peticion_lleva_manager_y_worktree() {
+        let r = agent_request("rev", vec!["claude".into()], "/tmp/x", Some("ws".into()), Some("jefe".into()), Some("rev".into()), 40, 140);
+        match r {
+            Request::Spawn { name, manager, worktree, workspace, .. } => {
+                assert_eq!(name, "rev");
+                assert_eq!(manager.as_deref(), Some("jefe"));
+                assert_eq!(worktree.as_deref(), Some("rev"));
+                assert_eq!(workspace.as_deref(), Some("ws"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
