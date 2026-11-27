@@ -318,6 +318,8 @@ struct App {
     cierres_pedidos: std::collections::HashSet<u32>,
     /// El usuario cerró el último panel (o su shell terminó): al vaciarse el listado se cierra la ventana.
     salir_al_vaciar: bool,
+    /// Se cerró el último panel: la ventana sale solo si el Kill responde `removed` (revisión 20, A2).
+    cierre_ultimo: bool,
     /// Cuotas por agente del daemon, y el último error si no se pudieron leer.
     limits: Vec<Limits>,
     limits_error: Option<String>,
@@ -1700,6 +1702,8 @@ fn shells_terminados(panes: &[PaneInfo]) -> Vec<u32> {
     panes
         .iter()
         .filter(|p| p.status == Status::Exited && !p.agent && !p.hooked && p.unacked == 0)
+        // Un shell lanzado con `-c` (o `-lc`, `-ic`) ejecuta un comando: al acabar, su salida se queda para leerla.
+        .filter(|p| !p.cmd.iter().skip(1).any(|a| a == "-c" || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))))
         .filter(|p| p.cmd.first().and_then(|c| std::path::Path::new(c).file_name()).and_then(|n| n.to_str()).is_some_and(|n| SHELLS.contains(&n)))
         .filter(|p| !panes.iter().any(|o| o.manager.as_deref() == Some(p.name.as_str())))
         .map(|p| p.id)
@@ -2681,14 +2685,18 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                             app.selected = Some(id);
                         }
                     }
+                    // A2: cualquier listado con paneles desarma la salida: otra pestaña abierta mientras tanto cuenta.
+                    if !app.panes.is_empty() {
+                        app.salir_al_vaciar = false;
+                    }
                     // Como en cualquier terminal: cerrar la última pestaña cierra la ventana.
                     if app.salir_al_vaciar && app.panes.is_empty() {
                         restaurar = Task::batch([restaurar, iced::exit()]);
                     }
                     for id in shells_terminados(&app.panes) {
-                        app.salir_al_vaciar |= app.panes.len() == 1;
+                        app.cierre_ultimo |= app.panes.len() == 1;
                         if app.cierres_pedidos.insert(id) {
-                            restaurar = Task::batch([restaurar, send_request(Request::Kill { pane: id.to_string(), remove: true }, |_| Message::Echo)]);
+                            restaurar = Task::batch([restaurar, send_request(Request::Kill { pane: id.to_string(), remove: true }, Message::Killed)]);
                         }
                     }
                     let alerts = app.attention.observe(&app.panes, app.selected);
@@ -3136,7 +3144,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ConfirmClose => {
             app.confirm_close = false;
-            app.salir_al_vaciar = app.panes.len() == 1 && app.selected.is_some();
+            app.cierre_ultimo = app.panes.len() == 1 && app.selected.is_some();
             // M1: el foco se decide antes de cerrar, mientras el panel y su hermano aún están en el layout.
             app.pending_focus = app.selected.and_then(|id| successor(app, id));
             match app.selected {
@@ -3144,8 +3152,13 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 None => Task::none(),
             }
         }
-        Message::Killed(Ok(_)) => load_panes(),
+        // A2 (revisión 20): la ventana solo sale si el panel se quitó de verdad (`removed`), no si el Kill no hizo nada.
+        Message::Killed(Ok(v)) => {
+            app.salir_al_vaciar = std::mem::take(&mut app.cierre_ultimo) && v.get("removed").is_some();
+            load_panes()
+        }
         Message::Killed(Err(e)) => {
+            app.cierre_ultimo = false;
             app.error = Some(e);
             load_panes()
         }
@@ -4570,15 +4583,36 @@ mod tests {
         assert_eq!(shells_terminados(&[shell, agente, build, vivo]), vec![1]);
     }
 
+    /// Un shell lanzado con `-c` ejecuta un comando: no se cierra solo al acabar, para que su salida quede a la vista.
+    #[test]
+    fn un_shell_con_c_no_se_cierra_solo() {
+        let mut con_c = pane_info(1, "c", Status::Exited);
+        con_c.cmd = vec!["bash".into(), "-c".into(), "cargo test".into()];
+        let mut lc = pane_info(2, "l", Status::Exited);
+        lc.cmd = vec!["zsh".into(), "-lc".into(), "make".into()];
+        let mut login = pane_info(3, "g", Status::Exited);
+        login.cmd = vec!["zsh".into(), "--login".into()];
+        assert_eq!(shells_terminados(&[con_c, lc, login]), vec![3]);
+    }
+
     /// Cerrar la última pestaña marca la ventana para salir; con otra abierta, no.
     #[test]
     fn cerrar_la_ultima_pestana_cierra_la_ventana() {
         let mut app = App { panes: vec![pane_info(1, "a", Status::Exited), pane_info(2, "b", Status::Idle)], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::ConfirmClose);
+        let _ = update(&mut app, Message::Killed(Ok(serde_json::json!({ "removed": "a" }))));
         assert!(!app.salir_al_vaciar);
         let mut app = App { panes: vec![pane_info(1, "a", Status::Exited)], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::ConfirmClose);
+        // A2: sin `removed` (el Kill no quitó el panel) la ventana no sale.
+        let _ = update(&mut app, Message::Killed(Ok(serde_json::json!({}))));
+        assert!(!app.salir_al_vaciar);
+        let _ = update(&mut app, Message::ConfirmClose);
+        let _ = update(&mut app, Message::Killed(Ok(serde_json::json!({ "removed": "a" }))));
         assert!(app.salir_al_vaciar);
+        // Un listado con paneles lo desarma (otra pestaña abierta antes del siguiente listado).
+        let _ = update(&mut app, Message::Panes(Ok(vec![pane_info(2, "b", Status::Idle)])));
+        assert!(!app.salir_al_vaciar);
     }
 
     /// Un clic que un widget de texto capturó sigue llegando al terminal (foco de split y selección).
