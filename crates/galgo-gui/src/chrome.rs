@@ -386,6 +386,12 @@ pub fn layout_view(app: &App) -> Element<'_, Message> {
     }
 }
 
+/// Un panel sin pantalla todavía: fondo del terminal, sin texto de espera. Pasa en una vuelta de milisegundos
+/// (la del primer snapshot), y un texto ahí solo parpadea.
+fn vacio_terminal<'a>() -> Element<'a, Message> {
+    container(Space::new(Length::Fill, Length::Fill)).style(theme::surface(theme::TERM_BG)).into()
+}
+
 fn placeholder<'a>(msg: &'a str) -> Element<'a, Message> {
     container(text(msg).size(theme::BODY_SIZE).color(theme::DIM)).center(Length::Fill).into()
 }
@@ -454,12 +460,12 @@ fn leaf_view(app: &App, id: u32, split: bool) -> Element<'_, Message> {
                 let resaltes = resaltes_de(app, snap);
                 lazy(key, move |_| screen_view(snap, sel, style, &resaltes)).into()
             }
-            None => placeholder("Esperando salida…"),
+            None => vacio_terminal(),
         }
     } else {
         match app.others.get(&id) {
             Some(snap) => screen_view(snap, None, CursorStyle::Off, &[]),
-            None => placeholder("Esperando salida…"),
+            None => vacio_terminal(),
         }
     };
     // Con la búsqueda abierta en este panel, su barra va encima, arriba a la derecha.

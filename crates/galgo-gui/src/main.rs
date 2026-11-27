@@ -361,7 +361,6 @@ struct App {
     others: std::collections::HashMap<u32, Snapshot>,
     others_gen: std::collections::HashMap<u32, u64>,
     others_loading: std::collections::HashSet<u32>,
-    others_cursor: usize,
     /// Foco que toma el hermano o la pestaña vecina al cerrar el panel enfocado (M1).
     pending_focus: Option<u32>,
     /// Panel maximizado dentro de su split (⌘⇧Enter): ocupa toda el área y los demás se ocultan.
@@ -976,17 +975,24 @@ fn cwd_nuevo(app: &App) -> String {
     focus_context(app).1.unwrap_or_else(home_dir)
 }
 
-/// Siguiente panel visible sin el foco que hay que sondear, por turnos. `None` si no hay ninguno libre.
-fn next_other(app: &mut App) -> Option<u32> {
-    let key = focus_key(app)?;
-    let ids = app.layouts.active_tab(&key)?.root.ids();
-    let others: Vec<u32> = ids.into_iter().filter(|id| Some(*id) != app.selected && !app.others_loading.contains(id)).collect();
-    if others.is_empty() {
-        return None;
-    }
-    let id = others[app.others_cursor % others.len()];
-    app.others_cursor = app.others_cursor.wrapping_add(1);
-    Some(id)
+/// Paneles visibles sin el foco que no tienen una petición en vuelo. Todos a la vez: cada snapshot cuesta una fracción
+/// de milisegundo, y así cambiar a uno no muestra una pantalla vieja ni un estado de espera (antes se sondeaba uno por tick).
+fn otros_visibles(app: &App) -> Vec<u32> {
+    let Some(key) = focus_key(app) else { return Vec::new() };
+    let Some(tab) = app.layouts.active_tab(&key) else { return Vec::new() };
+    tab.root.ids().into_iter().filter(|id| Some(*id) != app.selected && !app.others_loading.contains(id)).collect()
+}
+
+/// Pide la pantalla de cada panel visible sin el foco que no esté ya pidiéndose.
+fn cargar_otros(app: &mut App, ids: Vec<u32>) -> Task<Message> {
+    let tareas: Vec<Task<Message>> = ids
+        .into_iter()
+        .map(|id| {
+            app.others_loading.insert(id);
+            load_other(id, app.others_gen.get(&id).copied())
+        })
+        .collect();
+    Task::batch(tareas)
 }
 
 /// Pide la pantalla de un panel visible sin el foco: desplazamiento 0, con «lo que cambió» si ya tenemos una.
@@ -1311,6 +1317,8 @@ fn select(app: &mut App, id: u32) -> Task<Message> {
     clear_selection(app);
     app.attention.mark_read(id);
     if app.loading {
+        // Hay una carga en vuelo (de otro panel): al llegar, se pide la pantalla de este.
+        app.refresh_wanted = true;
         Task::none()
     } else {
         app.loading = true;
@@ -2137,13 +2145,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 _ => Task::none(),
             };
             // Un panel visible sin el foco se sondea por turnos: uno por tick, sin tocar su tamaño.
-            let other_task = match next_other(app) {
-                Some(id) => {
-                    app.others_loading.insert(id);
-                    load_other(id, app.others_gen.get(&id).copied())
-                }
-                None => Task::none(),
-            };
+            let ids = otros_visibles(app);
+            let other_task = cargar_otros(app, ids);
             Task::batch([focus_task, other_task])
         }
         Message::OtherScreen(id, result) => {
@@ -2735,7 +2738,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
             // `restaurar` lleva los relanzamientos de los paneles que faltan: debe ejecutarse (M3).
-            Task::batch([arranque.unwrap_or_else(Task::none), envios, restaurar])
+            // Un panel recién aparecido (p. ej. un split) se pide ya: no se pinta vacío hasta el siguiente tick.
+            let ids: Vec<u32> = otros_visibles(app).into_iter().filter(|id| !app.others.contains_key(id)).collect();
+            let nuevos = cargar_otros(app, ids);
+            Task::batch([arranque.unwrap_or_else(Task::none), envios, restaurar, nuevos])
         }
         Message::Screen(id, offset, sent_since, result) => {
             app.loading = false;
@@ -2991,6 +2997,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 mouse::ScrollDelta::Lines { y, .. } => y,
                 mouse::ScrollDelta::Pixels { y, .. } => y / line_h(),
             };
+            // Una muesca de rueda salta WHEEL_LINES; el trackpad (píxeles) avanza las líneas que mide, sin ese salto.
+            let escala = if matches!(delta, mouse::ScrollDelta::Pixels { .. }) { 1 } else { WHEEL_LINES };
             // Un trackpad envía fracciones de línea: se acumulan hasta sumar un paso completo.
             app.wheel_acc += lines;
             let steps = app.wheel_acc.trunc() as i32;
@@ -3014,7 +3022,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             if steps != 0 {
                 let max = app.snap.as_ref().map_or(0, |s| s.scrollback_max) as i32;
-                let next = (app.scroll as i32 + steps * WHEEL_LINES).clamp(0, max);
+                let next = (app.scroll as i32 + steps * escala).clamp(0, max);
                 if next as u16 != app.scroll {
                     app.scroll = next as u16;
                     clear_selection(app);
@@ -4644,6 +4652,17 @@ mod tests {
         let _ = vista;
     }
 
+    /// Si se enfoca otro panel mientras hay una carga en vuelo, la pantalla del nuevo se pide al llegar la otra
+    /// (antes se perdía y el panel se quedaba sin contenido hasta que cambiara su salida).
+    #[test]
+    fn enfocar_con_una_carga_en_vuelo_repite_la_del_nuevo() {
+        let mut app = App { panes: vec![pane_info(1, "a", Status::Idle), pane_info(2, "b", Status::Idle)], selected: Some(1), ..Default::default() };
+        app.loading = true;
+        let _ = select(&mut app, 2);
+        assert!(app.refresh_wanted, "la carga del panel nuevo queda pendiente");
+        assert_eq!(app.selected, Some(2));
+    }
+
     /// `exit` en un shell cierra su pestaña; un agente o un comando terminado se quedan para leerlos.
     #[test]
     fn un_shell_que_termina_solo_se_cierra() {
@@ -4826,7 +4845,7 @@ mod tests {
         assert!(rows > 5);
     }
 
-    /// E: las pantallas de los paneles visibles sin foco se sondean por turnos, y la respuesta se guarda.
+    /// E: las pantallas de los paneles visibles sin foco se sondean, y la respuesta se guarda.
     #[test]
     fn paneles_visibles_se_sondean_por_turnos() {
         let mut app = App { panes: vec![pane_info(1, "a", Status::Idle)], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
@@ -4834,11 +4853,10 @@ mod tests {
         app.layouts.split(1, true, 2);
         app.panes.push(pane_info(2, "b", Status::Idle));
         app.layouts.sync_nombrado(&pane_nombres(&app));
-        let first = next_other(&mut app);
-        assert_eq!(first, Some(2), "el único sin foco");
+        assert_eq!(otros_visibles(&app), vec![2], "el único sin foco");
         // Como en el tick: mientras su respuesta no llega, no se vuelve a pedir.
         app.others_loading.insert(2);
-        assert_eq!(next_other(&mut app), None);
+        assert!(otros_visibles(&app).is_empty());
         let _ = update(&mut app, Message::OtherScreen(2, Ok(ScreenReply::Full(snap(&["hola"], 20)))));
         assert!(app.others.contains_key(&2));
         assert!(!app.others_loading.contains(&2));
