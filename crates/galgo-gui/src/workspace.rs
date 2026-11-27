@@ -21,6 +21,47 @@ pub fn tree_to_json(node: &Node, nombre: &dyn Fn(u32) -> Option<String>) -> Opti
     }
 }
 
+/// Nombres de paneles que referencia una disposición guardada (sus hojas, en todas las pestañas y workspaces).
+pub fn nombres(v: &Value) -> Vec<String> {
+    fn de(t: &Value, out: &mut Vec<String>) {
+        if let Some(n) = t.get("leaf").and_then(Value::as_str) {
+            out.push(n.to_string());
+        }
+        if let Some(s) = t.get("split") {
+            for k in ["a", "b"] {
+                if let Some(x) = s.get(k) {
+                    de(x, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for ws in v.get("workspaces").and_then(Value::as_array).into_iter().flatten() {
+        for t in ws.get("tabs").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(tree) = t.get("tree") {
+                de(tree, &mut out);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Metadatos de los paneles guardados junto a la disposición: nombre → (cwd, workspace). Sirven para relanzar un
+/// shell nuevo, en su carpeta, cuando su panel no vuelve tras un reinicio (M3).
+pub type MetaPaneles = BTreeMap<String, (Option<String>, Option<String>)>;
+
+pub fn metadatos(v: &Value) -> MetaPaneles {
+    let mut out = MetaPaneles::new();
+    for (nombre, m) in v.get("panes").and_then(Value::as_object).into_iter().flatten() {
+        let cwd = m.get("cwd").and_then(Value::as_str).map(str::to_string);
+        let ws = m.get("workspace").and_then(Value::as_str).map(str::to_string);
+        out.insert(nombre.clone(), (cwd, ws));
+    }
+    out
+}
+
 /// Árbol desde JSON, resolviendo cada nombre con `id_de`. Una hoja que no existe se quita; un split con un lado
 /// vacío se queda con el otro. Cualquier forma inesperada da `None`.
 pub fn json_to_tree(v: &Value, id_de: &dyn Fn(&str) -> Option<u32>) -> Option<Node> {
@@ -111,6 +152,23 @@ pub fn restore(v: &Value, id_de: &dyn Fn(&str) -> Option<u32>) -> Restored {
         out.by_key.insert(key.to_string(), WsTabs { tabs, active });
     }
     out
+}
+
+#[cfg(test)]
+mod tests_m3 {
+    use super::*;
+
+    #[test]
+    fn nombres_y_metadatos_de_una_disposicion() {
+        let v = json!({
+            "workspaces": [{ "key": "nexo", "tabs": [{ "focus": "a", "tree": { "split": { "v": true, "r": 0.5, "a": { "leaf": "a" }, "b": { "leaf": "b" } } } }] }],
+            "panes": { "a": { "cwd": "/x", "workspace": "nexo/main" }, "b": { "cwd": "/y" } }
+        });
+        assert_eq!(nombres(&v), vec!["a".to_string(), "b".to_string()]);
+        let m = metadatos(&v);
+        assert_eq!(m["a"], (Some("/x".to_string()), Some("nexo/main".to_string())));
+        assert_eq!(m["b"], (Some("/y".to_string()), None));
+    }
 }
 
 #[cfg(test)]

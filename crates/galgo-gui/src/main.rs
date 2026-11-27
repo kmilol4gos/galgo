@@ -253,6 +253,12 @@ struct App {
     ws_restored: bool,
     /// Último estado de workspaces escrito en disco (para no escribir si no cambió).
     ws_saved: String,
+    /// Disposición guardada aún no aplicada: se espera a que vuelvan (o se relancen) sus paneles (M3).
+    ws_pendiente: Option<serde_json::Value>,
+    /// Listados recibidos mientras se espera la disposición.
+    ws_intentos: u32,
+    /// Cwd y workspace de cada panel conocido: para relanzar su shell, en su carpeta, tras un reinicio (M3).
+    pane_meta: workspace::MetaPaneles,
     /// Cerrar un workspace pide dos clics: el primero deja aquí su clave.
     ws_close_armed: Option<String>,
     /// Cuándo se armó el cierre: pasados unos segundos, el primer clic vuelve a contar como aviso.
@@ -1573,12 +1579,75 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 
 /// Guarda pestañas, splits y grupos explícitos cuando cambian. Solo después de restaurar, y con los nombres de los
 /// paneles reales (un panel sin nombre conocido sale de su árbol).
+/// Aplica la disposición guardada (M3). Al primer listado, los nombres que faltan (paneles que no volvieron tras
+/// `galgo stop`) se relanzan como shells nuevos en su carpeta. La disposición se aplica cuando todos sus paneles
+/// existen, o tras unos segundos de espera; mientras, no se guarda nada (un listado incompleto borraría la disposición).
+fn intentar_restaurar(app: &mut App) -> Task<Message> {
+    if app.ws_restored {
+        return Task::none();
+    }
+    if app.ws_pendiente.is_none() {
+        let Some(v) = app.prefs_path.as_ref().and_then(|p| prefs::get(p, "workspaces")) else {
+            app.ws_restored = true;
+            return Task::none();
+        };
+        app.pane_meta = workspace::metadatos(&v);
+        app.ws_pendiente = Some(v);
+    }
+    let v = app.ws_pendiente.clone().unwrap_or(serde_json::Value::Null);
+    let presentes: std::collections::HashSet<&str> = app.panes.iter().map(|p| p.name.as_str()).collect();
+    let faltan: Vec<String> = workspace::nombres(&v).into_iter().filter(|n| !presentes.contains(n.as_str())).collect();
+    let mut tareas = Vec::new();
+    if app.ws_intentos == 0 {
+        // Un shell nuevo para cada panel que no volvió, en su carpeta (si se conoce).
+        for nombre in &faltan {
+            let Some(cwd) = app.pane_meta.get(nombre).and_then(|(c, _)| c.clone()) else { continue };
+            let req = launch::shell_request(nombre, &login_shell(), &cwd, None, 40, 140);
+            tareas.push(Task::perform(async move { tokio::task::spawn_blocking(move || request(req)).await.ok(); }, |_| Message::Echo));
+        }
+    }
+    app.ws_intentos += 1;
+    if !faltan.is_empty() && app.ws_intentos < WS_ESPERA_LISTADOS {
+        return Task::batch(tareas);
+    }
+    let ids: std::collections::HashMap<String, u32> = app.panes.iter().map(|p| (p.name.clone(), p.id)).collect();
+    let r = workspace::restore(&v, &|n| ids.get(n).copied());
+    app.explicit = r.explicit;
+    for (k, ws) in r.by_key {
+        app.layouts.by_key.insert(k, ws);
+    }
+    app.ws_pendiente = None;
+    app.ws_restored = true;
+    Task::batch(tareas)
+}
+
+/// Listados (cada ~1 s) que se esperan a que vuelvan los paneles de la disposición antes de aplicarla.
+const WS_ESPERA_LISTADOS: u32 = 15;
+
 fn persist_workspaces(app: &mut App) {
     if !app.ws_restored || !app.started {
         return;
     }
     let nombres: std::collections::HashMap<u32, String> = app.panes.iter().map(|p| (p.id, p.name.clone())).collect();
-    let v = workspace::snapshot(&app.layouts.by_key, &app.explicit, &|id| nombres.get(&id).cloned());
+    let mut v = workspace::snapshot(&app.layouts.by_key, &app.explicit, &|id| nombres.get(&id).cloned());
+    // M3: el cwd y el workspace de cada panel viven junto a la disposición. Los que no están ahora se conservan.
+    for p in &app.panes {
+        app.pane_meta.insert(p.name.clone(), (p.cwd.clone(), p.workspace.clone()));
+    }
+    while app.pane_meta.len() > 200 {
+        let primero = app.pane_meta.keys().next().cloned();
+        if let Some(k) = primero {
+            app.pane_meta.remove(&k);
+        }
+    }
+    if let Some(obj) = v.as_object_mut() {
+        let panes: serde_json::Map<String, serde_json::Value> = app
+            .pane_meta
+            .iter()
+            .map(|(n, (cwd, ws))| (n.clone(), serde_json::json!({ "cwd": cwd, "workspace": ws })))
+            .collect();
+        obj.insert("panes".into(), serde_json::Value::Object(panes));
+    }
     let texto = v.to_string();
     if texto != app.ws_saved {
         if let Some(path) = &app.prefs_path {
@@ -2254,16 +2323,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.error = None;
                     app.panes = panes;
                     // Primer listado: se restauran los workspaces guardados (pestañas, splits y grupos explícitos).
+                    let restaurar = intentar_restaurar(app);
                     if !app.ws_restored {
-                        app.ws_restored = true;
-                        if let Some(v) = app.prefs_path.as_ref().and_then(|p| prefs::get(p, "workspaces")) {
-                            let ids: std::collections::HashMap<String, u32> = app.panes.iter().map(|p| (p.name.clone(), p.id)).collect();
-                            let r = workspace::restore(&v, &|n| ids.get(n).copied());
-                            app.explicit = r.explicit;
-                            for (k, ws) in r.by_key {
-                                app.layouts.by_key.insert(k, ws);
-                            }
-                        }
                         if let Some(v) = app.prefs_path.as_ref().and_then(|p| prefs::get(p, "agent_roles")) {
                             app.roles = v.as_object().into_iter().flatten().filter_map(|(n, r)| Some((n.clone(), r.as_str()?.to_string()))).collect();
                         }
@@ -3289,6 +3350,36 @@ mod tests {
         assert!(shortcut(&Key::Character("o".into()), keyboard::Modifiers::COMMAND).is_none());
         assert!(shortcut(&Key::Character("n".into()), keyboard::Modifiers::COMMAND).is_none());
         assert!(matches!(shortcut(&Key::Character("N".into()), keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenNewNamedWorkspace)));
+    }
+
+    /// M3: tras un reinicio, la disposición espera a sus paneles; el que no vuelve se relanza en su carpeta, y nada se
+    /// guarda hasta que la disposición está aplicada (un listado incompleto no la borra).
+    #[test]
+    fn la_disposicion_espera_a_sus_paneles() {
+        let dir = std::env::temp_dir().join(format!("galgo-m3-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prefs_path = dir.join("gui-prefs.json");
+        let _ = std::fs::remove_file(&prefs_path);
+        let v = serde_json::json!({
+            "workspaces": [{ "key": "nexo", "explicit": false, "folder": null, "active": 0, "tabs": [{
+                "focus": "shell",
+                "tree": { "split": { "v": true, "r": 0.5, "a": { "leaf": "shell" }, "b": { "leaf": "claude" } } }
+            }] }],
+            "panes": { "claude": { "cwd": "/tmp", "workspace": "nexo" } }
+        });
+        prefs::set(&prefs_path, "workspaces", v).expect("se escribe la disposición");
+        let mut app = App { prefs_path: Some(prefs_path.clone()), ..Default::default() };
+        let en_nexo = |id: u32, name: &str| {
+            let mut p = pane_info(id, name, Status::Idle);
+            p.workspace = Some("nexo".into());
+            p
+        };
+        let _ = update(&mut app, Message::Panes(Ok(vec![en_nexo(1, "shell")])));
+        assert!(!app.ws_restored && app.ws_pendiente.is_some(), "espera a claude");
+        assert!(app.layouts.by_key.get("nexo").map_or(true, |w| w.tabs[0].root.ids().len() < 2), "el split no se aplica a medias");
+        let _ = update(&mut app, Message::Panes(Ok(vec![en_nexo(1, "shell"), en_nexo(2, "claude")])));
+        assert!(app.ws_restored && app.ws_pendiente.is_none());
+        assert_eq!(app.layouts.by_key.get("nexo").expect("la pestaña vuelve").tabs[0].root.ids().len(), 2);
     }
 
     #[test]

@@ -83,6 +83,7 @@ pub fn spawn_request(name: &str, cmd: Vec<String>, cwd: &str, workspace: Option<
         cols,
         workspace,
         worktree: None,
+        orquestador: false,
     }
 }
 
@@ -235,6 +236,7 @@ pub fn agent_request(
         cols,
         workspace,
         worktree,
+        orquestador: false,
     }
 }
 
