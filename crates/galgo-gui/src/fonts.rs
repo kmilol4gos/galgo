@@ -65,6 +65,11 @@ pub fn set_current(family: &'static str) {
     }
 }
 
+/// Una Nerd Font trae sus propios iconos y separadores, con el avance de una celda: no hace falta fallback.
+pub fn is_nerd(family: &str) -> bool {
+    family.contains("Nerd Font")
+}
+
 /// Archivo de la familia dentro de `dirs` (el de su prefijo, con preferencia por el Regular).
 pub fn file_for(family: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let prefijo = CANDIDATES.iter().find(|(f, _)| *f == family)?.1;
@@ -148,6 +153,13 @@ mod tests {
             assert!((cell - 0.602).abs() < 0.01, "ancho de celda {cell}");
             assert!(line > 1.0 && line < 1.6, "alto de línea {line}");
         }
+    }
+
+    /// Una Nerd Font trae sus iconos con el avance de una celda; Menlo no, y necesita el fallback escalado.
+    #[test]
+    fn nerd_font_no_necesita_fallback() {
+        assert!(is_nerd("MesloLGLDZ Nerd Font Mono"));
+        assert!(!is_nerd("Menlo"));
     }
 
     /// La elección se guarda y se vuelve a leer; una elección "automática" vuelve a null.

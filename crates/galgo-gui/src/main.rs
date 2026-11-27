@@ -767,8 +767,14 @@ fn terminal_area(window: (f32, f32), extra_top: f32, extra_bottom: f32) -> layou
 }
 
 /// Cuadrícula de texto que cabe en un rectángulo de panel (con su margen interior).
+/// Columnas de margen a la derecha. Un glifo de una fuente de fallback puede medir un poco más que la celda y
+/// la línea del terminal, sin este margen, se parte en dos (el prompt de p10k deja la hora en la fila siguiente).
+/// El daemon recibe ese número de columnas, así que el shell dibuja su prompt dentro del margen.
+const COLS_MARGIN: u16 = 2;
+
 fn grid_in(rect: layout::Rect) -> (u16, u16) {
-    (((rect.h - 2.0 * LEAF_PAD) / line_h()).floor().max(5.0) as u16, ((rect.w - 2.0 * LEAF_PAD) / cell_w()).floor().max(20.0) as u16)
+    let cols = ((rect.w - 2.0 * LEAF_PAD) / cell_w()).floor().max(20.0) as u16;
+    (((rect.h - 2.0 * LEAF_PAD) / line_h()).floor().max(5.0) as u16, cols.saturating_sub(COLS_MARGIN).max(20))
 }
 
 /// Cuadrícula de la ventana entera (un panel nuevo sin split).
@@ -1858,8 +1864,10 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
     }
     let mut sp: Span<'static, Message> = span(text).color(fg.unwrap_or(term::DEFAULT_FG)).underline(r.underline);
     if let Some(b) = bg { sp = sp.background(b); }
-    if symbol {
-        sp = sp.font(Font::with_name(SYMBOLS_FAMILY));
+    if symbol && !fonts::is_nerd(fonts::current()) {
+        // La fuente de símbolos mide 1 em por glifo; la celda, `metrics().0` em. Se escala para que cada glifo
+        // ocupe exactamente una celda: si no, la fila se desborda y el prompt se parte.
+        sp = sp.font(Font::with_name(SYMBOLS_FAMILY)).size(font_size() * fonts::metrics().0);
     } else if r.bold || r.italic {
         sp = sp.font(Font {
             weight: if r.bold { font::Weight::Bold } else { font::Weight::Normal },
@@ -3038,6 +3046,27 @@ mod render {
         }
     }
 
+    /// Render de un snapshot real volcado por el daemon (`GALGO_SNAP`), con cada fuente de terminal.
+    #[test]
+    #[ignore]
+    fn render_snapshot_real() {
+        let Ok(ruta) = std::env::var("GALGO_SNAP") else { return };
+        let dir = std::path::PathBuf::from(std::env::var("GALGO_UX_DIR").unwrap_or_else(|_| "/tmp/galgo-ux".into()));
+        let snap: Snapshot = serde_json::from_str(&std::fs::read_to_string(ruta).unwrap()).unwrap();
+        let cols = snap.cols as f32;
+        // Como en la app: la fuente de símbolos se carga al arrancar.
+        iced_graphics::text::font_system().write().unwrap().load_font(std::borrow::Cow::Borrowed(SYMBOLS_FONT));
+        for familia in ["Menlo", "MesloLGLDZ Nerd Font Mono"] {
+            let nombre: &'static str = fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == familia).unwrap_or("Menlo");
+            fonts::set_current(nombre);
+            let mut app = App { window: ((cols + COLS_MARGIN as f32) * cell_w() + 2.0 * LEAF_PAD + SIDEBAR_W, 240.0), panes: vec![pane_info(1, "shell", Status::Idle)], selected: Some(1), snap: Some(snap.clone()), ..Default::default() };
+            app.layouts.sync(&pane_keys(&app));
+            let archivo = format!("snap-{}.png", familia.replace(' ', "_"));
+            render(&app, (app.window.0 as u32, 240), &dir.join(archivo));
+        }
+        fonts::set_current("Menlo");
+    }
+
     /// Render del prompt p10k con cada fuente disponible (para comparar a ojo).
     #[test]
     #[ignore]
@@ -3345,6 +3374,19 @@ mod r14_b_tests {
         let _ = update(&mut app, Message::Echo);
         assert!(app.loading, "pide la pantalla del enfocado");
         assert!(app.others_loading.is_empty(), "no pide a los demás paneles");
+    }
+}
+
+#[cfg(test)]
+mod margen_tests {
+    use super::*;
+
+    /// El terminal deja `COLS_MARGIN` columnas libres a la derecha: el shell no dibuja su prompt hasta el borde.
+    #[test]
+    fn el_terminal_deja_margen_a_la_derecha() {
+        let rect = layout::Rect { x: 0.0, y: 0.0, w: 2.0 * LEAF_PAD + 100.0 * cell_w(), h: 200.0 };
+        let (_, cols) = grid_in(rect);
+        assert_eq!(cols, 100 - COLS_MARGIN);
     }
 }
 
