@@ -35,6 +35,9 @@ pub fn primitivas(ch: char, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
         }
         return Some(v);
     }
+    if (0x2550..=0x256C).contains(&c) {
+        return doble(c, w, h, ligero);
+    }
     let (izq, der, arr, aba) = brazos(c)?;
     let (cx, cy) = (w / 2.0, h / 2.0);
     let grosor = |peso: u8| if peso == 2 { ligero * 2.0 } else { ligero };
@@ -57,6 +60,62 @@ pub fn primitivas(ch: char, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
 /// Si el carácter lo dibuja este módulo (y no la fuente).
 pub fn es_dibujable(ch: char) -> bool {
     primitivas(ch, 1.0, 1.0, 1.0).is_some()
+}
+
+/// Líneas dobles puras (U+2550–U+256C de solo líneas dobles): dos trazos paralelos por brazo, a ±d del centro. Cada
+/// trazo arranca donde se une con el trazo del brazo perpendicular que le corresponde (la regla: el trazo en el
+/// lado `s` de un brazo se une con el del otro eje en `s·sy·o`, y en el medio se cruza sin hueco si el brazo es
+/// continuo). Las mezclas con líneas simples no están aquí: siguen con la fuente.
+fn doble(c: u32, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
+    // (izquierda, derecha, arriba, abajo) con líneas dobles.
+    let (l, r, u, d) = match c {
+        0x2550 => (true, true, false, false),
+        0x2551 => (false, false, true, true),
+        0x2554 => (false, true, false, true),
+        0x2557 => (true, false, false, true),
+        0x255A => (false, true, true, false),
+        0x255D => (true, false, true, false),
+        0x2560 => (false, true, true, true),
+        0x2563 => (true, false, true, true),
+        0x2566 => (true, true, false, true),
+        0x2569 => (true, true, true, false),
+        0x256C => (true, true, true, true),
+        _ => return None,
+    };
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let (dx, dy) = ((w / 4.0).max(ligero * 2.0), (h / 4.0).max(ligero * 2.0));
+    let (hs, vs): (Vec<f32>, Vec<f32>) = (
+        [(l, -1.0f32), (r, 1.0)].iter().filter(|(p, _)| *p).map(|(_, s)| *s).collect(),
+        [(u, -1.0f32), (d, 1.0)].iter().filter(|(p, _)| *p).map(|(_, s)| *s).collect(),
+    );
+    // Elige el punto de unión de un trazo: el más interior (máximo) en el lado derecho, el más interior en el izquierdo (mínimo).
+    let elegir = |sx: f32, valores: Vec<f32>| -> f32 {
+        if sx > 0.0 {
+            valores.into_iter().fold(f32::MIN, f32::max)
+        } else {
+            valores.into_iter().fold(f32::MAX, f32::min)
+        }
+    };
+    let mut out = Vec::new();
+    let medio = ligero / 2.0;
+    for &sx in &hs {
+        for o in [-1.0f32, 1.0] {
+            let inicio = if vs.is_empty() { 0.0 } else { elegir(sx, vs.iter().map(|&sy| sx * sy * o).collect()) };
+            let x0 = cx + inicio * dx;
+            // Desde el borde hasta el punto de unión (con medio grosor de solape para no dejar muesca).
+            let (a, b) = if sx < 0.0 { (0.0, x0 + medio) } else { (x0 - medio, w) };
+            out.push(Prim::Linea { a: (a, cy + o * dy), b: (b, cy + o * dy), grosor: ligero });
+        }
+    }
+    for &sy in &vs {
+        for p in [-1.0f32, 1.0] {
+            let inicio = if hs.is_empty() { 0.0 } else { elegir(sy, hs.iter().map(|&sx| sy * sx * p).collect()) };
+            let y0 = cy + inicio * dy;
+            let (a, b) = if sy < 0.0 { (0.0, y0 + medio) } else { (y0 - medio, h) };
+            out.push(Prim::Linea { a: (cx + p * dx, a), b: (cx + p * dx, b), grosor: ligero });
+        }
+    }
+    Some(out)
 }
 
 /// Brazos (izquierda, derecha, arriba, abajo) de un carácter de cajas: 0 = no hay, 1 = ligero, 2 = pesado.
@@ -232,7 +291,30 @@ mod tests {
     fn lo_que_no_se_dibuja_aqui_sigue_con_la_fuente() {
         assert!(primitivas('a', 10.0, 20.0, 1.0).is_none());
         assert!(primitivas('中', 10.0, 20.0, 1.0).is_none());
-        assert!(primitivas('═', 10.0, 20.0, 1.0).is_none(), "los dobles no están en la tabla");
+
         assert!(primitivas('┍', 10.0, 20.0, 1.0).is_none(), "los pesos mezclados no están en la tabla");
+    }
+}
+
+#[cfg(test)]
+mod tests_dobles {
+    use super::*;
+
+    /// Las líneas dobles puras dibujan dos trazos por brazo; la esquina ╔ tiene su trazo exterior en el borde izquierdo
+    /// y el superior, y el interior en el derecho y el inferior.
+    #[test]
+    fn la_esquina_doble_cierra_su_contorno() {
+        let v = primitivas('╔', 10.0, 20.0, 1.0).unwrap();
+        assert_eq!(v.len(), 4, "dos trazos horizontales y dos verticales");
+        // Trazo horizontal exterior (y = cy - dy = 5) empieza en x = cx - dx = 5 - 2.5 = 2.5.
+        assert!(v.contains(&Prim::Linea { a: (2.5 - 0.5, 10.0 - 5.0), b: (10.0, 5.0), grosor: 1.0 }), "{v:?}");
+    }
+
+    #[test]
+    fn la_recta_doble_es_continua_y_la_mezcla_no_se_dibuja() {
+        assert_eq!(primitivas('═', 10.0, 20.0, 1.0).unwrap().len(), 4);
+        assert_eq!(primitivas('║', 10.0, 20.0, 1.0).unwrap().len(), 4);
+        assert!(primitivas('╒', 10.0, 20.0, 1.0).is_none(), "las mezclas siguen con la fuente");
+        assert!(primitivas('╬', 10.0, 20.0, 1.0).unwrap().len() == 8, "la cruz doble tiene ocho trazos");
     }
 }

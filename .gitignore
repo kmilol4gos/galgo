@@ -5,3 +5,6 @@
 
 # Informes de revisión internos (llevan rutas locales)
 docs/review-*.md
+
+# Compilación del GUI (su propio workspace, fuera del principal)
+crates/galgo-gui/target/
