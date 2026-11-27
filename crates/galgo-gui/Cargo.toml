@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 rfd = "0.18.0"
 ttf-parser = "0.20"
 unicode-width = "0.2"
+toml = "0.8"
 
 [dev-dependencies]
 iced_core = "0.13"

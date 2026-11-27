@@ -18,6 +18,7 @@ mod prefs;
 mod recents;
 mod settings;
 mod sidebar;
+mod team;
 mod workspace;
 
 use std::collections::BTreeMap;
