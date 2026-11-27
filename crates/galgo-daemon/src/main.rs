@@ -2695,6 +2695,44 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
         scrollback_max: 0,
         bracketed_paste: false,
         wrapped: (0..rows).map(|r| screen.row_wrapped(r)).collect(),
+        mouse: match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => galgo_proto::MouseTracking::None,
+            vt100::MouseProtocolMode::Press => galgo_proto::MouseTracking::Press,
+            vt100::MouseProtocolMode::PressRelease => galgo_proto::MouseTracking::PressRelease,
+            vt100::MouseProtocolMode::ButtonMotion => galgo_proto::MouseTracking::ButtonMotion,
+            vt100::MouseProtocolMode::AnyMotion => galgo_proto::MouseTracking::AnyMotion,
+        },
+        mouse_sgr: screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+        alt_screen: screen.alternate_screen(),
+    }
+}
+
+#[cfg(test)]
+mod raton_tests {
+    use super::*;
+
+    /// Lo que un programa real (un printf de la secuencia de activación) deja en el snapshot.
+    #[test]
+    fn el_snapshot_informa_del_modo_de_raton_y_de_la_pantalla_alternativa() {
+        let mut parser = vt100::Parser::new(std::num::NonZeroU16::new(10).unwrap(), std::num::NonZeroU16::new(40).unwrap(), 0);
+        let snap = snapshot(parser.screen());
+        assert_eq!(snap.mouse, galgo_proto::MouseTracking::None);
+        assert!(!snap.mouse_sgr && !snap.alt_screen);
+
+        parser.process(b"\x1b[?1002h\x1b[?1006h");
+        let snap = snapshot(parser.screen());
+        assert_eq!(snap.mouse, galgo_proto::MouseTracking::ButtonMotion);
+        assert!(snap.mouse_sgr);
+
+        parser.process(b"\x1b[?1049h\x1b[?1002l\x1b[?1000h");
+        let snap = snapshot(parser.screen());
+        assert_eq!(snap.mouse, galgo_proto::MouseTracking::PressRelease);
+        assert!(snap.alt_screen);
+
+        parser.process(b"\x1b[?1000l\x1b[?1049l");
+        let snap = snapshot(parser.screen());
+        assert_eq!(snap.mouse, galgo_proto::MouseTracking::None);
+        assert!(!snap.alt_screen);
     }
 }
 

@@ -1535,6 +1535,32 @@ ok=0; for i in $(seq 1 60); do galgo inbox --pane jefe147 2>/dev/null | grep -q 
 galgo tasks --pane jefe147 | grep -q "lista"; check "la tarea queda lista en el registro" $?
 galgo read w147 | grep -q "tarea #"; check "el texto llegó al worker pegado en su terminal" $?
 export PATH="$ANTES_PATH"; unset TMP_ARGS_DIR TMP_FAKE_DIR DESTINO
+echo "149. ratón hacia el programa: el modo que activa un programa real llega al snapshot y los bytes le llegan"
+export GALGO_SOCKET="$TMP/c149/g.sock"; mkdir -p "$TMP/c149" && chmod 700 "$TMP/c149"
+galgo spawn raton149 -- bash --norc >/dev/null
+galgo send raton149 "printf '\\033[?1002h\\033[?1006h'; IFS= read -r -n 10 x; printf '%s' \"\$x\" > $TMP/c149/bytes; printf '\\033[?1002l\\033[?1006l'; read -r -n 1 _" >/dev/null
+# Pide el snapshot crudo al socket (como hace la GUI) y busca el modo en el JSON compacto.
+snap149() { python3 -c 'import json,os,socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["GALGO_SOCKET"])
+s.sendall(b"{\"op\":\"snapshot\",\"pane\":\"raton149\",\"offset\":0}\n"); buf = b""
+while not buf.endswith(b"\n"):
+    d = s.recv(65536)
+    if not d:
+        break
+    buf += d
+print(buf.decode())'; }
+ok=0; for i in $(seq 1 50); do snap149 | grep -q '"mouse":"button_motion"' && { ok=1; break; }; sleep 0.2; done
+[ $ok = 1 ]; check "el snapshot informa de 1002 (button_motion) cuando el programa lo activa" $?
+snap149 | grep -q '"mouse_sgr":true'; check "y de la codificación SGR (1006)" $?
+galgo send raton149 "$(printf '\033[<0;10;5M')" --no-enter >/dev/null
+ok=0; for i in $(seq 1 50); do [ -s "$TMP/c149/bytes" ] && break; sleep 0.2; done
+printf '\033[<0;10;5M' | cmp -s - "$TMP/c149/bytes"; check "el programa recibe la secuencia SGR intacta" $?
+galgo send raton149 a --no-enter >/dev/null
+ok=0; for i in $(seq 1 50); do snap149 | grep -q '"mouse":"none"' && { ok=1; break; }; sleep 0.2; done
+[ $ok = 1 ]; check "al desactivarlo, el snapshot vuelve a none" $?
+galgo kill raton149 --remove >/dev/null; galgo stop >/dev/null 2>&1
+export GALGO_SOCKET="$TMP/galgo.sock"
+
 # Ningún daemon de esta corrida puede quedar vivo: se comprueba (y se para) lo que quede bajo $TMP.
 echo "148. cerrar una pestaña quita el panel; kill a secas lo deja como exited"
 export GALGO_SOCKET="$TMP/c148/g.sock"; mkdir -p "$TMP/c148" && chmod 700 "$TMP/c148"

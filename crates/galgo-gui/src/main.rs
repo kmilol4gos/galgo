@@ -21,12 +21,13 @@ mod team;
 mod workspace;
 
 use std::collections::BTreeMap;
+mod raton;
 mod term;
 mod theme;
 mod usage;
 
 use attention::{Alert, Attention};
-use galgo_proto::{Run, Snapshot};
+use galgo_proto::{MouseTracking, Run, Snapshot};
 use galgo_usage::Limits;
 use iced::keyboard::{self, key::Named, Key};
 use iced::mouse;
@@ -297,6 +298,10 @@ struct App {
     pill_click: Option<(String, std::time::Instant)>,
     /// Fracción de líneas de la rueda que aún no suma un paso completo.
     wheel_acc: f32,
+    /// Botón (código xterm) que el programa recibió en pulsación y aún no ha soltado.
+    raton_pulsado: Option<u8>,
+    /// Última celda por la que pasó el ratón mientras el programa lo quería (arrastres sin repetir celda).
+    raton_celda: Option<Cell>,
     sel: Option<Selection>,
     dragging: bool,
     pointer: Option<Point>,
@@ -1448,6 +1453,47 @@ fn grid_cell(app: &App, p: Point) -> Option<Cell> {
     pixel_to_cell(focus_origin(app), p.x, p.y, (snap.rows, snap.cols))
 }
 
+/// La barra de búsqueda flota arriba a la derecha del panel enfocado: un clic en ella no es un clic en el terminal.
+fn en_barra_busqueda(app: &App, p: Point) -> bool {
+    app.buscar.is_some()
+        && app.selected.and_then(|id| pane_rect(app, id)).is_some_and(|r| p.x > r.x + r.w - 380.0 && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + leaf_top() + 48.0)
+}
+
+/// Botones que se reenvían al programa (los demás no tienen significado en la cuadrícula).
+fn raton_boton(b: mouse::Button) -> Option<u8> {
+    match b {
+        mouse::Button::Left => Some(raton::IZQ),
+        mouse::Button::Middle => Some(raton::MEDIO),
+        mouse::Button::Right => Some(raton::DER),
+        _ => None,
+    }
+}
+
+/// Secuencia de ratón para `gesto` en `celda`, si el programa del panel enfocado pide seguimiento de ratón.
+/// No mira la geometría: quien pulsa la comprueba antes; soltar y arrastrar usan la celda ya conocida.
+fn secuencia_raton_en(app: &App, gesto: raton::Gesto, (fila, col): Cell) -> Option<String> {
+    let snap = app.snap.as_ref()?;
+    if app.scroll != 0 {
+        return None;
+    }
+    let mods = raton::Mods { shift: app.mods.shift(), alt: app.mods.alt(), ctrl: app.mods.control() };
+    raton::secuencia(snap.mouse, snap.mouse_sgr, gesto, mods, fila, col)
+}
+
+/// Igual que `secuencia_raton_en`, pero solo si el puntero cae en la cuadrícula del panel enfocado y no sobre
+/// otra cosa (barra de búsqueda, divisor, otro panel). Shift devuelve el ratón a galgo (selección propia).
+fn secuencia_raton_pulsa(app: &App, gesto: raton::Gesto) -> Option<(String, Cell)> {
+    let p = app.pointer?;
+    if app.mods.shift() || body_mode(app) != Body::Screen || !pointer_in_grid(app) || en_barra_busqueda(app, p) {
+        return None;
+    }
+    if divider_under(app, p).is_some() || leaf_at(app, p) != app.selected {
+        return None;
+    }
+    let cell = grid_cell(app, p)?;
+    secuencia_raton_en(app, gesto, cell).map(|seq| (seq, cell))
+}
+
 /// Extremos de una selección en orden de lectura.
 fn ordered(sel: Selection) -> (Cell, Cell) {
     if sel.anchor <= sel.head { (sel.anchor, sel.head) } else { (sel.head, sel.anchor) }
@@ -1637,6 +1683,9 @@ fn reenviar_evento(event: Event, status: event::Status) -> Option<Message> {
         | Event::Window(iced::window::Event::Focused)
         | Event::Window(iced::window::Event::Unfocused) => Some(Message::Event(event)),
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => Some(Message::Event(event)),
+        // Central y derecho: solo los programas con ratón los usan; la geometría la decide quien recibe.
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle | mouse::Button::Right))
+        | Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Middle | mouse::Button::Right)) => Some(Message::Event(event)),
         // La rueda que otro widget ya usó (una lista con scroll) no llega al terminal.
         Event::Mouse(mouse::Event::WheelScrolled { .. }) if status == event::Status::Ignored => Some(Message::Event(event)),
         // El soltar del botón siempre llega, para no dejar una selección arrastrándose.
@@ -2904,6 +2953,23 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             app.wheel_acc += lines;
             let steps = app.wheel_acc.trunc() as i32;
             app.wheel_acc -= steps as f32;
+            // Un programa con ratón recibe la rueda como botones 64/65; uno en pantalla alternativa sin ratón, flechas
+            // (como Terminal.app). Solo si el puntero está sobre la cuadrícula y no hay historial desplazado.
+            if steps != 0 && app.scroll == 0 && pointer_in_grid(app) {
+                let (raton_on, alt) = app.snap.as_ref().map_or((false, false), |s| (s.mouse != MouseTracking::None, s.alt_screen));
+                if raton_on {
+                    if let Some((seq, _)) = secuencia_raton_pulsa(app, raton::Gesto::Rueda { arriba: steps > 0 }) {
+                        for _ in 0..steps.unsigned_abs().min(20) {
+                            send_text(app, seq.clone());
+                        }
+                        return Task::none();
+                    }
+                } else if alt && !app.mods.shift() {
+                    let flecha = if steps > 0 { "\x1b[A" } else { "\x1b[B" };
+                    send_text(app, flecha.repeat(3 * steps.unsigned_abs().min(20) as usize));
+                    return Task::none();
+                }
+            }
             if steps != 0 {
                 let max = app.snap.as_ref().map_or(0, |s| s.scrollback_max) as i32;
                 let next = (app.scroll as i32 + steps * WHEEL_LINES).clamp(0, max);
@@ -2924,13 +2990,15 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             if body_mode(app) != Body::Screen {
                 return Task::none();
             }
-            // La barra de búsqueda flota arriba a la derecha del panel: un clic en ella no es un clic en el terminal.
-            if app.buscar.is_some() {
-                if let (Some(p), Some(r)) = (app.pointer, app.selected.and_then(|id| pane_rect(app, id))) {
-                    if p.x > r.x + r.w - 380.0 && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + leaf_top() + 48.0 {
-                        return Task::none();
-                    }
-                }
+            if app.pointer.is_some_and(|p| en_barra_busqueda(app, p)) {
+                return Task::none();
+            }
+            // Un programa que pide ratón recibe el clic; con Shift no (selección propia de galgo).
+            if let Some((seq, cell)) = secuencia_raton_pulsa(app, raton::Gesto::Pulsa(raton::IZQ)) {
+                app.raton_pulsado = Some(raton::IZQ);
+                app.raton_celda = Some(cell);
+                send_text(app, seq);
+                return Task::none();
             }
             // Un clic en otro panel visible le da el foco; el arrastre empieza en el siguiente clic dentro de él.
             if let Some(id) = app.pointer.and_then(|p| leaf_at(app, p)) {
@@ -2977,10 +3045,34 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 }
                 return Task::none();
             }
+            // Arrastre con botón (1002/1003) o movimiento sin botón (1003), una vez por celda.
+            if let Some(cell) = grid_cell(app, position) {
+                if app.raton_celda != Some(cell) {
+                    if let Some(code) = app.raton_pulsado {
+                        app.raton_celda = Some(cell);
+                        if let Some(seq) = secuencia_raton_en(app, raton::Gesto::Arrastra(code), cell) {
+                            send_text(app, seq);
+                        }
+                    } else if let Some((seq, cell)) = secuencia_raton_pulsa(app, raton::Gesto::Mueve) {
+                        app.raton_celda = Some(cell);
+                        send_text(app, seq);
+                    }
+                }
+            }
             app.hover_divider = divider_under(app, position).map(|d| (d.path, d.vertical));
             if app.dragging {
                 if let (Some(cell), Some(sel)) = (grid_cell(app, position), app.sel.as_mut()) {
                     sel.head = cell;
+                }
+            }
+            Task::none()
+        }
+        // Soltar un botón que el programa recibió en pulsación: va siempre a él, esté el puntero donde esté.
+        Message::Event(Event::Mouse(mouse::Event::ButtonReleased(b))) if app.raton_pulsado.is_some() && raton_boton(b) == app.raton_pulsado => {
+            let code = app.raton_pulsado.take().unwrap_or(raton::IZQ);
+            if let Some(cell) = app.raton_celda {
+                if let Some(seq) = secuencia_raton_en(app, raton::Gesto::Suelta(code), cell) {
+                    send_text(app, seq);
                 }
             }
             Task::none()
@@ -2996,6 +3088,16 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             // Un clic sin arrastre no deja selección.
             if app.sel.is_some_and(|s| s.anchor == s.head) {
                 clear_selection(app);
+            }
+            Task::none()
+        }
+        // Central o derecho sobre la cuadrícula, si el programa pide ratón.
+        Message::Event(Event::Mouse(mouse::Event::ButtonPressed(b))) => {
+            let Some(code) = raton_boton(b) else { return Task::none() };
+            if let Some((seq, cell)) = secuencia_raton_pulsa(app, raton::Gesto::Pulsa(code)) {
+                app.raton_pulsado = Some(code);
+                app.raton_celda = Some(cell);
+                send_text(app, seq);
             }
             Task::none()
         }
@@ -3395,6 +3497,9 @@ mod tests {
             scrollback_max: 0,
             bracketed_paste: false,
             wrapped: vec![],
+            mouse: Default::default(),
+            mouse_sgr: false,
+            alt_screen: false,
         }
     }
 
@@ -4826,7 +4931,7 @@ mod render {
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
         let run = |t: &str| Run { t: t.into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false, dim: false, strike: false, blink: false };
-        Snapshot { gen: 0, rows: lines.len() as u16, cols, cursor: (0, 0), cursor_hidden: true, lines: lines.iter().map(|l| vec![run(l)]).collect(), scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![] }
+        Snapshot { gen: 0, rows: lines.len() as u16, cols, cursor: (0, 0), cursor_hidden: true, lines: lines.iter().map(|l| vec![run(l)]).collect(), scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false }
     }
 
     pub fn render(app: &App, (w, h): (u32, u32), path: &std::path::Path) {
@@ -4874,7 +4979,7 @@ mod render {
         let rows = 40u16;
         let mut all = lines;
         while all.len() < rows as usize { all.push(vec![]); }
-        Snapshot { gen: 1, rows, cols, cursor: (1, 52), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![] }
+        Snapshot { gen: 1, rows, cols, cursor: (1, 52), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false }
     }
 
     fn shell_snap(cols: u16) -> Snapshot {
@@ -4888,7 +4993,7 @@ mod render {
         let rows = 40u16;
         let mut all = lines;
         while all.len() < rows as usize { all.push(vec![]); }
-        Snapshot { gen: 1, rows, cols, cursor: (3, 23), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![] }
+        Snapshot { gen: 1, rows, cols, cursor: (3, 23), cursor_hidden: false, lines: all, scrollback: 0, scrollback_max: 0, bracketed_paste: false, wrapped: vec![], mouse: Default::default(), mouse_sgr: false, alt_screen: false }
     }
 
     fn usage(agent: &str, ctx: f32, cost: f64) -> galgo_usage::PaneUsage {
@@ -4971,6 +5076,9 @@ mod render {
             scrollback_max: 0,
             bracketed_paste: false,
             wrapped: vec![false, false],
+            mouse: Default::default(),
+            mouse_sgr: false,
+            alt_screen: false,
         }
     }
 

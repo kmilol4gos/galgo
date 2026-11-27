@@ -351,6 +351,23 @@ impl Color {
     }
 }
 
+/// Qué eventos de ratón pide el programa del panel (DECSET 9, 1000, 1002 o 1003).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseTracking {
+    /// Sin seguimiento: el ratón es del terminal (selección, rueda sobre el historial).
+    #[default]
+    None,
+    /// Solo pulsaciones (X10, modo 9).
+    Press,
+    /// Pulsaciones y soltar (modo 1000).
+    PressRelease,
+    /// Además arrastres con botón pulsado (modo 1002).
+    ButtonMotion,
+    /// Además todo movimiento (modo 1003).
+    AnyMotion,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Token de la vista: `generación << 16 | offset`. La generación cambia con cada escritura del panel y
@@ -375,6 +392,15 @@ pub struct Snapshot {
     /// Por fila: `true` si la línea continúa en la siguiente (soft wrap). Vacío en respuestas antiguas.
     #[serde(default)]
     pub wrapped: Vec<bool>,
+    /// Seguimiento de ratón que pide el programa (modo 1000/1002/1003).
+    #[serde(default)]
+    pub mouse: MouseTracking,
+    /// El programa pide la codificación SGR (1006) para los eventos de ratón.
+    #[serde(default)]
+    pub mouse_sgr: bool,
+    /// El programa usa la pantalla alternativa (vim, less, htop…).
+    #[serde(default)]
+    pub alt_screen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
