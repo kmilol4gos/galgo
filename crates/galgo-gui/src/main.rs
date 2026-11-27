@@ -253,6 +253,9 @@ struct App {
     agent_form: Option<AgentForm>,
     roles: BTreeMap<String, String>,
     roles_saved: String,
+    /// Equipo que espera la confirmación de su primera vez en el repo, y la confianza ya dada (repo → huella).
+    team_pending: Option<TeamPending>,
+    team_trust: serde_json::Value,
     /// Modificadores del teclado (para Cmd+clic) y el último clic (para doble y triple clic: celda, instante, n).
     mods: keyboard::Modifiers,
     clicks: Option<(Cell, std::time::Instant, u8)>,
@@ -361,6 +364,11 @@ enum Message {
     PaneChanged(u32, u64),
     /// No hubo forma de suscribirse al panel: mientras tanto, la pantalla se sondea.
     WatchDown(u32),
+    /// Levantar un equipo: el del repo (con confirmación la primera vez) o uno integrado; y su resultado.
+    TeamRequested(TeamSource),
+    TeamConfirm,
+    TeamCancel,
+    TeamLaunched(String, Option<String>, Vec<(String, Result<PaneInfo, String>)>),
     /// «+ Agente…»: abre el formulario, y sus campos.
     OpenAgentForm,
     AgentFormPick(launch::Agent),
@@ -466,10 +474,14 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 25] = [
+    let commands: [(&str, &str, Message); 29] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
         ("Nuevo workspace con grupo…", "Cmd+Shift+N", Message::OpenNewNamedWorkspace),
         ("Agregar agente al workspace…", "", Message::OpenAgentForm),
+        ("Levantar equipo del repo", "", Message::TeamRequested(TeamSource::Repo)),
+        ("Equipo: Claude manager + Codex worker + Claude revisor", "", Message::TeamRequested(TeamSource::Preset(0))),
+        ("Equipo: Claude manager + PI worker", "", Message::TeamRequested(TeamSource::Preset(1))),
+        ("Equipo: opencode + Claude revisor", "", Message::TeamRequested(TeamSource::Preset(2))),
         ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
         ("Lanzar agente…", "Cmd+Shift+L", Message::OpenLauncher),
@@ -631,6 +643,124 @@ fn spawn_task_sized(app: &mut App, req: galgo_proto::Request, (rows, cols): (u16
     )
 }
 
+/// Un equipo leído de un repo que todavía no se ha confirmado: se muestra antes de lanzar nada.
+#[derive(Debug, Clone)]
+struct TeamPending {
+    key: Option<String>,
+    root: String,
+    team: team::Team,
+    fp: String,
+}
+
+/// De dónde sale un equipo a levantar: el `team.toml` del repo, o uno de los integrados.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TeamSource {
+    Repo,
+    Preset(usize),
+}
+
+/// Raíz del repo que contiene `cwd`; si no es un repo, el propio `cwd`.
+fn repo_root(cwd: &str) -> String {
+    std::process::Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cwd.to_string())
+}
+
+/// Lee `.galgo/team.toml` de `root`: texto y equipo validado. Un archivo que no es regular o pasa de tamaño no se lee.
+fn read_team(root: &str) -> Result<(String, team::Team), String> {
+    let path = std::path::Path::new(root).join(team::FILE);
+    let meta = std::fs::symlink_metadata(&path).map_err(|_| format!("no hay {} en {root}", team::FILE))?;
+    if !meta.file_type().is_file() || meta.len() > team::MAX_BYTES {
+        return Err(format!("{} no es un archivo normal de tamaño razonable", team::FILE));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("no pude leer {}: {e}", team::FILE))?;
+    let team = team::parse(&text)?;
+    Ok((text, team))
+}
+
+/// Árbol de un equipo: el manager a la izquierda (60 %), y los workers apilados a la derecha.
+fn team_tree(manager: Option<u32>, workers: &[u32]) -> Option<layout::Node> {
+    let mut apilados: Option<layout::Node> = None;
+    for (i, id) in workers.iter().enumerate().rev() {
+        apilados = Some(match apilados {
+            None => layout::Node::Leaf(*id),
+            // Cada worker toma su parte del hueco que queda debajo: 1/(n) del total en el primero, etc.
+            Some(resto) => layout::Node::Split { vertical: false, ratio: 1.0 / (workers.len() - i) as f32, a: Box::new(layout::Node::Leaf(*id)), b: Box::new(resto) },
+        });
+    }
+    match (manager, apilados) {
+        (Some(m), Some(derecha)) => Some(layout::Node::Split { vertical: true, ratio: 0.6, a: Box::new(layout::Node::Leaf(m)), b: Box::new(derecha) }),
+        (Some(m), None) => Some(layout::Node::Leaf(m)),
+        (None, derecha) => derecha,
+    }
+}
+
+/// Levanta un equipo en el workspace `key` (o en uno nuevo con el nombre del equipo, si no lo hay): los agentes se
+/// lanzan en orden (el manager primero), cada worker enlazado al manager, y el prompt inicial llega tras arrancar.
+fn launch_team(app: &mut App, key: Option<String>, root: String, team: team::Team) -> Task<Message> {
+    let key = match key.filter(|k| app.explicit.contains_key(k)) {
+        Some(k) => k,
+        None => {
+            let taken: Vec<&str> = app.explicit.keys().map(String::as_str).chain(app.layouts.by_key.keys().map(String::as_str)).collect();
+            let nombre = launch::free_name(&team.name, &taken);
+            app.explicit.insert(nombre.clone(), root.clone());
+            nombre
+        }
+    };
+    let (rows, cols) = grid_for(app.window);
+    let mut reservados: Vec<String> = Vec::new();
+    let mut manager_name: Option<String> = None;
+    let mut trabajos = Vec::new();
+    let ordenados = team.agents.iter().filter(|a| a.role == launch::Role::Manager).chain(team.agents.iter().filter(|a| a.role != launch::Role::Manager));
+    for a in ordenados {
+        let taken: Vec<&str> = names(app).into_iter().chain(reservados.iter().map(String::as_str)).collect();
+        let nombre = launch::free_name(&a.name, &taken);
+        let manager = if a.role.needs_manager() { manager_name.clone() } else { None };
+        if a.role == launch::Role::Manager {
+            manager_name = Some(nombre.clone());
+        }
+        let cmd = a.provider.command_with(&login_shell(), a.model.as_deref());
+        let worktree = (a.isolation == launch::Isolation::Worktree).then(|| nombre.clone());
+        let req = launch::agent_request(&nombre, cmd, &root, Some(key.clone()), manager, worktree, rows, cols);
+        app.roles.insert(nombre.clone(), a.role.label().to_string());
+        reservados.push(nombre.clone());
+        trabajos.push((nombre, req, a.prompt.clone()));
+    }
+    app.inflight.extend(reservados.iter().cloned());
+    let clave = key.clone();
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                trabajos
+                    .into_iter()
+                    .map(|(nombre, req, prompt)| {
+                        let r = request(req).and_then(|d| serde_json::from_value::<PaneInfo>(d).map_err(|e| e.to_string()));
+                        // El prompt inicial va cuando el panel ya arrancó; si no alcanza, queda en su entrada (el usuario lo ve).
+                        if r.is_ok() {
+                            if let Some(texto) = prompt {
+                                std::thread::sleep(Duration::from_millis(1500));
+                                let _ = request(Request::Send { pane: nombre.clone(), text: texto, enter: true });
+                            }
+                        }
+                        (nombre, r)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| e.to_string())
+        },
+        move |res| match res {
+            Ok(resultados) => Message::TeamLaunched(clave.clone(), manager_name.clone(), resultados),
+            Err(e) => Message::TeamLaunched(clave.clone(), None, vec![(String::new(), Err(e))]),
+        },
+    )
+}
+
 /// Estado del formulario «+ Agente…»: qué lanzar, con qué rol y dónde trabajar.
 #[derive(Debug, Clone)]
 struct AgentForm {
@@ -677,6 +807,7 @@ fn manager_of(app: &App, key: Option<&str>) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Body {
     Welcome,
+    TeamConfirm,
     AgentForm,
     NewWorkspace,
     Launcher,
@@ -696,6 +827,8 @@ fn body_mode(app: &App) -> Body {
         Body::NewWorkspace
     } else if app.launcher {
         Body::Launcher
+    } else if app.team_pending.is_some() {
+        Body::TeamConfirm
     } else if app.agent_form.is_some() {
         Body::AgentForm
     } else if app.form.is_some() {
@@ -1788,6 +1921,81 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             // B3: el foco va al buscador: lo que se escribe, y Enter, llegan ahí.
             iced::widget::text_input::focus(new_ws_input_id())
         }
+        Message::TeamRequested(source) => match source {
+            TeamSource::Preset(i) => {
+                let Some((_, team)) = team::presets().into_iter().nth(i) else { return Task::none() };
+                let cwd = focus_context(app).1.unwrap_or_else(home_dir);
+                let key = focus_key(app);
+                launch_team(app, key, repo_root(&cwd), team)
+            }
+            TeamSource::Repo => {
+                let key = focus_key(app);
+                let cwd = key.as_deref().and_then(|k| app.explicit.get(k).cloned()).or_else(|| focus_context(app).1).unwrap_or_else(home_dir);
+                let root = repo_root(&cwd);
+                match read_team(&root) {
+                    Err(e) => {
+                        app.error = Some(e);
+                        Task::none()
+                    }
+                    Ok((text, team)) => {
+                        let fp = team::fingerprint(&text);
+                        if team::trusted(&app.team_trust, &root, &fp) {
+                            launch_team(app, key, root, team)
+                        } else {
+                            // La primera vez (o si cambió): el equipo se muestra y no se lanza nada hasta confirmar.
+                            app.team_pending = Some(TeamPending { key, root, team, fp });
+                            Task::none()
+                        }
+                    }
+                }
+            }
+        },
+        Message::TeamConfirm => {
+            let Some(p) = app.team_pending.take() else { return Task::none() };
+            if !app.team_trust.is_object() {
+                app.team_trust = serde_json::json!({});
+            }
+            app.team_trust[p.root.as_str()] = serde_json::json!(p.fp);
+            if let Some(path) = &app.prefs_path {
+                if let Err(e) = prefs::set(path, "team_trust", app.team_trust.clone()) {
+                    eprintln!("galgo-gui: no pude guardar la confianza del equipo: {e}");
+                }
+            }
+            launch_team(app, p.key, p.root, p.team)
+        }
+        Message::TeamCancel => {
+            app.team_pending = None;
+            Task::none()
+        }
+        Message::TeamLaunched(key, manager, resultados) => {
+            let mut manager_id = None;
+            let mut trabajadores = Vec::new();
+            for (nombre, r) in resultados {
+                app.inflight.retain(|n| *n != nombre);
+                match r {
+                    Ok(p) => {
+                        let id = p.id;
+                        app.sizes.insert(id, grid_for(app.window));
+                        if manager.as_deref() == Some(p.name.as_str()) {
+                            manager_id = Some(id);
+                        } else {
+                            trabajadores.push(id);
+                        }
+                        app.panes.push(p);
+                    }
+                    Err(e) => app.error = Some(e),
+                }
+            }
+            // Layout automático: el manager a la izquierda y los workers apilados a la derecha, en una pestaña nueva.
+            let foco = manager_id.or(trabajadores.first().copied());
+            if let (Some(root), Some(foco)) = (team_tree(manager_id, &trabajadores), foco) {
+                let ws = app.layouts.by_key.entry(key).or_default();
+                ws.tabs.push(layout::Tab { root, focus: foco });
+                ws.active = ws.tabs.len() - 1;
+                return Task::batch([load_panes(), select(app, foco)]);
+            }
+            load_panes()
+        }
         Message::OpenAgentForm => {
             app.agent_form = Some(AgentForm::para(app));
             Task::none()
@@ -2535,6 +2743,7 @@ fn view(app: &App) -> Element<'_, Message> {
         Body::NewWorkspace => chrome::floating(base, chrome::new_workspace_panel(app), 560.0, Message::CloseNewWorkspace),
         Body::Launcher => chrome::floating(base, chrome::launcher_panel(app), 440.0, Message::CloseLauncher),
         Body::AgentForm => chrome::floating(base, chrome::agent_form_panel(app), 480.0, Message::CloseAgentForm),
+        Body::TeamConfirm => chrome::floating(base, chrome::team_confirm_panel(app), 500.0, Message::TeamCancel),
         Body::Form => match &app.form {
             Some(f) => chrome::floating(base, chrome::form_panel(app, f), 460.0, Message::CancelForm),
             None => base,
@@ -2595,6 +2804,7 @@ fn main() -> iced::Result {
             // Barra lateral y barra de estado: como se dejaron (por defecto, ocultas).
             let flag = |clave: &str| prefs::get(&prefs, clave).and_then(|v| v.as_bool()).unwrap_or(false);
             // Zoom de letra: el último que se eligió (0 = normal).
+            let confianza = prefs::get(&prefs, "team_trust").unwrap_or_else(|| serde_json::json!({}));
             let zoom_guardado = prefs::get(&prefs, "zoom").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             ZOOM.store(zoom_guardado.clamp(ZOOM_MIN, ZOOM_MAX), std::sync::atomic::Ordering::Relaxed);
             let app = App {
@@ -2604,6 +2814,7 @@ fn main() -> iced::Result {
                 recents_path: Some(file),
                 font_installed: installed,
                 sidebar: flag("sidebar"),
+                team_trust: confianza,
                 status: flag("status"),
                 prefs_path: Some(prefs),
                 ..Default::default()
@@ -3063,6 +3274,76 @@ mod tests {
         assert!(app.agent_form.is_none(), "un nombre válido cierra el formulario");
         assert_eq!(app.roles.get("rev").map(String::as_str), Some("worker"));
         assert_eq!(manager_of(&app, Some("ws")).as_deref(), Some("jefe"));
+    }
+
+    /// Layout de un equipo: el manager a la izquierda y los workers apilados a la derecha, en ese orden.
+    #[test]
+    fn layout_de_equipo_manager_a_la_izquierda() {
+        assert_eq!(team_tree(None, &[]), None);
+        assert_eq!(team_tree(Some(1), &[]), Some(layout::Node::Leaf(1)));
+        let arbol = team_tree(Some(1), &[2, 3, 4]).unwrap();
+        assert_eq!(arbol.ids(), vec![1, 2, 3, 4], "el manager primero, luego los workers de arriba abajo");
+        match arbol {
+            layout::Node::Split { vertical, ratio, a, b } => {
+                assert!(vertical && (ratio - 0.6).abs() < 1e-6, "el manager ocupa el 60 % a la izquierda");
+                assert_eq!(*a, layout::Node::Leaf(1));
+                assert!(matches!(*b, layout::Node::Split { vertical: false, .. }), "los workers van apilados");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Un equipo del repo pide confirmación la primera vez; confirmado, queda de confianza y el siguiente lanza
+    /// directo. Lanzar crea su workspace con nombre, los roles y los nombres reservados.
+    #[test]
+    fn equipo_del_repo_pide_confianza_una_vez() {
+        let dir = std::env::temp_dir().join(format!("galgo-team-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".galgo")).unwrap();
+        std::fs::write(
+            dir.join(team::FILE),
+            "name = \"cotiza\"\n[[agent]]\nname=\"jefe\"\nprovider=\"claude\"\nrole=\"manager\"\n[[agent]]\nname=\"codex\"\nprovider=\"codex\"\nrole=\"worker\"\n",
+        )
+        .unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let mut app = App::default();
+        let mut p = pane_info(1, "shell", Status::Idle);
+        p.cwd = Some(root.clone());
+        app.panes = vec![p];
+        app.layouts.sync(&pane_keys(&app));
+        app.selected = Some(1);
+        let _ = update(&mut app, Message::TeamRequested(TeamSource::Repo));
+        assert!(app.team_pending.is_some(), "la primera vez se pide confirmación");
+        assert!(app.explicit.is_empty(), "sin confirmar, no se crea nada");
+        let _ = update(&mut app, Message::TeamConfirm);
+        assert!(app.team_pending.is_none());
+        assert!(team::trusted(&app.team_trust, &root, &team::fingerprint(&std::fs::read_to_string(dir.join(team::FILE)).unwrap())));
+        assert!(app.explicit.contains_key("cotiza"), "el equipo tiene su workspace con nombre");
+        assert_eq!(app.roles.get("jefe").map(String::as_str), Some("manager"));
+        assert_eq!(app.roles.get("codex").map(String::as_str), Some("worker"));
+        assert!(app.inflight.contains(&"jefe".to_string()) && app.inflight.contains(&"codex".to_string()));
+        // Segunda vez, mismo archivo: ya es de confianza y no pide nada.
+        app.inflight.clear();
+        let _ = update(&mut app, Message::TeamRequested(TeamSource::Repo));
+        assert!(app.team_pending.is_none(), "un equipo de confianza se lanza directo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Un resultado de lanzamiento arma el layout del equipo: el manager a la izquierda y el foco en él.
+    #[test]
+    fn resultado_del_equipo_arma_el_layout() {
+        let mut app = App::default();
+        let mut jefe = pane_info(10, "jefe", Status::Idle);
+        jefe.workspace = Some("cotiza".into());
+        let mut codex = pane_info(11, "codex", Status::Idle);
+        codex.workspace = Some("cotiza".into());
+        app.explicit.insert("cotiza".into(), "/tmp/cotiza".into());
+        let _ = update(&mut app, Message::TeamLaunched("cotiza".into(), Some("jefe".into()), vec![("jefe".into(), Ok(jefe)), ("codex".into(), Ok(codex))]));
+        let ws = app.layouts.by_key.get("cotiza").expect("el workspace tiene su pestaña");
+        let tab = ws.tabs.last().unwrap();
+        assert_eq!(tab.root.ids(), vec![10, 11]);
+        assert_eq!(tab.focus, 10, "el foco va al manager");
+        assert!(matches!(tab.root, layout::Node::Split { vertical: true, .. }));
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la

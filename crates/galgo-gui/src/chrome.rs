@@ -295,11 +295,12 @@ fn group_pill<'a>(app: &'a App, key: String, pestanas: Vec<Element<'a, Message>>
     .padding([0, 4])
     .on_press(Message::CloseWorkspace(key.clone()));
     let agente = theme::btn(text("+ agente").size(theme::SMALL_SIZE).color(theme::TEXT_SOFT)).padding([0, 6]).on_press(Message::OpenAgentForm);
+    let equipo = theme::btn(text("equipo").size(theme::SMALL_SIZE).color(theme::TEXT_SOFT)).padding([0, 6]).on_press(Message::TeamRequested(crate::TeamSource::Repo));
     let mut fila = row![text(key.clone()).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT)].spacing(6).align_y(Alignment::Center);
     for p in pestanas {
         fila = fila.push(p);
     }
-    fila = fila.push(agente).push(cerrar);
+    fila = fila.push(agente).push(equipo).push(cerrar);
     container(fila).padding([0, 8]).height(Length::Fixed(TABS_H - 8.0)).center_y(Length::Fixed(TABS_H - 8.0)).style(theme::group).into()
 }
 
@@ -1013,6 +1014,58 @@ pub fn agent_form_panel(app: &App) -> Element<'_, Message> {
         container(cuerpo).padding([12, 16]),
         theme::rule(false),
         container(pie).padding([10, 16]),
+    ]
+    .into()
+}
+
+/// Confirmación de un equipo que llega por primera vez (o cambió) desde su repo: qué se lanza y con qué, antes de nada.
+pub fn team_confirm_panel(app: &App) -> Element<'_, Message> {
+    let Some(p) = app.team_pending.as_ref() else { return column![].into() };
+    let mut lista = column![].spacing(6);
+    for a in &p.team.agents {
+        let modelo = a.model.clone().unwrap_or_else(|| "predeterminado".into());
+        lista = lista.push(
+            column![
+                row![
+                    text(a.name.clone()).size(theme::BODY_SIZE).color(TEXT),
+                    text(format!("{} · {}", a.provider.label(), modelo)).size(theme::SMALL_SIZE).color(theme::DIM),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                text(format!("{} · {}", a.role.label(), a.isolation.label())).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT),
+            ]
+            .spacing(2),
+        );
+    }
+    column![
+        container(
+            column![
+                text(format!("Equipo «{}»", p.team.name)).size(theme::TITLE_SIZE).color(TEXT),
+                text(p.root.clone()).size(theme::SMALL_SIZE).color(theme::DIM),
+            ]
+            .spacing(4),
+        )
+        .padding([14, 16]),
+        theme::rule(false),
+        container(column![
+            text("Estos agentes se lanzan con tu usuario y pueden modificar archivos del repo. Revísalos antes de confirmar.")
+                .size(theme::SMALL_SIZE)
+                .color(theme::BLOCKED),
+            lista,
+        ]
+        .spacing(10))
+        .padding([12, 16]),
+        theme::rule(false),
+        container(
+            row![
+                Space::with_width(Length::Fill),
+                theme::btn_secondary(text("Cancelar").size(theme::SMALL_SIZE + 1.0)).padding([5, 12]).on_press(Message::TeamCancel),
+                theme::btn_primary(text("Confirmar y levantar").size(theme::SMALL_SIZE + 1.0).color(TEXT)).padding([5, 14]).on_press(Message::TeamConfirm),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding([10, 16]),
     ]
     .into()
 }
