@@ -119,7 +119,8 @@ fn agent_row<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
     ]
     .spacing(8)
     .align_y(Alignment::Center);
-    theme::btn(container(line).width(Length::Fill).padding([5, 8]).clip(true))
+    // Filas con aire: más altura de fila y el mismo radio que el resto de superficies.
+    theme::btn(container(line).width(Length::Fill).padding([8, 10]).clip(true))
         .padding(0)
         .width(Length::Fill)
         .on_press(Message::Select(pane.id))
@@ -233,7 +234,7 @@ pub fn session_bar(app: &App) -> Element<'_, Message> {
             .spacing(7)
             .align_y(Alignment::Center);
         // B4: la sesión se elige por su clave, no por su posición, que puede cambiar entre el dibujo y el clic.
-        bar = bar.push(theme::btn(container(label).padding([4, 12])).padding(0).on_press(Message::SelectWorkspace(key.clone())).style(theme::tab(active)));
+        bar = bar.push(theme::btn(container(label).padding([5, 12])).padding(0).on_press(Message::SelectWorkspace(key.clone())).style(theme::tab(active)));
     }
     bar = bar.push(icon_button(text("+").size(16).color(MUTED).into(), "Nuevo workspace  ⌘N", Message::OpenNewWorkspace));
     bar = bar
@@ -318,6 +319,8 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
                 label = label.push(theme::btn(text("×").size(13).color(theme::DIM)).padding([0, 4]).on_press(Message::AskClose));
             }
             let top = container(Space::new(Length::Fill, Length::Fixed(2.0))).style(theme::tab_underline(active));
+            // Icono de terminal (>_) delante del título: el proceso y el cwd se leen de un vistazo.
+            let label = row![text(">_").size(theme::SMALL_SIZE).color(theme::DIM), label].spacing(6).align_y(Alignment::Center);
             let b = theme::btn(container(label).padding([0, 14]).center_y(Length::Fixed(TABS_H - 3.0)))
                 .padding(0)
                 .on_press(Message::SelectTab(i))
@@ -435,10 +438,19 @@ fn leaf_view(app: &App, id: u32, split: bool) -> Element<'_, Message> {
             None => placeholder("Esperando salida…"),
         }
     };
-    let body = container(inner).width(Length::Fill).height(Length::Fill).padding(LEAF_PAD).clip(true);
-    let framed = container(body).width(Length::Fill).height(Length::Fill).style(move |_| container::Style {
+    // Panel redondeado con borde sutil y padding generoso: el texto no pega con el marco.
+    let body = container(inner).width(Length::Fill).height(Length::Fill).padding(PANEL_PAD).clip(true);
+    let panel = container(body).width(Length::Fill).height(Length::Fill).clip(true).style(move |_| container::Style {
         background: Some(theme::TERM_BG.into()),
-        border: Border { color: if split && focused { Color { a: 0.55, ..theme::ACCENT } } else { Color::TRANSPARENT }, width: 1.0, radius: 0.0.into() },
+        border: Border {
+            color: if split && focused { Color { a: 0.55, ..theme::ACCENT } } else { theme::BORDER },
+            width: 1.0,
+            radius: theme::RADIUS_PANEL.into(),
+        },
+        ..Default::default()
+    });
+    let framed = container(panel).padding(PANEL_GUTTER).width(Length::Fill).height(Length::Fill).style(move |_| container::Style {
+        background: Some(theme::BG.into()),
         ..Default::default()
     });
     if split && !focused {

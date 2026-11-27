@@ -70,7 +70,11 @@ const TABS_H: f32 = 36.0;
 /// Altura de la barra de estado (abajo, con su divisor de 1 px).
 const STATUS_H: f32 = 26.0;
 /// Margen interior de cada panel de terminal.
-const LEAF_PAD: f32 = 8.0;
+/// Aire entre el panel y el borde de su hueco: margen exterior (`PANEL_GUTTER`) más el padding interior del texto.
+/// Todo lo que mide la posición del texto (rejilla, clics, origen) usa este total.
+const PANEL_GUTTER: f32 = 6.0;
+const PANEL_PAD: f32 = 16.0;
+const LEAF_PAD: f32 = PANEL_GUTTER + PANEL_PAD;
 /// Origen de la cuadrícula de un panel único (referencia de las pruebas); un split usa el de su rectángulo.
 const TERM_ORIGIN: (f32, f32) = (SIDEBAR_W + LEAF_PAD, 2.0 * TABS_H + LEAF_PAD);
 /// Primera opción del desplegable de manager del formulario: ningún manager.
@@ -1859,14 +1863,14 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
         fg = Some(f);
         bg = Some(b);
     }
-    if mark == Mark::Selected {
-        bg = Some(SELECTION_BG);
-    }
-    let mut sp: Span<'static, Message> = span(text).color(fg.unwrap_or(term::DEFAULT_FG)).underline(r.underline);
     // Cursor de bloque: el acento semitransparente bajo el carácter, que sigue con su color (no se invierte).
     if mark == Mark::Cursor {
         bg = Some(theme::CURSOR);
     }
+    if mark == Mark::Selected {
+        bg = Some(SELECTION_BG);
+    }
+    let mut sp: Span<'static, Message> = span(text).color(fg.unwrap_or(term::DEFAULT_FG)).underline(r.underline);
     if let Some(b) = bg { sp = sp.background(b); }
     if symbol && !fonts::is_nerd(fonts::current()) {
         // La fuente de símbolos mide 1 em por glifo; la celda, `metrics().0` em. Se escala para que cada glifo
