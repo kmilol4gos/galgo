@@ -241,6 +241,27 @@ pub fn epoch_for(saved: Option<&Saved>) -> u64 {
 /// pendientes no se guardan (no tienen nada que conservar), y los resúmenes se acotan.
 pub fn snapshot(st: &State) -> Saved {
     let now_unix = unix_now();
+    // Un fantasma sin mensajes propios se guarda igual si es el manager de un panel que se guarda (transitivamente):
+    // sin él, el panel de abajo quedaría con un manager que ya no existe tras el siguiente reinicio (B5).
+    let mut guardar: std::collections::HashSet<u32> = st
+        .panes
+        .values()
+        .filter(|p| !p.ghost || p.inbox.iter().any(|m| !m.acked))
+        .map(|p| p.id)
+        .collect();
+    loop {
+        let antes = guardar.len();
+        let nuevos: Vec<u32> = st
+            .panes
+            .values()
+            .filter(|p| guardar.contains(&p.id))
+            .filter_map(|p| p.manager.filter(|m| st.panes.contains_key(m)))
+            .collect();
+        guardar.extend(nuevos);
+        if guardar.len() == antes {
+            break;
+        }
+    }
     Saved {
         version: VERSION,
         epoch: st.epoch,
@@ -269,7 +290,7 @@ pub fn snapshot(st: &State) -> Saved {
         panes: st
             .panes
             .values()
-            .filter(|p| !p.ghost || p.inbox.iter().any(|m| !m.acked))
+            .filter(|p| guardar.contains(&p.id))
             .map(|p| SavedPane {
                 id: p.id,
                 name: p.name.clone(),
@@ -344,11 +365,10 @@ pub fn restore(st: &mut State, saved: Saved) {
     }
     let mut lost = Vec::new();
     for sp in saved.panes {
-        if sp.alive {
+        // B5: un panel que vuelve como fantasma no se anuncia como perdido; solo se avisa de los que se descartan.
+        if sp.alive && !necesario.contains(&sp.id) {
             lost.push((sp.id, sp.name.clone(), sp.manager));
-            if !necesario.contains(&sp.id) {
-                continue;
-            }
+            continue;
         }
         let mut inbox = Vec::new();
         for m in sp.inbox {
@@ -554,21 +574,34 @@ mod tests {
     }
 
     /// Un panel vivo vuelve como fantasma, su manager recibe el aviso y el mensaje sigue en el inbox.
+    /// B5 (sección 122): un manager fantasma sin mensajes propios sigue en el guardado mientras uno de sus paneles
+    /// tenga trabajo; si no, el panel de abajo se queda sin manager tras el siguiente reinicio.
+    #[test]
+    fn el_manager_de_un_fantasma_con_trabajo_se_guarda() {
+        let mut st = State { epoch: 4, ..State::default() };
+        restore(&mut st, saved_with_inbox());
+        for m in st.panes.get_mut(&1).unwrap().inbox.iter_mut() {
+            m.acked = true;
+        }
+        let guardado = snapshot(&st);
+        assert!(guardado.panes.iter().any(|p| p.id == 1), "el manager del que tiene trabajo se guarda");
+    }
+
     #[test]
     fn restaura_inbox_y_avisa_al_manager() {
         let mut st = State { epoch: 4, ..State::default() };
         restore(&mut st, saved_with_inbox());
         let mgr = &st.panes[&1];
         assert!(mgr.ghost && mgr._master.is_none());
-        // Su mensaje previo, más el aviso de que w ya no existe.
+        // Su mensaje previo. El panel w vuelve como fantasma: no se anuncia como perdido (B5).
         let inbox = &st.panes[&1].inbox;
-        assert_eq!(inbox.len(), 2, "el mensaje previo y el aviso");
-        assert!(inbox.iter().any(|m| m.summary.contains("el panel w ya no existe")));
+        assert_eq!(inbox.len(), 1, "solo el mensaje previo");
+        assert!(!inbox.iter().any(|m| m.summary.contains("ya no existe")));
         assert_eq!(st.panes[&2].inbox[0].summary, "hecho");
         assert_eq!(st.panes[&2].inbox[0].id, (2 << 32) | 4);
         assert_eq!(st.next_pane, 5);
-        // El aviso de arranque consume un id: el contador sigue donde estaba.
-        assert_eq!(st.next_msg, 10);
+        // Sin aviso de arranque (B5), el contador no avanza más de lo que ya estaba.
+        assert_eq!(st.next_msg, 9);
     }
 
     /// Un resumen enorme se guarda acotado.

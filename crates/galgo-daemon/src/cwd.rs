@@ -117,6 +117,18 @@ pub struct Anuncios {
 
 const MAX_CARGA: usize = 4096;
 
+/// B4: un título no lleva controles ni caracteres de formato que alteren la pantalla (bidi, ancho cero).
+pub fn limpiar_titulo(t: &str) -> String {
+    t.chars()
+        .filter(|c| !c.is_control() && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'))
+        .collect()
+}
+
+/// B4: una ruta anunciada por OSC 7 se guarda solo si es absoluta, sin controles y existe como carpeta.
+pub fn ruta_segura(p: &str) -> bool {
+    p.starts_with('/') && !p.chars().any(char::is_control) && std::path::Path::new(p).is_dir()
+}
+
 fn cierra(tipo: Tipo, carga: &[u8], out: &mut Anuncios) {
     let texto = String::from_utf8_lossy(carga).into_owned();
     match tipo {
@@ -126,9 +138,9 @@ fn cierra(tipo: Tipo, carga: &[u8], out: &mut Anuncios) {
             }
         }
         Tipo::Titulo => {
-            let t = texto.trim();
-            if !t.is_empty() {
-                out.titulo = Some(t.to_string());
+            let t = limpiar_titulo(texto.trim());
+            if !t.trim().is_empty() {
+                out.titulo = Some(t.trim().to_string());
             }
         }
     }
@@ -242,6 +254,17 @@ mod tests {
         assert_eq!(o.feed(b"\x1b]0;vim: main.rs\x07").titulo.as_deref(), Some("vim: main.rs"));
         assert_eq!(o.feed(b"\x1b]2;\xe2\x9c\xb3 Claude Code\x1b\\").titulo.as_deref(), Some("✳ Claude Code"));
         assert_eq!(o.feed(b"\x1b]2;   \x07").titulo, None, "un título vacío no cuenta");
+    }
+
+    #[test]
+    fn titulos_y_rutas_se_sanean() {
+        assert_eq!(limpiar_titulo("ab\u{202E}cd\u{7}\u{1b}e\u{200B}f"), "abcdef");
+        assert!(ruta_segura(&std::env::temp_dir().display().to_string()));
+        assert!(!ruta_segura("relativa/ruta"));
+        assert!(!ruta_segura("/no/existe/jamas/xyz"));
+        assert!(!ruta_segura("/tmp/con\u{7}control"));
+        let mut o = Osc::default();
+        assert_eq!(o.feed(b"\x1b]2;vim\xe2\x80\xae\x07").titulo.as_deref(), Some("vim"));
     }
 
     #[test]

@@ -124,6 +124,10 @@ struct Pane {
     /// La línea del cursor es un prompt libre. Lo mantiene el hilo lector (y el redimensionado), que ya tiene la
     /// pantalla. El estado lo lee sin tomar el candado de la pantalla: así no hay interbloqueo (ver `ORDEN DE CANDADOS`).
     prompt_libre: Arc<AtomicBool>,
+    /// Proceso en primer plano cuando el agente terminó su turno: si cambia, la marca de listo ya no vale (M2).
+    listo_fg: Option<i32>,
+    /// Último proceso en primer plano visto por `info`: si cambia, el título OSC del anterior se olvida (B4).
+    fg_visto: Mutex<Option<i32>>,
     /// Desde cuándo el agente terminó su turno (Stop). Solo entonces se le entregan tareas (A2). Solo en memoria.
     listo_desde: Option<Instant>,
     /// Última entrada del usuario o del CLI en el pty. No se entrega tras teclear hace poco (A2). Solo en memoria.
@@ -160,10 +164,40 @@ impl Pane {
         }
         let Some(master) = self._master.as_ref() else { return true };
         let Some(fg) = master.process_group_leader() else { return false };
-        if cwd::ruta_de_pid(fg).is_some_and(|r| es_agente_ruta(&r)) {
-            return true;
+        if let Some(ruta) = cwd::ruta_de_pid(fg) {
+            if es_agente_ruta(&ruta) {
+                return true;
+            }
+            // B1: una instalación por npm corre como `node …/claude/cli.js`: ahí manda la línea de órdenes.
+            let nombre = std::path::Path::new(&ruta).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if matches!(nombre.as_str(), "node" | "bun" | "deno") && args_de_pid(fg).is_some_and(|a| es_agente_args(&a)) {
+                return true;
+            }
         }
         self.pid.is_some_and(|p| p as i32 == fg) && is_agent_cmd(&self.cmd)
+    }
+
+    /// Proceso en primer plano del pty, o None sin pty.
+    fn fg_pid(&self) -> Option<i32> {
+        self._master.as_ref().and_then(|m| m.process_group_leader())
+    }
+
+    /// El turno terminó (Stop o Idle): el agente puede recibir su tarea tras la gracia, si sigue en el mismo proceso.
+    fn marcar_listo(&mut self) {
+        self.listo_desde = Some(Instant::now());
+        self.listo_fg = self.fg_pid();
+    }
+
+    /// El título OSC que sigue vigente: el del proceso en primer plano actual. Si el proceso cambió, el título del
+    /// anterior no se hereda (B4: un `htop` no sale con el título de `vim`).
+    fn titulo_vigente(&self) -> Option<String> {
+        let fg = self.fg_pid();
+        let mut visto = self.fg_visto.lock().unwrap();
+        if *visto != fg {
+            *visto = fg;
+            *self.osc_titulo.lock().unwrap() = None;
+        }
+        self.osc_titulo.lock().unwrap().clone()
     }
 
     /// La línea del cursor es un prompt libre (lo mantiene el hilo lector). Sin tomar el candado de la pantalla.
@@ -238,6 +272,8 @@ impl Pane {
             profundidad_recibida: 0,
             orquestador: false,
             listo_desde: None,
+            listo_fg: None,
+            fg_visto: Mutex::new(None),
             ultima_entrada: None,
             prompt_libre: Arc::new(AtomicBool::new(false)),
             changed: Arc::new(Notify::new()),
@@ -419,6 +455,10 @@ impl State {
         if from == to {
             bail!("un agente no se delega una tarea a sí mismo");
         }
+        // M4: no se devuelve una tarea a quien te la delegó (ciclo): el manager nunca queda con profundidad 3.
+        if self.tasks.iter().any(|t| t.status.abierta() && t.to == from && t.from == to) {
+            bail!("no se le devuelve una tarea a quien te la delegó");
+        }
         // M2: la profundidad es la de la última tarea que recibió el remitente, y no se reinicia al cerrarla: un
         // agente que trabaja en una tarea de profundidad d delega a d+1. Un manager (sin tareas recibidas) delega a 1.
         let profundidad = self.panes.get(&from).map_or(1, |p| p.profundidad_recibida + 1);
@@ -448,9 +488,14 @@ impl State {
     fn entregar(&mut self, pane: u32) {
         let fuera = self.panes.get(&pane).is_some_and(|p| p.hooked && !p.agente_en_primer_plano());
         if fuera {
-            // Ya no es el agente (salió, o hay un shell delante): no se le entrega nada, y hasta su próximo hook no es agente.
+            // Ya no es el agente (salió, o hay un shell delante): no se le entrega nada, y hasta su próximo hook no es
+            // agente. M2: lo que sabíamos de su turno (listo, resultado, estado) se olvida con él.
+            // Solo se olvida lo que decide la entrega (el turno terminado). El estado y el resultado se conservan: un hook
+            // de un shell no debe borrar el resultado que ya reportó el panel.
             if let Some(p) = self.panes.get_mut(&pane) {
                 p.hooked = false;
+                p.listo_desde = None;
+                p.listo_fg = None;
             }
         }
         self.deliver(pane);
@@ -467,6 +512,7 @@ impl State {
                 && matches!(p.status, Status::Idle | Status::Done | Status::Failed)
                 // A2: solo tras el fin de un turno, con un rato de gracia, sin teclear hace poco y con el cursor en un prompt vacío.
                 && p.listo_desde.is_some_and(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
+                && p.listo_fg == p.fg_pid()
                 && p.ultima_entrada.is_none_or(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
                 && p.linea_de_prompt_libre()
         });
@@ -485,7 +531,10 @@ impl State {
         p.status = Status::Working;
         p.reported = false;
         p.touched_since_report = true;
-        p.profundidad_recibida = self.tasks[idx].depth;
+        // M4: la profundidad sube con las entregas; solo una orden humana la devuelve a cero (ver `Send`).
+        p.profundidad_recibida = p.profundidad_recibida.max(self.tasks[idx].depth);
+        p.listo_desde = None;
+        p.listo_fg = None;
         self.tasks[idx].status = TaskStatus::Entregada;
         self.touch();
     }
@@ -633,7 +682,7 @@ impl State {
             workspace: p.workspace.clone(),
             cwd: p.cwd_vivo(),
             programa: p.programa(),
-            titulo_osc: p.osc_titulo.lock().ok().and_then(|g| g.clone()),
+            titulo_osc: p.titulo_vigente(),
             usage: usage::merged(p.usage.as_ref(), p.usage_report.as_ref()),
             title: p.title.clone(),
             agent: p.hooked || is_agent_cmd(&p.cmd) || p.usage.is_some() || p.usage_report.is_some(),
@@ -907,6 +956,8 @@ fn git_run(dir: &str, args: &[&str]) -> std::result::Result<String, String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C")
         .arg(dir)
+        // B3: el repo del agente no ejecuta sus propios programas (fsmonitor, hooks): git no lee esa configuración.
+        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -976,6 +1027,18 @@ fn es_agente_ruta(ruta: &str) -> bool {
     ruta.split('/').any(|c| c == "claude" || c == "codex")
 }
 
+/// La línea de órdenes de un proceso tiene un componente claude o codex (B1: `node …/@openai/codex/bin/codex.js`).
+fn es_agente_args(args: &str) -> bool {
+    args.split_whitespace().any(|t| t.split('/').any(|c| c == "claude" || c == "codex"))
+}
+
+/// Argumentos de un proceso (`ps -o args=`), o None si no existe.
+fn args_de_pid(pid: i32) -> Option<String> {
+    let out = Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
+    let texto = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!texto.is_empty()).then_some(texto)
+}
+
 fn is_agent_cmd(cmd: &[String]) -> bool {
     cmd.first()
         .and_then(|c| std::path::Path::new(c).file_name())
@@ -1019,6 +1082,8 @@ fn git_program_with(program: &str, dir: &str, args: &[&str], inherited: &[(&str,
     let mut cmd = std::process::Command::new(program);
     cmd.arg("-C")
         .arg(dir)
+        // B3: el repo del agente no ejecuta sus propios programas (fsmonitor, hooks): git no lee esa configuración.
+        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1064,12 +1129,10 @@ fn is_session_marker(key: &str) -> bool {
     // hereda se cree otro terminal o otra sesión. TERM_PROGRAM y su versión se fijan después, para galgo.
     const EXACT: &[&str] = &[
         "CLAUDECODE",
-        "CLAUDE_EFFORT",
         "TERM_PROGRAM",
         "TERM_PROGRAM_VERSION",
         "TERM_SESSION_ID",
         "TERMINFO",
-        "TERMINFO_DIRS",
         "TMUX",
         "TMUX_PANE",
         "STY",
@@ -1243,6 +1306,8 @@ impl Daemon {
             profundidad_recibida: 0,
             orquestador: false,
             listo_desde: None,
+            listo_fg: None,
+            fg_visto: Mutex::new(None),
             ultima_entrada: None,
             changed: Arc::clone(&changed),
             orphans: Vec::new(),
@@ -1272,7 +1337,7 @@ impl Daemon {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let anuncios = osc.feed(&buf[..n]);
-                        if let Some(dir) = anuncios.cwd {
+                        if let Some(dir) = anuncios.cwd.filter(|d| cwd::ruta_segura(d)) {
                             *osc_hilo.lock().unwrap() = Some(dir);
                         }
                         if let Some(titulo) = anuncios.titulo {
@@ -1638,6 +1703,10 @@ impl Daemon {
                 let mut st = self.state.lock().unwrap();
                 let id = st.resolve(&pane)?;
                 let p = st.panes.get_mut(&id).unwrap();
+                // M4: una orden humana (sin panel detrás) empieza un trabajo nuevo: la cadena de profundidad vuelve a cero.
+                if sender.is_none() && enter {
+                    p.profundidad_recibida = 0;
+                }
                 let mut chunk = text.into_bytes();
                 if enter {
                     chunk.push(b'\r');
@@ -1823,6 +1892,11 @@ impl Daemon {
                             if !reported && p.status != Status::Blocked {
                                 p.status = Status::Idle;
                             }
+                            // M1: un agente que espera la orden (idle_prompt, o el SessionStart de Codex al arrancar)
+                            // está libre. La heurística del prompt (cursor visible) evita los diálogos de arranque.
+                            if p.status == Status::Idle {
+                                p.marcar_listo();
+                            }
                         }
                         HookEvent::Blocked => {
                             let p = st.panes.get_mut(&id).unwrap();
@@ -1840,7 +1914,7 @@ impl Daemon {
                         }
                         HookEvent::TurnEnded | HookEvent::Failed => {
                             // A2: el turno terminó: solo ahora (y tras un rato) se le puede entregar una tarea.
-                            st.panes.get_mut(&id).unwrap().listo_desde = Some(Instant::now());
+                            st.panes.get_mut(&id).unwrap().marcar_listo();
                             // Si ya hubo un `galgo done` explícito en este turno, no se duplica.
                             if !reported {
                                 let failed = event == HookEvent::Failed;
@@ -2539,10 +2613,10 @@ mod tests_sesion {
     /// M2/M3: solo se quitan marcadores de sesión; la configuración del usuario se conserva.
     #[test]
     fn marcadores_de_sesion_si_configuracion_no() {
-        for k in ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_TOKEN", "HERDR_PANE_ID", "HERDR_ENV", "CLAUDE_EFFORT", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERMINFO", "TMUX", "ITERM_SESSION_ID", "KITTY_WINDOW_ID", "WEZTERM_PANE"] {
+        for k in ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_TOKEN", "HERDR_PANE_ID", "HERDR_ENV", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERMINFO", "TMUX", "ITERM_SESSION_ID", "KITTY_WINDOW_ID", "WEZTERM_PANE"] {
             assert!(is_session_marker(k), "{k} debe quitarse");
         }
-        for k in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "HOME", "PATH", "GALGO_DEBUG", "COLORTERM", "LANG"] {
+        for k in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "HOME", "PATH", "GALGO_DEBUG", "COLORTERM", "LANG", "CLAUDE_EFFORT", "TERMINFO_DIRS"] {
             assert!(!is_session_marker(k), "{k} debe conservarse");
         }
     }
@@ -3240,6 +3314,47 @@ mod orquestador_tests {
         assert!(r.block_on(d.handle(Some(4), lanza)).is_err(), "un agente orquestado no lanza paneles");
         assert!(r.block_on(d.handle(Some(1), Request::Shutdown)).is_err(), "un panel no detiene el daemon");
         assert!(r.block_on(d.handle(None, envia("3"))).is_ok(), "sin panel (el usuario) no hay restricción");
+    }
+
+    /// M1: un agente que avisa `idle` (su espera de orden, o el arranque de Codex) queda listo para su primera tarea
+    /// tras la gracia. Blocked no cuenta: ahí hay un diálogo.
+    #[test]
+    fn idle_deja_listo_para_la_primera_tarea() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _x = vivo(&mut st, 1, "x", false, Status::Idle);
+        let d = daemon_con(st);
+        let r = rt();
+        r.block_on(d.handle(Some(1), Request::Hook { pane: "1".into(), event: HookEvent::Idle, summary: None, source: None })).unwrap();
+        assert!(d.state.lock().unwrap().panes[&1].listo_desde.is_some(), "idle es fin de turno");
+        let mut st = d.state.lock().unwrap();
+        st.panes.get_mut(&1).unwrap().status = Status::Blocked;
+        st.panes.get_mut(&1).unwrap().listo_desde = None;
+        drop(st);
+        r.block_on(d.handle(Some(1), Request::Hook { pane: "1".into(), event: HookEvent::Idle, summary: None, source: None })).unwrap();
+        assert!(d.state.lock().unwrap().panes[&1].listo_desde.is_none(), "un bloqueo no se da por listo");
+    }
+
+    /// M4: no se devuelve una tarea a quien te la delegó; y una orden humana devuelve la profundidad a cero.
+    #[test]
+    fn ciclos_y_profundidad_con_orden_humana() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _j = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _w = vivo(&mut st, 2, "worker", true, Status::Idle);
+        st.tasks.push(tarea_abierta(1, 1, 2, None, unix_ahora()));
+        assert!(st.check_delegation(2, 1, None).is_err(), "el worker no devuelve la tarea a su jefe");
+        st.panes.get_mut(&2).unwrap().profundidad_recibida = 2;
+        let d = daemon_con(st);
+        let r = rt();
+        r.block_on(d.handle(None, Request::Send { pane: "2".into(), text: "hola".into(), enter: true })).unwrap();
+        assert_eq!(d.state.lock().unwrap().panes[&2].profundidad_recibida, 0, "la orden humana empieza un trabajo nuevo");
+    }
+
+    /// B1: una instalación por npm se reconoce por su línea de órdenes; un node cualquiera no.
+    #[test]
+    fn el_agente_de_npm_se_reconoce_por_sus_argumentos() {
+        assert!(es_agente_args("node /usr/local/lib/node_modules/@openai/codex/bin/codex.js --model x"));
+        assert!(es_agente_args("node /opt/claude/cli.js"));
+        assert!(!es_agente_args("node server.js --port 3000"));
     }
 
     /// Revisión 17, A1: `Resize` (pantalla → estado) y `tick` (que entrega) no deben interbloquearse. Con una tarea
