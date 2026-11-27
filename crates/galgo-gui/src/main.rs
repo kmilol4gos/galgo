@@ -572,7 +572,8 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
 
 /// M2: un panel que puede tener trabajo en curso (todo salvo los terminados o caídos) pide confirmación al cerrarse.
 fn needs_confirm(p: &PaneInfo) -> bool {
-    !matches!(p.status, Status::Done | Status::Failed | Status::Exited)
+    // Solo un proceso ya terminado se cierra sin preguntar: un agente en Done o Failed sigue vivo y puede tener estado.
+    !matches!(p.status, Status::Exited)
 }
 
 /// M2: con el formulario abierto, Cmd+W cierra el formulario (no el panel de detrás) y Cmd+N sigue valiendo;
@@ -3431,6 +3432,15 @@ mod tests {
         }
         let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
         assert!(app.alias.get("proyecto").is_none());
+    }
+
+    /// Cerrar pide confirmación siempre que el proceso siga vivo (también en Done o Failed); un terminado no.
+    #[test]
+    fn cerrar_pide_confirmacion_mientras_el_proceso_viva() {
+        for st in [Status::Idle, Status::Working, Status::Blocked, Status::Done, Status::Failed] {
+            assert!(needs_confirm(&pane_info(1, "p", st)), "{st:?} sigue vivo");
+        }
+        assert!(!needs_confirm(&pane_info(1, "p", Status::Exited)));
     }
 
     /// A1: cerrar el último panel no relanza su shell (el listado llega vacío, pero el daemon es el mismo).
