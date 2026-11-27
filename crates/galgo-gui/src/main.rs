@@ -8,6 +8,7 @@ use std::time::Duration;
 use theme::{BG, MUTED, SIDEBAR, TEXT};
 
 mod attention;
+mod cajas;
 mod chrome;
 mod launch;
 mod fonts;
@@ -2654,6 +2655,36 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
     sp
 }
 
+/// Color de trazo de una celda (con inversa, el fondo): lo que pinta el canvas de cajas.
+fn color_de_trazo(r: &Run) -> Color {
+    if r.inverse {
+        term::color(r.bg).unwrap_or(term::DEFAULT_BG)
+    } else {
+        term::color(r.fg).unwrap_or(term::DEFAULT_FG)
+    }
+}
+
+/// Saca de la fila las cajas y bloques que dibuja `cajas` (se sustituyen por un espacio con el mismo estilo, así el
+/// fondo y el cursor se pintan igual) y las apunta en la capa de la pantalla, a su columna y fila exactas.
+fn quitar_cajas(runs: &[Run], fila: u16, capa: &mut cajas::Capa) -> Vec<Run> {
+    let mut col: u16 = 0;
+    runs.iter()
+        .map(|r| {
+            let mut t = String::with_capacity(r.t.len());
+            for ch in r.t.chars() {
+                if cajas::es_dibujable(ch) {
+                    capa.celdas.push((col, fila, ch, color_de_trazo(r)));
+                    t.push(' ');
+                } else {
+                    t.push(ch);
+                }
+                col += cells_of(ch);
+            }
+            Run { t, ..r.clone() }
+        })
+        .collect()
+}
+
 fn spans_for_line(runs: &[Run], cursor: Option<(u16, Mark)>, sel: Option<(u16, u16)>) -> Vec<Span<'static, Message>> {
     let mut out = Vec::new();
     let mut col: u16 = 0;
@@ -2699,15 +2730,20 @@ fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle) -> E
             CursorStyle::Idle => true,
         };
     let mark = if style == CursorStyle::Idle { Mark::CursorIdle } else { Mark::Cursor };
+    let mut capa = cajas::Capa { cw: cell_w(), lh: line_h(), ligero: (font_size() / 12.0).max(1.0), ..Default::default() };
     for (r, runs) in snap.lines.iter().enumerate() {
         let cursor = (visible && snap.cursor.0 as usize == r).then_some((snap.cursor.1, mark));
         let selected = sel.and_then(|s| selected_cols(s, r as u16, snap.cols));
-        let spans = spans_for_line(runs, cursor, selected);
+        let sin_cajas = quitar_cajas(runs, r as u16, &mut capa);
+        let spans = spans_for_line(&sin_cajas, cursor, selected);
         lines = lines.push(
             rich_text(spans).size(font_size()).font(terminal_font()).line_height(iced::widget::text::LineHeight::Absolute(line_h().into())).wrapping(iced::widget::text::Wrapping::None),
         );
     }
-    lines.into()
+    // Las cajas van encima del texto, en la misma rejilla: cada celda ocupa exactamente cw × lh.
+    let (ancho, alto) = (snap.cols as f32 * cell_w(), snap.lines.len() as f32 * line_h());
+    let dibujo = iced::widget::canvas(capa).width(Length::Fixed(ancho)).height(Length::Fixed(alto));
+    iced::widget::Stack::with_children(vec![lines.into(), dibujo.into()]).into()
 }
 
 fn view(app: &App) -> Element<'_, Message> {
@@ -4558,6 +4594,22 @@ mod simbolos_tests {
 }
 
 #[cfg(test)]
+mod cajas_tests {
+    use super::*;
+
+    /// Las cajas salen de la fila y se apuntan en su columna y fila exactas; el resto del texto no cambia.
+    #[test]
+    fn las_cajas_salen_de_la_fila_y_van_a_su_celda() {
+        let runs = vec![Run { t: "┌─x".into(), fg: galgo_proto::Color::Default, bg: galgo_proto::Color::Default, bold: false, italic: false, underline: false, inverse: false }];
+        let mut capa = cajas::Capa { cw: 8.0, lh: 18.0, ligero: 1.0, ..Default::default() };
+        let sin = quitar_cajas(&runs, 3, &mut capa);
+        assert_eq!(sin[0].t, "  x");
+        assert_eq!(capa.celdas.len(), 2);
+        assert_eq!((capa.celdas[0].0, capa.celdas[0].1, capa.celdas[0].2), (0, 3, '┌'));
+        assert_eq!((capa.celdas[1].0, capa.celdas[1].1, capa.celdas[1].2), (1, 3, '─'));
+    }
+}
+
 mod anchos_tests {
     use super::*;
 
