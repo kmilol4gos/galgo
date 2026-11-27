@@ -168,6 +168,7 @@ CLAUDE_BIN="$TMP/bin/claude" PI_BIN="$TMP/bin/pi" PLANNER_MODEL=openai/terra \
   "$ROOT/scripts/team.sh" eq "$TMP" >/dev/null
 # Espera a que los agentes falsos escriban su línea (no un tiempo fijo: con la máquina cargada tardan más).
 for i in $(seq 1 50); do galgo read eq-reviewer 2>/dev/null | grep -q "claude --model opus" && break; sleep 0.2; done
+for i in $(seq 1 50); do galgo read eq-planner 2>/dev/null | grep -q "pi --model openai/terra" && break; sleep 0.2; done
 [ "$(galgo ls | grep -c ' eq-')" = "4" ]; check "crea los 4 paneles" $?
 galgo read eq-programmer | grep -q "claude --model haiku"; check "programmer usa haiku" $?
 galgo read eq-reviewer | grep -q "claude --model opus"; check "reviewer usa opus" $?
