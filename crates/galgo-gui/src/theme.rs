@@ -4,23 +4,28 @@
 //! sobrios y los colores de estado (un punto por agente). Filas planas: fondo transparente, con un tono sutil al pasar
 //! el puntero o al estar seleccionadas. Bordes finos y esquinas poco redondeadas.
 
-use crate::term;
 use galgo_proto::Status;
 use iced::theme::Palette;
 use iced::widget::{button, container};
 use iced::{Background, Border, Color, Element, Shadow, Theme};
 
-pub const BG: Color = Color::from_rgb(0.106, 0.090, 0.075);
-pub const SIDEBAR: Color = Color::from_rgb(0.141, 0.122, 0.098);
-pub const HOVER: Color = Color::from_rgb(0.173, 0.149, 0.118);
-pub const SELECTED: Color = Color::from_rgb(0.227, 0.188, 0.141);
-pub const BORDER: Color = Color::from_rgb(0.227, 0.196, 0.161);
+/// Fondo cálido único: el del chrome y el del terminal son el mismo tono (#35312c), así que el terminal no choca.
+pub const BG: Color = Color::from_rgb(0.208, 0.192, 0.173);
+/// Barra lateral: un punto más oscura que el fondo, para separarla sin divisores marcados.
+pub const SIDEBAR: Color = Color::from_rgb(0.173, 0.161, 0.145);
+pub const HOVER: Color = Color::from_rgb(0.247, 0.231, 0.208);
+pub const SELECTED: Color = Color::from_rgb(0.290, 0.271, 0.239);
+/// Bordes sutiles: solo para dar forma a paneles y campos; las divisiones se hacen con espacio y tono.
+pub const BORDER: Color = Color::from_rgb(0.275, 0.259, 0.231);
 pub const TEXT: Color = Color::from_rgb(0.925, 0.890, 0.824);
 /// Texto de las filas no seleccionadas: un punto más apagado que `TEXT`.
 pub const TEXT_SOFT: Color = Color::from_rgb(0.788, 0.749, 0.682);
 pub const MUTED: Color = Color::from_rgb(0.561, 0.518, 0.459);
-pub const DIM: Color = Color::from_rgb(0.369, 0.337, 0.286);
+pub const DIM: Color = Color::from_rgb(0.420, 0.388, 0.345);
+/// Acento suave: azul apagado, para foco y selección. El cursor lo usa semitransparente.
 pub const ACCENT: Color = Color::from_rgb(0.435, 0.608, 0.820);
+/// Relleno del cursor de bloque: el acento con transparencia, para no tapar el carácter bajo él.
+pub const CURSOR: Color = Color { a: 0.55, ..ACCENT };
 pub const WORKING: Color = Color::from_rgb(0.435, 0.659, 0.784);
 pub const BLOCKED: Color = Color::from_rgb(0.878, 0.659, 0.290);
 pub const DONE: Color = Color::from_rgb(0.561, 0.749, 0.498);
@@ -28,7 +33,7 @@ pub const FAILED: Color = Color::from_rgb(0.851, 0.451, 0.420);
 pub const IDLE: Color = Color::from_rgb(0.369, 0.337, 0.286);
 
 /// Esquina de botones, filas y paneles.
-pub const RADIUS: f32 = 3.0;
+pub const RADIUS: f32 = 8.0;
 /// Grosor de los bordes finos (divisores de splits, foco).
 pub const LINE: f32 = 1.0;
 /// Tamaños de letra: título, cuerpo y texto secundario.
@@ -139,8 +144,10 @@ pub fn tab_underline(active: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// Fondo del área de terminales (igual que el del terminal: el panel no se distingue de su marco).
-pub const TERM_BG: Color = term::DEFAULT_BG;
+/// Fondo del área de terminales: el mismo tono cálido que el chrome (`BG`), así el panel se funde con su marco.
+pub const TERM_BG: Color = BG;
+/// Radio del panel del terminal y de las píldoras de pestaña.
+pub const RADIUS_PANEL: f32 = 12.0;
 /// Superficie elevada: paleta, lanzador y diálogos que flotan sobre el terminal.
 pub const ELEVATED: Color = Color::from_rgb(0.141, 0.122, 0.098);
 /// Velo bajo una capa flotante.
@@ -196,8 +203,9 @@ pub fn overlay(_: &Theme) -> container::Style {
 pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        // Píldora: la activa, un tono más clara que el fondo; sin subrayados ni rectángulos duros.
         let background = if active {
-            Some(Background::Color(TERM_BG))
+            Some(Background::Color(SELECTED))
         } else if hover {
             Some(Background::Color(HOVER))
         } else {
@@ -206,7 +214,7 @@ pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
         button::Style {
             background,
             text_color: if active { TEXT } else { MUTED },
-            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 0.0.into() },
+            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: RADIUS_PANEL.into() },
             shadow: Shadow::default(),
         }
     }

@@ -1854,7 +1854,7 @@ fn is_symbol(ch: char) -> bool {
 
 fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Message> {
     let (mut fg, mut bg) = (term::color(r.fg), term::color(r.bg));
-    if r.inverse ^ (mark == Mark::Cursor) {
+    if r.inverse {
         let (f, b) = (bg.unwrap_or(term::DEFAULT_BG), fg.unwrap_or(term::DEFAULT_FG));
         fg = Some(f);
         bg = Some(b);
@@ -1863,6 +1863,10 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
         bg = Some(SELECTION_BG);
     }
     let mut sp: Span<'static, Message> = span(text).color(fg.unwrap_or(term::DEFAULT_FG)).underline(r.underline);
+    // Cursor de bloque: el acento semitransparente bajo el carácter, que sigue con su color (no se invierte).
+    if mark == Mark::Cursor {
+        bg = Some(theme::CURSOR);
+    }
     if let Some(b) = bg { sp = sp.background(b); }
     if symbol && !fonts::is_nerd(fonts::current()) {
         // La fuente de símbolos mide 1 em por glifo; la celda, `metrics().0` em. Se escala para que cada glifo
