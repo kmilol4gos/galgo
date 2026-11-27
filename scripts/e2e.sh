@@ -1460,5 +1460,20 @@ tareas = pedir({"op": "tasks", "pane": "jefe145"})["data"]
 assert any(t["id"] == tid and t["status"] == "lista" for t in tareas), tareas
 PYEOF
 check "la tarea se entrega solo con hooks y el resultado vuelve al remitente" $?
+echo "146. modo orquestador (CLI): galgo delegate y galgo task done desde el panel propio (GALGO_PANE)"
+export GALGO_SOCKET="$TMP/c146/g.sock"; mkdir -p "$TMP/c146" && chmod 700 "$TMP/c146"
+galgo spawn jefe146 -- /bin/cat >/dev/null; galgo spawn codex146 -- /bin/cat >/dev/null
+check "paneles de prueba" $?
+python3 -c 'import json,socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
+s.sendall((json.dumps({"op":"hook","pane":"codex146","event":"idle","summary":None})+"\n").encode()); s.shutdown(socket.SHUT_WR); s.makefile("r").readline()' "$GALGO_SOCKET"
+out=$(GALGO_PANE=jefe146 galgo delegate codex146 crea x.txt --context "en la raíz"); echo "$out" | grep -q "tarea #.*entregada"; check "galgo delegate entrega a un agente libre" $?
+TID=$(echo "$out" | sed -n 's/^tarea #\([0-9]*\).*/\1/p')
+sleep 0.6; galgo read codex146 | grep -q "tarea #$TID"; check "el destinatario recibe el texto" $?
+GALGO_PANE=jefe146 galgo task done "$TID" "soy jefe" >/dev/null 2>&1; [ $? -ne 0 ]; check "el remitente no cierra la tarea" $?
+GALGO_PANE=codex146 galgo task done "$TID" x.txt creado >/dev/null; check "el destinatario cierra la tarea" $?
+galgo inbox --pane jefe146 | grep -q "x.txt creado"; check "el resultado llega al remitente" $?
+galgo tasks --pane jefe146 | grep -q "lista"; check "galgo tasks muestra la tarea cerrada" $?
+env -u GALGO_PANE galgo delegate codex146 algo >/dev/null 2>&1; [ $? -ne 0 ]; check "sin GALGO_PANE no se delega" $?
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

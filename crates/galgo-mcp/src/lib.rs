@@ -186,6 +186,20 @@ fn build_request(name: &str, args: &Value, env: &Env) -> Result<Request, String>
         }),
         "galgo_inbox" => Ok(Request::Inbox { pane: own_pane(env)? }),
         "galgo_ack" => Ok(Request::Ack { pane: own_pane(env)?, msg: u64_arg(args, "msg")? }),
+        // El remitente es siempre este panel (GALGO_PANE), nunca un argumento: no se puede suplantar a otro agente.
+        "galgo_delegate" => Ok(Request::Delegate {
+            from: own_pane(env)?,
+            to: str_arg(args, "to")?,
+            task: str_arg(args, "task")?,
+            context: opt_str(args, "context"),
+        }),
+        "galgo_task_done" => Ok(Request::TaskDone {
+            from: own_pane(env)?,
+            id: u64_arg(args, "id")?,
+            summary: str_arg(args, "summary")?,
+            ok: opt_bool(args, "ok").unwrap_or(true),
+        }),
+        "galgo_tasks" => Ok(Request::Tasks { pane: opt_str(args, "pane").or_else(|| env.pane.clone()) }),
         other => Err(format!("herramienta desconocida: {other}")),
     }
 }
@@ -288,6 +302,32 @@ pub fn tool_definitions() -> Vec<Value> {
             &["target"],
         ),
         tool(
+            "galgo_delegate",
+            "Delega una tarea en otro agente del workspace. Remitente: este panel (GALGO_PANE). La tarea llega al destinatario cuando está libre; su resultado vuelve aquí.",
+            json!({
+                "to": { "type": "string", "description": "Agente destinatario: id o nombre de panel." },
+                "task": { "type": "string", "description": "Qué hacer, en pocas líneas." },
+                "context": { "type": "string", "description": "Contexto opcional para quien la recibe." },
+            }),
+            &["to", "task"],
+        ),
+        tool(
+            "galgo_task_done",
+            "Cierra una tarea que te delegaron (solo el destinatario puede). El resultado vuelve al agente que la delegó.",
+            json!({
+                "id": { "type": "integer", "description": "Id de la tarea." },
+                "summary": { "type": "string", "description": "Resultado en pocas líneas." },
+                "ok": { "type": "boolean", "default": true },
+            }),
+            &["id", "summary"],
+        ),
+        tool(
+            "galgo_tasks",
+            "Lista las tareas delegadas en las que participa un panel (por defecto, este).",
+            json!({ "pane": { "type": "string", "description": "Panel: id o nombre. Por defecto, este." } }),
+            &[],
+        ),
+        tool(
             "galgo_done",
             "Reporta el resultado de este panel (GALGO_PANE) y lo entrega a su manager.",
             json!({
@@ -363,14 +403,55 @@ mod tests {
         assert_eq!(r["result"]["protocolVersion"], PROTOCOL_VERSION);
     }
 
+    /// Modo orquestador: el remitente de una delegación es este panel (GALGO_PANE), aunque los argumentos digan otra cosa.
     #[test]
-    fn tools_list_expone_las_ocho_herramientas() {
+    fn delegate_toma_el_remitente_del_entorno() {
+        let env = Env { pane: Some("jefe".into()), cwd: None };
+        let args = json!({ "to": "codex", "task": "crea x.txt", "from": "otro-agente" });
+        match build_request("galgo_delegate", &args, &env).unwrap() {
+            Request::Delegate { from, to, task, .. } => {
+                assert_eq!(from, "jefe", "el argumento from no cuenta");
+                assert_eq!((to.as_str(), task.as_str()), ("codex", "crea x.txt"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let sin_panel = Env { pane: None, cwd: None };
+        assert!(build_request("galgo_delegate", &args, &sin_panel).is_err(), "sin GALGO_PANE no se delega");
+        assert!(build_request("galgo_task_done", &json!({ "id": 3, "summary": "hecho" }), &sin_panel).is_err());
+    }
+
+    /// Cerrar una tarea: el id y el resumen llegan tal cual, `ok` por defecto es verdadero.
+    #[test]
+    fn task_done_lleva_id_resumen_y_ok() {
+        let env = Env { pane: Some("codex".into()), cwd: None };
+        match build_request("galgo_task_done", &json!({ "id": 7, "summary": "listo" }), &env).unwrap() {
+            Request::TaskDone { from, id, summary, ok } => {
+                assert_eq!((from.as_str(), id, summary.as_str(), ok), ("codex", 7, "listo", true));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn tools_list_expone_las_herramientas() {
         let r = call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &no_daemon, None);
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["galgo_list", "galgo_spawn", "galgo_send", "galgo_read", "galgo_wait", "galgo_done", "galgo_inbox", "galgo_ack"]
+            [
+                "galgo_list",
+                "galgo_spawn",
+                "galgo_send",
+                "galgo_read",
+                "galgo_wait",
+                "galgo_delegate",
+                "galgo_task_done",
+                "galgo_tasks",
+                "galgo_done",
+                "galgo_inbox",
+                "galgo_ack"
+            ]
         );
         for t in tools {
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));

@@ -124,6 +124,31 @@ enum Cmd {
     },
     /// Uso vivo de los paneles (tokens, contexto, coste) y cuotas por agente.
     Usage(usage_cmd::UsageArgs),
+    /// Delega una tarea a otro agente del workspace. Remitente: este panel (GALGO_PANE).
+    Delegate {
+        /// Panel destinatario: id o nombre.
+        to: String,
+        /// Texto de la tarea (varias palabras valen).
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
+        /// Contexto adicional que acompaña a la tarea.
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long, env = "GALGO_PANE")]
+        from: String,
+    },
+    /// Tareas delegadas en las que participa este panel (o todas, con --all).
+    Tasks {
+        #[arg(long)]
+        all: bool,
+        #[arg(long, env = "GALGO_PANE")]
+        pane: Option<String>,
+    },
+    /// Cierra una tarea que te delegaron: el resultado vuelve a quien te la pidió.
+    Task {
+        #[command(subcommand)]
+        action: TaskCmd,
+    },
     /// Título de la tarea del panel: lo muestra la barra lateral. Sin texto lo borra.
     Title {
         #[arg(default_value = "")]
@@ -135,6 +160,20 @@ enum Cmd {
     Worktree {
         #[command(subcommand)]
         action: WorktreeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCmd {
+    /// Termina la tarea `id` con su resumen. `--fail` la marca como fallida.
+    Done {
+        id: u64,
+        #[arg(required = true, num_args = 1..)]
+        summary: Vec<String>,
+        #[arg(long)]
+        fail: bool,
+        #[arg(long, env = "GALGO_PANE")]
+        from: String,
     },
 }
 
@@ -211,6 +250,11 @@ fn run() -> Result<()> {
         Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
         Cmd::Stop => Request::Shutdown,
         Cmd::Title { text, pane } => Request::SetTitle { pane: pane.clone(), title: text.clone() },
+        Cmd::Delegate { to, task, context, from } => Request::Delegate { from: from.clone(), to: to.clone(), task: task.join(" "), context: context.clone() },
+        Cmd::Tasks { all, pane } => Request::Tasks { pane: if *all { None } else { pane.clone() } },
+        Cmd::Task { action: TaskCmd::Done { id, summary, fail, from } } => {
+            Request::TaskDone { from: from.clone(), id: *id, summary: summary.join(" "), ok: !fail }
+        }
         Cmd::Worktree { action } => {
             let (pane, action, confirm) = match action {
                 WorktreeCmd::Diff { pane } => (pane, galgo_proto::WorktreeAction::Diff, false),
@@ -344,6 +388,25 @@ fn print_human(cmd: &Cmd, data: Value) -> Result<()> {
             }
         }
         Cmd::Read { .. } => println!("{}", data["text"].as_str().unwrap_or("")),
+        Cmd::Delegate { .. } | Cmd::Task { .. } => {
+            let id = data["id"].as_u64();
+            match id {
+                Some(id) => println!("tarea #{id}: {}", data["status"].as_str().unwrap_or("?")),
+                None => println!("{}", data["ok"].as_bool().map_or("hecho".to_string(), |_| "tarea cerrada".to_string())),
+            }
+        }
+        Cmd::Tasks { .. } => {
+            let tareas: Vec<galgo_proto::TaskInfo> = serde_json::from_value(data)?;
+            if tareas.is_empty() {
+                println!("sin tareas");
+            }
+            for t in tareas {
+                println!("#{} {} → {} [{}] {}", t.id, t.from, t.to, serde_json::to_value(t.status)?.as_str().unwrap_or("?"), t.text);
+                if let Some(s) = &t.summary {
+                    println!("    {s}");
+                }
+            }
+        }
         Cmd::Worktree { action } => match action {
             WorktreeCmd::Diff { .. } => println!("{}", data["texto"].as_str().unwrap_or("sin cambios")),
             _ => println!("{}", data["mensaje"].as_str().unwrap_or("hecho")),
@@ -411,5 +474,48 @@ mod tests_workspace {
         let v = visible("ws\u{1b}[31mROJO\n── falso (9)");
         assert!(!v.chars().any(char::is_control), "{v:?}");
         assert_eq!(v, "ws?[31mROJO?── falso (9)");
+    }
+}
+
+#[cfg(test)]
+mod tests_orquestador {
+    use super::*;
+    use clap::Parser;
+
+    /// Las dos pruebas tocan GALGO_PANE: una a la vez, o una vería la variable de la otra.
+    static ENTORNO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// El remitente de `delegate` y `task done` sale de GALGO_PANE: sin él, la CLI no delega ni cierra nada.
+    #[test]
+    fn delegate_exige_el_panel_propio() {
+        let _g = ENTORNO.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("GALGO_PANE");
+        assert!(Cli::try_parse_from(["galgo", "delegate", "codex", "crea", "x.txt"]).is_err());
+        std::env::set_var("GALGO_PANE", "jefe");
+        let cli = Cli::try_parse_from(["galgo", "delegate", "codex", "crea", "x.txt", "--context", "raíz"]).unwrap();
+        match cli.cmd {
+            Cmd::Delegate { to, task, context, from } => {
+                assert_eq!((to.as_str(), from.as_str()), ("codex", "jefe"));
+                assert_eq!(task.join(" "), "crea x.txt");
+                assert_eq!(context.as_deref(), Some("raíz"));
+            }
+            _ => panic!("no es delegate"),
+        }
+        std::env::remove_var("GALGO_PANE");
+    }
+
+    #[test]
+    fn task_done_con_id_y_resumen() {
+        let _g = ENTORNO.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("GALGO_PANE", "codex");
+        let cli = Cli::try_parse_from(["galgo", "task", "done", "4", "x.txt", "creado", "--fail"]).unwrap();
+        match cli.cmd {
+            Cmd::Task { action: TaskCmd::Done { id, summary, fail, from } } => {
+                assert_eq!((id, from.as_str(), fail), (4, "codex", true));
+                assert_eq!(summary.join(" "), "x.txt creado");
+            }
+            _ => panic!("no es task done"),
+        }
+        std::env::remove_var("GALGO_PANE");
     }
 }
