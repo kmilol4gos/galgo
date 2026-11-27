@@ -240,6 +240,7 @@ fn run() -> Result<()> {
             inject: *inject,
             rows: 40,
             cols: 140,
+            orquestador: *orquestador,
         },
         Cmd::Ls { .. } => Request::List,
         Cmd::Send { pane, text, no_enter } => {

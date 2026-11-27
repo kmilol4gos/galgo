@@ -104,6 +104,8 @@ struct Pane {
     osc_cwd: Arc<Mutex<Option<String>>>,
     /// Profundidad de la última tarea que recibió este panel (0 si ninguna). No se reinicia al cerrarla (M2).
     profundidad_recibida: u8,
+    /// Panel de un agente en modo orquestador (A3): no actúa sobre otros paneles. Se guarda con el estado.
+    orquestador: bool,
     /// Último título que el programa anunció por OSC 0/2 (lo escribe el hilo lector).
     osc_titulo: Arc<Mutex<Option<String>>>,
     /// Uso del transcript (lo rellena el hilo de sondeo) y último informe del agente. Solo en memoria.
@@ -234,6 +236,7 @@ impl Pane {
             last_blocked: None,
             hooked: false,
             profundidad_recibida: 0,
+            orquestador: false,
             listo_desde: None,
             ultima_entrada: None,
             prompt_libre: Arc::new(AtomicBool::new(false)),
@@ -519,9 +522,11 @@ impl State {
         (self.epoch << 32) | (self.next_msg & 0xFFFF_FFFF)
     }
 
-    /// El panel vivo cuyo líder de sesión es `sid` (su shell): el remitente de una llamada de ese proceso.
-    fn pane_de_sesion(&self, sid: i32) -> Option<u32> {
-        self.panes.values().find(|p| !p.ghost && !p.exited && p.pid == Some(sid as u32)).map(|p| p.id)
+    /// El panel vivo cuyo proceso (su líder de pty) está entre los ancestros de `pid`: el remitente de esa llamada.
+    /// Sin panel en la cadena, no hay remitente (A2, revisión 17).
+    fn panel_de_ascendencia(&self, pid: i32) -> Option<u32> {
+        let cadena = peer::ascendencia(pid);
+        cadena.iter().find_map(|&a| self.panes.values().find(|p| !p.ghost && !p.exited && p.pid == Some(a as u32)).map(|p| p.id))
     }
 
     fn resolve(&self, r: &str) -> Result<u32> {
@@ -954,11 +959,16 @@ fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(Pa
 /// Si la línea del cursor de `s` es un prompt libre: el agente espera una orden y no hay texto a medias. Lo que hay
 /// tras el prompt, sin contar los bordes de caja de la TUI, tiene que ser nada.
 fn prompt_libre_de(s: &vt100::Screen) -> bool {
+    // A2: un diálogo (confirmación, selección de inicio de sesión) oculta el cursor: no es un prompt. Y una línea
+    // vacía tampoco basta: el prompt tiene que estar a la vista y terminar en su carácter.
+    if s.hide_cursor() {
+        return false;
+    }
     let (fila, _) = s.cursor_position();
     let (_, cols) = s.size();
     let texto = s.contents_between(fila, 0, fila, cols.get());
     let limpio = texto.trim_end().trim_end_matches(|c: char| matches!(c, '│' | '║' | '|')).trim_end();
-    limpio.is_empty() || limpio.ends_with(['>', '❯', '›', '$', '%', '#'])
+    !limpio.is_empty() && limpio.ends_with(['>', '❯', '›', '$', '%', '#'])
 }
 
 /// Una ruta de ejecutable es la de un agente conocido (`…/claude/versions/2.0.50`, `…/bin/codex`).
@@ -1231,6 +1241,7 @@ impl Daemon {
             last_blocked: None,
             hooked: false,
             profundidad_recibida: 0,
+            orquestador: false,
             listo_desde: None,
             ultima_entrada: None,
             changed: Arc::clone(&changed),
@@ -1479,9 +1490,7 @@ impl Daemon {
     }
 
     /// Atiende una solicitud. `wait` devuelve además el mensaje a confirmar tras responder.
-    async fn dispatch(self: &Arc<Self>, req: Request, peer: Option<i32>) -> (Result<Value>, Option<(u32, u64)>) {
-        // Remitente: el panel cuya sesión es la del proceso que llamó (None si la llamada no viene de un panel).
-        let sender = peer.and_then(peer::sesion_de).and_then(|sid| self.state.lock().unwrap().pane_de_sesion(sid));
+    async fn dispatch(self: &Arc<Self>, req: Request, sender: Option<u32>) -> (Result<Value>, Option<(u32, u64)>) {
         // Solo lo que puede cambiar el inbox o la lista de paneles avisa al guardado. Un `Send` no cambia
         // nada persistente (el texto no se guarda), y las lecturas tampoco: no se escribe nada por ellos.
         let mutating = matches!(
@@ -1531,9 +1540,57 @@ impl Daemon {
         }
     }
 
-    async fn handle(self: &Arc<Self>, sender: Option<u32>, req: Request) -> Result<Value> {
+    /// A3 (revisión 17): lo que un panel puede pedir al daemon. Sin panel (la CLI del usuario, las pruebas) no hay
+    /// restricción. Un panel solo actúa sobre sí mismo en lo suyo (su resultado, su buzón, su estado, sus hooks); sobre
+    /// otros, solo dentro de su workspace, y un agente orquestado nunca. Ningún panel detiene el daemon.
+    fn autorizar(&self, sender: Option<u32>, req: &Request) -> Result<()> {
+        let Some(s) = sender else { return Ok(()) };
+        let st = self.state.lock().unwrap();
+        let (orquestado, ws_propio) = st.panes.get(&s).map_or((false, None), |p| (p.orquestador, p.workspace.clone()));
+        let propio = |pane: &str| -> Result<bool> { Ok(st.resolve(pane)? == s) };
+        let alcance = |pane: &str| -> Result<()> {
+            let id = st.resolve(pane)?;
+            if id == s {
+                return Ok(());
+            }
+            if orquestado {
+                bail!("un agente orquestado solo actúa sobre su propio panel");
+            }
+            if st.panes[&id].workspace != ws_propio {
+                bail!("{pane} está en otro workspace: un panel solo actúa dentro del suyo");
+            }
+            Ok(())
+        };
         match req {
-            Request::Spawn { name, cmd, cwd, manager, inject, rows, cols, workspace, worktree } => {
+            Request::Done { pane, .. }
+            | Request::Inbox { pane }
+            | Request::Ack { pane, .. }
+            | Request::SetStatus { pane, .. }
+            | Request::Hook { pane, .. }
+            | Request::UsageReport { pane, .. }
+            | Request::SetTitle { pane, .. } => {
+                if !propio(pane)? {
+                    bail!("un panel solo actúa sobre sí mismo ({pane} no es el suyo)");
+                }
+            }
+            Request::Send { pane, .. }
+            | Request::Read { pane, .. }
+            | Request::Snapshot { pane, .. }
+            | Request::Resize { pane, .. }
+            | Request::Watch { pane }
+            | Request::Kill { pane }
+            | Request::Worktree { pane, .. } => alcance(pane)?,
+            Request::Spawn { .. } if orquestado => bail!("un agente orquestado no lanza paneles"),
+            Request::Shutdown => bail!("un panel no detiene el daemon"),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle(self: &Arc<Self>, sender: Option<u32>, req: Request) -> Result<Value> {
+        self.autorizar(sender, &req)?;
+        match req {
+            Request::Spawn { name, cmd, cwd, manager, inject, rows, cols, workspace, worktree, orquestador } => {
                 let rama = worktree.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
                 let (cwd, workspace) = match rama {
                     // Worktree propio: el panel arranca dentro, y el workspace sale del repo original, no del worktree.
@@ -1562,7 +1619,11 @@ impl Daemon {
                     }
                 };
                 let (id, inherited) = self.spawn_pane(name, cmd, cwd, manager, inject, rows, cols, workspace)?;
-                let st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap();
+                if let Some(p) = st.panes.get_mut(&id) {
+                    p.orquestador = orquestador;
+                }
+                st.touch();
                 let mut v = serde_json::to_value(st.info(&st.panes[&id], self.orphan_secs))?;
                 v["inherited"] = json!(inherited);
                 Ok(v)
@@ -1730,8 +1791,9 @@ impl Daemon {
                     let mut st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
                     // Un panel no puede hablar por otro: si la llamada viene de un panel, el hook es de ese panel.
-                    if sender.is_some_and(|s| s != id) {
-                        bail!("el hook no es del panel {pane}");
+                    // A2: un hook lo envía el agente de su propio panel. Sin panel en la cadena de procesos, se rechaza.
+                    if sender != Some(id) {
+                        bail!("los hooks solo los envía el agente de su propio panel ({pane})");
                     }
                     // Un hook de agente marca el panel como agente real (lo muestra la GUI).
                     st.panes.get_mut(&id).unwrap().hooked = true;
@@ -2208,7 +2270,11 @@ impl Daemon {
 async fn serve(d: Arc<Daemon>, stream: UnixStream) {
     use std::os::unix::io::AsRawFd;
     // El proceso que conectó: de él sale el remitente de las llamadas de agente (ver peer.rs).
-    let peer = peer::pid_del_par(stream.as_raw_fd());
+    // El remitente se fija al conectar (B2): el pid del par no se vuelve a evaluar en cada solicitud.
+    let sender = match peer::pid_del_par(stream.as_raw_fd()) {
+        Some(pid) => d.state.lock().unwrap().panel_de_ascendencia(pid),
+        None => None,
+    };
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     // Líneas que llegan mientras se atiende una espera; se procesan en orden.
@@ -2230,7 +2296,7 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
             }
             Ok(req) if matches!(req, Request::Wait { .. }) => {
                 client_ack = matches!(req, Request::Wait { client_ack: true, .. });
-                let mut fut = std::pin::pin!(d.dispatch(req, peer));
+                let mut fut = std::pin::pin!(d.dispatch(req, sender));
                 let mut read_open = true;
                 let (res, ack) = loop {
                     tokio::select! {
@@ -2247,7 +2313,7 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
             }
             Ok(req) => {
                 // Cualquier otra solicitud se ejecuta siempre, aunque el cliente cierre su escritura.
-                let (res, ack) = d.dispatch(req, peer).await;
+                let (res, ack) = d.dispatch(req, sender).await;
                 (to_response(res), ack)
             }
             Err(e) => (Response::err(format!("solicitud inválida: {e}")), None),
@@ -3102,6 +3168,80 @@ mod orquestador_tests {
         assert_eq!(texto.matches('\r').count(), 1);
     }
 
+    /// A2: un hook sin panel en la cadena de procesos se rechaza; el de un panel, no.
+    #[test]
+    fn hook_sin_panel_se_rechaza() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _x = vivo(&mut st, 1, "x", false, Status::Idle);
+        let d = daemon_con(st);
+        let r = rt();
+        let hook = || Request::Hook { pane: "1".into(), event: HookEvent::Working, summary: None, source: None };
+        assert!(r.block_on(d.handle(None, hook())).is_err(), "sin panel no hay hook");
+        assert!(r.block_on(d.handle(Some(1), hook())).is_ok());
+    }
+
+    /// A2: la búsqueda de panel sube por los ancestros del proceso que conecta (un proceso real de esta prueba).
+    #[test]
+    fn el_panel_se_identifica_por_ascendencia() {
+        let padre = unsafe { libc::getppid() } as u32;
+        let mut st = State { epoch: 3, ..State::default() };
+        let _x = vivo(&mut st, 7, "x", false, Status::Idle);
+        st.panes.get_mut(&7).unwrap().pid = Some(padre);
+        assert_eq!(st.panel_de_ascendencia(std::process::id() as i32), Some(7), "el padre del proceso es el panel");
+        st.panes.get_mut(&7).unwrap().pid = Some(999_999);
+        assert_eq!(st.panel_de_ascendencia(std::process::id() as i32), None, "ningún ancestro es un panel");
+    }
+
+    /// A2: el prompt libre exige cursor visible y un prompt con su carácter; una línea vacía no basta.
+    #[test]
+    fn prompt_libre_exige_cursor_visible_y_prompt() {
+        use std::num::NonZeroU16;
+        let mut p = vt100::Parser::new(NonZeroU16::new(4).unwrap(), NonZeroU16::new(40).unwrap(), 0);
+        p.process(b"\x1b[?25l\x1b[1;1H> ");
+        assert!(!prompt_libre_de(p.screen()), "cursor oculto: es un diálogo");
+        p.process(b"\x1b[?25h");
+        assert!(prompt_libre_de(p.screen()), "cursor visible tras '> '");
+        p.process(b"\x1b[2K\x1b[1;1H");
+        assert!(!prompt_libre_de(p.screen()), "línea vacía: no es prompt");
+        p.process(b"\x1b[1;1H\xe2\x94\x82 > \xe2\x94\x82");
+        assert!(prompt_libre_de(p.screen()), "prompt dentro de borde de caja");
+        p.process(b"\x1b[2K\x1b[1;1Hescribiendo algo");
+        assert!(!prompt_libre_de(p.screen()), "texto a medias");
+    }
+
+    /// A3 (revisión 17): lo que un panel puede pedir. Sin panel no hay restricción (la CLI del usuario); un panel actúa
+    /// sobre sí mismo en lo suyo y sobre otros solo dentro de su workspace; un agente orquestado no actúa sobre otros;
+    /// ningún panel lanza paneles orquestados ni detiene el daemon.
+    #[test]
+    fn autorizacion_de_paneles() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _p1 = vivo(&mut st, 1, "a1", true, Status::Idle);
+        let _p2 = vivo(&mut st, 2, "a2", true, Status::Idle);
+        let _p3 = vivo(&mut st, 3, "b1", true, Status::Idle);
+        let _p4 = vivo(&mut st, 4, "orq", true, Status::Idle);
+        for id in [1, 2, 4] {
+            st.panes.get_mut(&id).unwrap().workspace = Some("uno".into());
+        }
+        st.panes.get_mut(&3).unwrap().workspace = Some("otro".into());
+        st.panes.get_mut(&4).unwrap().orquestador = true;
+        let d = daemon_con(st);
+        let r = rt();
+        let envia = |pane: &str| Request::Send { pane: pane.into(), text: "hola".into(), enter: false };
+        assert!(r.block_on(d.handle(Some(1), Request::Inbox { pane: "2".into() })).is_err(), "el buzón de otro no se lee");
+        assert!(r.block_on(d.handle(Some(1), Request::Inbox { pane: "1".into() })).is_ok(), "el propio sí");
+        assert!(r.block_on(d.handle(Some(1), envia("3"))).is_err(), "otro workspace: no se escribe");
+        assert!(r.block_on(d.handle(Some(1), envia("2"))).is_ok(), "mismo workspace: sí");
+        assert!(r.block_on(d.handle(Some(4), envia("2"))).is_err(), "un agente orquestado no escribe en otros");
+        assert!(r.block_on(d.handle(Some(4), envia("4"))).is_ok(), "ni a sí mismo está prohibido");
+        let lanza = Request::Spawn {
+            name: "nuevo".into(), cmd: vec!["bash".into()], cwd: None, manager: None, inject: false, rows: 24, cols: 80,
+            workspace: None, worktree: None, orquestador: true,
+        };
+        assert!(r.block_on(d.handle(Some(4), lanza)).is_err(), "un agente orquestado no lanza paneles");
+        assert!(r.block_on(d.handle(Some(1), Request::Shutdown)).is_err(), "un panel no detiene el daemon");
+        assert!(r.block_on(d.handle(None, envia("3"))).is_ok(), "sin panel (el usuario) no hay restricción");
+    }
+
     /// Revisión 17, A1: `Resize` (pantalla → estado) y `tick` (que entrega) no deben interbloquearse. Con una tarea
     /// pendiente y un agente listo, el `tick` llega a mirar el prompt; antes tomaba la pantalla con el estado tomado.
     #[test]
@@ -3162,7 +3302,7 @@ mod orquestador_tests {
         let _x = vivo(&mut st, 1, "x", true, Status::Blocked);
         let d = daemon_con(st);
         let r = rt();
-        r.block_on(d.handle(None, Request::Hook { pane: "1".into(), event: HookEvent::Idle, summary: None, source: None })).unwrap();
+        r.block_on(d.handle(Some(1), Request::Hook { pane: "1".into(), event: HookEvent::Idle, summary: None, source: None })).unwrap();
         assert_eq!(d.state.lock().unwrap().panes[&1].status, Status::Blocked);
     }
 

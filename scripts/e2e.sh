@@ -92,7 +92,29 @@ galgo wait w9 --pane mgr --timeout 2 | grep -q "no compila"; check "done --faile
 galgo spawn mgr -- bash 2>&1 | grep -q "ya existe"; check "rechaza nombre duplicado" $?
 galgo read no-existe 2>&1 | grep -q "no encontrado"; check "error por panel inexistente" $?
 
-hook() { GALGO_PANE="$1" galgo hook claude; }   # el JSON del evento llega por stdin, como en Claude Code
+# Revisión 17, A2: un hook solo vale si lo emite el agente de su propio panel. Por eso los hooks de estas pruebas
+# salen DENTRO del panel: la orden se escribe en la shell del panel y se espera a que acabe.
+en_panel() {  # en_panel <panel> <orden>: ejecuta la orden dentro del panel, espera y escribe su salida
+  local p="$1"; shift
+  local f="$TMP/ep.$$.$RANDOM"
+  galgo send "$p" "{ $*; } >$f.out 2>&1; echo listo >$f.ok" >/dev/null
+  local i; for i in $(seq 1 "${EP_TIMEOUT:-200}"); do [ -f "$f.ok" ] && break; sleep 0.05; done   # EP_TIMEOUT: décimas de segundo / 20
+  cat "$f.out" 2>/dev/null; rm -f "$f.ok" "$f.out"
+}
+hook() { en_panel "$1" "printf '%s\\n' '$(cat)' | galgo hook claude"; }                       # JSON por stdin, desde el panel
+hook_en() { en_panel "$1" "printf '%s\\n' '$(cat)' | galgo hook $2"; }                         # hook_en <panel> <agente>
+hook_directo() { GALGO_PANE="$1" galgo hook claude; }   # solo para probar el comportamiento sin daemon
+rpc_en() { en_panel "$1" "python3 $TMP/rpc.py '$2'"; }   # una solicitud al socket, desde el panel
+mkdir -p "$TMP" && cat > "$TMP/rpc.py" <<'RPC_EOF'
+import json, os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["GALGO_SOCKET"]); s.sendall((sys.argv[1] + "\n").encode()); buf = b""
+while not buf.endswith(b"\n"):
+    d = s.recv(65536)
+    if not d:
+        break
+    buf += d
+print(buf.decode().strip())
+RPC_EOF
 
 echo "10. hooks de Claude Code: estado y entrega al manager"
 galgo spawn mgr10 -- bash --norc >/dev/null
@@ -111,9 +133,8 @@ galgo wait w10 --pane mgr10 --timeout 2 | grep -q "terminé la tarea 10: 3 archi
 echo "11. Stop tras un galgo done explícito no duplica el mensaje"
 galgo spawn mgr11 -- bash --norc >/dev/null
 galgo spawn w11 --manager mgr11 -- bash --norc >/dev/null
-galgo send w11 'galgo done --summary "explícito"'
-sleep 0.7
-echo '{"hook_event_name":"Stop","last_assistant_message":"otro texto"}' | hook w11
+# El done y el Stop van en una sola orden: cada escritura en el panel cuenta como tarea nueva (reinicia el turno).
+en_panel w11 "galgo done --summary explícito; echo '{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"otro texto\"}' | galgo hook claude"
 [ "$(galgo inbox --pane mgr11 | grep -c '^#')" = "1" ]; check "un solo mensaje en el inbox" $?
 
 echo "12. StopFailure llega como fallo"
@@ -154,7 +175,7 @@ unset CLAUDE_CONFIG_DIR
 echo "15. sin daemon, el hook sigue en silencio y no arranca uno"
 galgo stop >/dev/null 2>&1
 sleep 0.5
-out=$(echo '{"hook_event_name":"Stop","last_assistant_message":"x"}' | hook w10 2>&1); rc=$?
+out=$(echo '{"hook_event_name":"Stop","last_assistant_message":"x"}' | hook_directo w10 2>&1); rc=$?
 [ "$rc" = "0" ] && [ -z "$out" ]; check "exit 0 y sin salida" $?
 [ ! -S "$GALGO_SOCKET" ]; check "no levantó un daemon" $?
 
@@ -231,10 +252,7 @@ grep -q -- --inject "$TMP/args321"; check "GALGO_INJECT=1 inyecta" $?
 echo "18. resultado duplicado: galgo done explícito + PostToolUse + Stop entregan una sola vez"
 galgo spawn mgr18 -- bash --norc >/dev/null
 galgo spawn w18 --manager mgr18 -- bash --norc >/dev/null
-galgo send w18 'galgo done --summary "explicito18"'
-sleep 0.7
-echo '{"hook_event_name":"PostToolUse","tool_name":"Bash"}' | hook w18
-echo '{"hook_event_name":"Stop","last_assistant_message":"ya reporté"}' | hook w18
+en_panel w18 "galgo done --summary explicito18; echo '{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"Bash\"}' | galgo hook claude; echo '{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"ya reporté\"}' | galgo hook claude"
 [ "$(galgo inbox --pane mgr18 | grep -c '^#')" = "1" ]; check "exactamente 1 mensaje en el inbox del manager" $?
 galgo ls | grep w18 | grep -q " done "; check "PostToolUse no saca al worker de done" $?
 echo '{"hook_event_name":"UserPromptSubmit","prompt":"otra tarea"}' | hook w18
@@ -755,12 +773,12 @@ HOME="$HOME97" galgo hooks install pi --yes >/dev/null && HOME="$HOME97" galgo h
 [ "$(cat "$HOME97/.pi/agent/extensions/galgo.ts.galgo-bak")" = 'extensión anterior' ] && [ "$(cat "$HOME97/.pi/agent/extensions/herdr-agent-state.ts")" = 'herdr intacto' ]; check "backup y extensión ajena conservados" $?
 galgo spawn m97 -- bash --norc >/dev/null
 galgo spawn w97 --manager m97 -- bash --norc >/dev/null
-printf '%s\n' '{"type":"before_agent_start","messageType":"user"}' | GALGO_PANE=w97 galgo hook pi
-printf '%s\n' '{"type":"ui_prompt_start","title":"permiso"}' | GALGO_PANE=w97 galgo hook pi
+printf '%s\n' '{"type":"before_agent_start","messageType":"user"}' | hook_en w97 pi
+printf '%s\n' '{"type":"ui_prompt_start","title":"permiso"}' | hook_en w97 pi
 galgo ls | grep w97 | grep -q blocked; check "PI informa espera de permiso" $?
-printf '%s\n' '{"type":"ui_prompt_end"}' | GALGO_PANE=w97 galgo hook pi
+printf '%s\n' '{"type":"ui_prompt_end"}' | hook_en w97 pi
 galgo ls | grep w97 | grep -q working; check "PI vuelve a working" $?
-printf '%s\n' '{"type":"agent_settled","outcome":"completed","summary":"resultado PI"}' | GALGO_PANE=w97 galgo hook pi
+printf '%s\n' '{"type":"agent_settled","outcome":"completed","summary":"resultado PI"}' | hook_en w97 pi
 galgo inbox --pane m97 | grep -q 'resultado PI'; check "PI entrega resultado al manager" $?
 out=$(printf '%s\n' '{"type":"agent_start"}' | env -u GALGO_PANE GALGO_SOCKET="$TMP/no-pi.sock" galgo hook pi 2>&1); rc=$?
 [ "$rc" = 0 ] && [ -z "$out" ] && [ ! -S "$TMP/no-pi.sock" ]; check "hook PI silencioso sin panel y daemon" $?
@@ -788,21 +806,20 @@ env -u CODEX_HOME HOME="$HOME98" galgo hooks install codex --yes >/dev/null && e
 cmp -s "$HOME98/.codex/hooks.json.galgo-bak" "$TMP/original98.json"; check "Codex respalda configuración previa" $?
 galgo spawn m98 -- bash --norc >/dev/null
 galgo spawn w98 --manager m98 -- bash --norc >/dev/null
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit"}' | GALGO_PANE=w98 galgo hook codex
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit"}' | hook_en w98 codex
 galgo ls | grep w98 | grep -q working; check "Codex informa prompt_submitted" $?
-printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact"}' | GALGO_PANE=w98 galgo hook codex
+printf '%s\n' '{"hook_event_name":"SessionStart","source":"compact"}' | hook_en w98 codex
 galgo ls | grep w98 | grep -q working; check "Codex compact no cambia working a idle" $?
-printf '%s\n' '{"hook_event_name":"Stop","last_assistant_message":"resultado Codex"}' | GALGO_PANE=w98 galgo hook codex
+printf '%s\n' '{"hook_event_name":"Stop","last_assistant_message":"resultado Codex"}' | hook_en w98 codex
 galgo inbox --pane m98 | grep -q 'resultado Codex'; check "Codex entrega resultado al manager" $?
 out=$(printf '%s\n' '{"hook_event_name":"SessionStart"}' | env -u GALGO_PANE GALGO_SOCKET="$TMP/no-codex.sock" galgo hook codex 2>&1); rc=$?
 [ "$rc" = 0 ] && [ -z "$out" ] && [ ! -S "$TMP/no-codex.sock" ]; check "hook Codex silencioso sin panel ni daemon" $?
 galgo spawn z98 --manager m98 -- bash --norc >/dev/null
-printf '%s\n' '{"hook_event_name":"UserPromptSubmit"}' | GALGO_PANE=z98 galgo hook codex
-galgo done --pane z98 --summary 'done explícito' >/dev/null
-printf '%s\n' '{"hook_event_name":"Stop","last_assistant_message":"duplicado inesperado"}' | GALGO_PANE=z98 galgo hook codex
+printf '%s\n' '{"hook_event_name":"UserPromptSubmit"}' | hook_en z98 codex
+en_panel z98 "galgo done --summary 'done explícito'; printf '%s\n' '{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"duplicado inesperado\"}' | galgo hook codex"
 ! galgo inbox --pane m98 | grep -q 'duplicado inesperado'; check "Codex Stop no duplica galgo done" $?
 galgo status blocked --pane z98
-HOME98="$HOME98" python3 -I - "$GALGO_SOCKET" <<'PY98'
+cat > "$TMP/codex98.py" <<'CODEX98_EOF'
 import shutil, sys
 if not shutil.which('codex'): sys.exit(77)
 import http.server, json, os, pathlib, subprocess, sys, threading
@@ -829,14 +846,19 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 env = dict(os.environ, HOME=str(home), CODEX_HOME=str(home/'.codex'), GALGO_PANE='z98', GALGO_SOCKET=sys.argv[1])
 try:
     run = subprocess.run(['codex','exec','--skip-git-repo-check','--dangerously-bypass-hook-trust','--json','test'], cwd=home, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35)
-    inbox = subprocess.check_output(['galgo','inbox','--pane','m98'], env=env).decode()
-    if run.returncode != 0 or 'respuesta real Codex' not in inbox:
-        print('Codex exit:', run.returncode, 'stdout:', run.stdout.decode(errors='replace')[-3000:], 'stderr:', run.stderr.decode(errors='replace')[-3000:], 'inbox:', inbox)
+    # El buzón del manager lo lee la shell del test: un panel solo lee el suyo (A3).
+    if run.returncode != 0:
+        print('Codex exit:', run.returncode, 'stdout:', run.stdout.decode(errors='replace')[-3000:], 'stderr:', run.stderr.decode(errors='replace')[-3000:])
         sys.exit(1)
 finally:
     server.shutdown()
-PY98
-check "Codex real carga hooks y entrega Stop con servidor simulado" $?
+CODEX98_EOF
+# Codex se lanza DENTRO del panel z98: sus hooks salen de su propio panel (revisión 17, A2).
+out98=$(EP_TIMEOUT=6000 en_panel z98 "HOME98='$HOME98' python3 -I $TMP/codex98.py '$GALGO_SOCKET'; echo RC=\$?")
+rc98=$(echo "$out98" | sed -n 's/^RC=//p' | tail -1)
+[ "${rc98:-1}" = 0 ] && galgo inbox --pane m98 | grep -q 'respuesta real Codex' || rc98=1
+[ "${rc98:-1}" = 0 ] || echo "$out98" | tail -15
+check "Codex real carga hooks y entrega Stop con servidor simulado" "${rc98:-1}"
 env -u CODEX_HOME HOME="$HOME98" galgo hooks uninstall codex --yes >/dev/null
 python3 -I - "$HOME98/.codex/hooks.json" "$TMP/original98.json" <<'PY98CHECK'
 import json,sys
@@ -1093,7 +1115,7 @@ export GALGO_SOCKET="$TMP/c126/g.sock"
 TR="$TMP/c126/claude.jsonl"
 printf '%s\n' '{"type":"assistant","isSidechain":false,"requestId":"r1","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}}' > "$TR"
 galgo spawn t126 -- bash --norc >/dev/null
-rpc "{\"op\":\"hook\",\"pane\":\"t126\",\"event\":\"working\",\"summary\":null,\"source\":{\"agent\":\"claude\",\"session_id\":\"s1\",\"transcript\":\"$TR\"}}" | grep -q '"ok":true'; check "el hook con fuente se acepta" $?
+rpc_en t126 "{\"op\":\"hook\",\"pane\":\"t126\",\"event\":\"working\",\"summary\":null,\"source\":{\"agent\":\"claude\",\"session_id\":\"s1\",\"transcript\":\"$TR\"}}" | grep -q '"ok":true'; check "el hook con fuente se acepta" $?
 sleep 2.5
 galgo --json ls | python3 -c 'import json,sys
 p=[x for x in json.load(sys.stdin) if x["name"]=="t126"][0]["usage"]
@@ -1274,11 +1296,11 @@ check "uninstall restaura statusline previo y configuración ajena" $?
 echo "141. hooks de Claude, Codex y PI asocian fuentes de uso"
 for agent in claude codex pi; do galgo spawn "source131-$agent" -- bash --norc >/dev/null; done
 printf '%s\n' '{"type":"assistant","isSidechain":false,"message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":123,"output_tokens":5}}}' > "$TMP/source131-claude.jsonl"
-printf '{"hook_event_name":"UserPromptSubmit","session_id":"s1","transcript_path":"%s"}\n' "$TMP/source131-claude.jsonl" | GALGO_PANE=source131-claude galgo hook claude
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"s1","transcript_path":"%s"}\n' "$TMP/source131-claude.jsonl" | hook_en source131-claude claude
 printf '%s\n' '{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}' '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":456,"output_tokens":7},"last_token_usage":{"input_tokens":456,"output_tokens":7},"model_context_window":10000}}}' > "$TMP/source131-codex.jsonl"
-printf '{"hook_event_name":"UserPromptSubmit","session_id":"s2","transcript_path":"%s"}\n' "$TMP/source131-codex.jsonl" | GALGO_PANE=source131-codex galgo hook codex
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"s2","transcript_path":"%s"}\n' "$TMP/source131-codex.jsonl" | hook_en source131-codex codex
 printf '%s\n' '{"type":"message","message":{"role":"assistant","usage":{"input":12,"output":3,"cost":{"total":0.1}}}}' > "$TMP/source131-pi.jsonl"
-printf '{"type":"agent_start","sessionId":"s3","sessionFile":"%s","context":{"tokens":42,"contextWindow":1000}}\n' "$TMP/source131-pi.jsonl" | GALGO_PANE=source131-pi galgo hook pi
+printf '{"type":"agent_start","sessionId":"s3","sessionFile":"%s","context":{"tokens":42,"contextWindow":1000}}\n' "$TMP/source131-pi.jsonl" | hook_en source131-pi pi
 sleep 3
 for agent in claude codex pi; do galgo --json usage --pane "source131-$agent" > "$TMP/usage131-$agent.json"; done
 python3 -I - "$TMP" <<'PY131'
@@ -1321,7 +1343,7 @@ while not buf.endswith(b"\n"):
     if not d: break
     buf+=d
 print(buf.decode().strip())' "$1"; }
-rpc "{\"op\":\"hook\",\"pane\":\"t137\",\"event\":\"working\",\"summary\":null,\"source\":{\"agent\":\"claude\",\"session_id\":\"s137\",\"transcript\":\"$TR137\"}}" | grep -q '"ok":true'; check "el hook con el transcript sintético se acepta" $?
+rpc_en t137 "{\"op\":\"hook\",\"pane\":\"t137\",\"event\":\"working\",\"summary\":null,\"source\":{\"agent\":\"claude\",\"session_id\":\"s137\",\"transcript\":\"$TR137\"}}" | grep -q '"ok":true'; check "el hook con el transcript sintético se acepta" $?
 sleep 2.5
 galgo --json ls | python3 -c 'import json,sys
 u=[x for x in json.load(sys.stdin) if x["name"]=="t137"][0]["usage"]
@@ -1438,7 +1460,7 @@ cat > "$TMP/fakebin/agente-falso.sh" <<'FAKE_EOF'
 emite() { echo "{\"hook_event_name\":\"$1\"}" | galgo hook claude >/dev/null 2>&1; }
 printf '%s\n' "$@" > "$TMP_ARGS_DIR/$GALGO_PANE_NAME.args" 2>/dev/null
 emite Stop
-while IFS= read -r linea; do
+while printf '> '; IFS= read -r linea; do
   case "$linea" in
     *DELEGAR*)
       to=$(echo "$linea" | sed -n 's/.*DELEGAR:\([A-Za-z0-9_-]*\).*/\1/p'); [ -n "$to" ] || to="$DESTINO"
@@ -1462,12 +1484,7 @@ for i in $(seq 1 50); do python3 -c 'import json,subprocess,sys
 ps=json.loads(subprocess.run(["galgo","--json","ls"],capture_output=True,text=True).stdout)
 sys.exit(0 if all(p.get("hooked") for p in ps if p["name"] in ("jefe145","codex145")) else 1)' && break; sleep 0.2; done
 # Un shell con hooks viejos (turn_ended) no es un agente: su primer plano es bash y no recibe nada.
-python3 - "$GALGO_SOCKET" <<'PYEOF'
-import json, socket, sys
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sys.argv[1])
-s.sendall((json.dumps({"op": "hook", "pane": "shell145", "event": "turn_ended", "summary": None}) + "\n").encode()); s.shutdown(socket.SHUT_WR)
-s.makefile("r").readline()
-PYEOF
+rpc_en shell145 '{"op": "hook", "pane": "shell145", "event": "turn_ended", "summary": null}' >/dev/null
 galgo send jefe145 "DELEGAR:sinhooks145" >/dev/null
 for i in $(seq 1 40); do galgo tasks --all 2>/dev/null | grep -q "jefe145 → sinhooks145" && break; sleep 0.2; done
 galgo tasks --all | grep "jefe145 → sinhooks145" | grep -q "pendiente"; check "sin hooks la tarea queda pendiente" $?
@@ -1477,6 +1494,9 @@ galgo tasks --all | grep "jefe145 → shell145" | grep -q "pendiente"; check "un
 python3 -c 'import json,subprocess,sys
 ps=json.loads(subprocess.run(["galgo","--json","ls"],capture_output=True,text=True).stdout)
 sys.exit(0 if not next(p for p in ps if p["name"]=="shell145").get("hooked") else 1)'; check "el shell deja de contar como agente" $?
+# A2: un Stop falso desde fuera del panel (con GALGO_PANE puesto a mano) no fuerza la entrega.
+echo '{"hook_event_name":"Stop"}' | hook_directo sinhooks145 >/dev/null 2>&1
+sleep 0.5; galgo tasks --all | grep "jefe145 → sinhooks145" | grep -q "pendiente"; check "un hook desde fuera del panel no fuerza la entrega (A2)" $?
 galgo send jefe145 "DELEGAR:codex145" >/dev/null
 ok=0; for i in $(seq 1 60); do galgo inbox --pane jefe145 2>/dev/null | grep -q "hecho por codex145" && { ok=1; break; }; sleep 0.25; done
 [ $ok = 1 ]; check "el worker libre recibe la tarea, la cierra y el resultado vuelve al manager" $?

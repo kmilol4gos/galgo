@@ -178,6 +178,8 @@ fn build_request(name: &str, args: &Value, env: &Env) -> Result<Request, String>
             cols: 140,
             workspace: opt_str(args, "workspace"),
             worktree: opt_str(args, "worktree"),
+            // Un agente no lanza paneles orquestados: esa marca solo la pone la CLI del usuario.
+            orquestador: false,
         }),
         "galgo_send" => Ok(Request::Send {
             pane: str_arg(args, "pane")?,

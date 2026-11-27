@@ -166,6 +166,9 @@ pub enum Request {
         /// de `cwd`. El panel arranca dentro de ese worktree; el workspace sale del repo original.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree: Option<String>,
+        /// Panel de un agente en modo orquestador: no puede lanzar paneles ni actuar sobre otros (revisión 17, A3).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        orquestador: bool,
     },
     List,
     Send {

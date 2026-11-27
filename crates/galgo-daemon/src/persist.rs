@@ -71,6 +71,9 @@ pub struct SavedPane {
     pub workspace: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Panel de un agente en modo orquestador (A3). Un estado anterior no lo tiene: se carga como no orquestado.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orquestador: bool,
     /// El panel tenía proceso al guardar. Al restaurar, su manager recibe el aviso de que ya no existe.
     pub alive: bool,
     pub inbox: Vec<SavedMsg>,
@@ -274,6 +277,7 @@ pub fn snapshot(st: &State) -> Saved {
                 manager: p.manager,
                 workspace: p.workspace.clone(),
                 cwd: p.cwd_vivo(),
+                orquestador: p.orquestador,
                 alive: !p.ghost && !p.exited,
                 inbox: p
                     .inbox
@@ -364,7 +368,8 @@ pub fn restore(st: &mut State, saved: Saved) {
                 inherited: false,
             });
         }
-        let pane = Pane::ghost(sp.id, sp.name, sp.cmd, sp.manager, inbox, sp.workspace, sp.cwd);
+        let mut pane = Pane::ghost(sp.id, sp.name, sp.cmd, sp.manager, inbox, sp.workspace, sp.cwd);
+        pane.orquestador = sp.orquestador;
         st.panes.insert(sp.id, pane);
     }
     // El aviso va después de cargar todos los paneles, para que el nombre del que se fue esté disponible.
@@ -440,6 +445,7 @@ mod tests {
                     workspace: None,
                     cwd: None,
                     alive: true,
+                    orquestador: false,
                     inbox: vec![SavedMsg { id: (1 << 32) | 1, from: 1, from_name: "mgr".into(), kind: "done".into(), summary: "previo".into(), created_unix: unix_now() }],
                 },
                 SavedPane {
@@ -450,6 +456,7 @@ mod tests {
                     workspace: Some("inventia/cotizacion".into()),
                     cwd: None,
                     alive: true,
+                    orquestador: false,
                     inbox: vec![SavedMsg { id: (2 << 32) | 4, from: 2, from_name: "w".into(), kind: "done".into(), summary: "hecho".into(), created_unix: unix_now() }],
                 },
             ],
