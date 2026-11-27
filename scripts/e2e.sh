@@ -1356,7 +1356,9 @@ HOME="$H139" galgo spawn wt139 --cwd "$R139" --worktree tarea-e2e -- bash --norc
 WT139=$(galgo --json ls | python3 -c 'import json,sys
 p=[x for x in json.load(sys.stdin) if x["name"]=="wt139"][0]
 print(p["cwd"])')
-case "$WT139" in "$H139/.galgo/worktrees/"*) true;; *) false;; esac; check "el panel arranca en ~/.galgo/worktrees" $?
+# El cwd vivo llega con la ruta real (macOS resuelve /var a /private/var): se compara con la ruta canónica.
+RW139=$(cd "$H139" && pwd -P)
+case "$WT139" in "$RW139/.galgo/worktrees/"*) true;; *) false;; esac; check "el panel arranca en ~/.galgo/worktrees" $?
 [ "$(git -C "$WT139" rev-parse --abbrev-ref HEAD)" = tarea-e2e ]; check "el worktree está en la rama nueva" $?
 galgo --json ls | python3 -c 'import json,sys
 p=[x for x in json.load(sys.stdin) if x["name"]=="wt139"][0]
