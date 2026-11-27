@@ -90,6 +90,50 @@ impl FromStr for HookEvent {
     }
 }
 
+/// Estado de una tarea delegada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    /// Creada, aún no entregada (el destinatario no está libre o no ha emitido hooks).
+    Pendiente,
+    /// Entregada al destinatario (pegada y enviada).
+    Entregada,
+    /// El destinatario trabaja en ella.
+    EnCurso,
+    /// El destinatario espera una decisión humana.
+    Bloqueada,
+    /// Terminada con éxito.
+    Lista,
+    /// Terminada con error, o el destinatario terminó antes.
+    Fallida,
+}
+
+impl TaskStatus {
+    /// Una tarea abierta cuenta para los límites; una lista o fallida ya no.
+    pub fn abierta(self) -> bool {
+        !matches!(self, TaskStatus::Lista | TaskStatus::Fallida)
+    }
+}
+
+/// Una tarea tal como la ve un cliente.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskInfo {
+    pub id: u64,
+    pub from: String,
+    pub to: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Archivos que cambió el destinatario, si trabajó en un worktree propio.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    pub depth: u8,
+    pub created_unix: u64,
+}
+
 /// Qué hacer con el worktree de tarea de un panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +209,27 @@ pub enum Request {
         summary: String,
         #[serde(default)]
         failed: bool,
+    },
+    /// Delegar una tarea de un agente a otro. `from` es el remitente (siempre `GALGO_PANE` en la CLI y el MCP).
+    Delegate {
+        from: String,
+        to: String,
+        task: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+    },
+    /// El destinatario de la tarea `id` la termina: `ok` o fallida, con su resumen. `from` debe ser el destinatario.
+    TaskDone {
+        from: String,
+        id: u64,
+        summary: String,
+        #[serde(default)]
+        ok: bool,
+    },
+    /// Tareas en las que participa el panel (o todas, sin `pane`).
+    Tasks {
+        #[serde(default)]
+        pane: Option<String>,
     },
     /// Acción sobre el worktree de tarea de un panel: ver cambios, fusionarlo en el repo principal o descartarlo.
     /// `Accept` y `Discard` exigen `confirm` (tocan el repo del usuario).

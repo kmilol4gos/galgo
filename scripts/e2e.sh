@@ -1423,5 +1423,42 @@ PYEOF
 check "un cambio llega como aviso y el cierre también" $?
 galgo stop >/dev/null 2>&1
 export GALGO_SOCKET="$TMP/galgo.sock"
+echo "145. modo orquestador (daemon): una tarea solo se entrega a un agente con hooks y libre; el resultado vuelve al remitente"
+export GALGO_SOCKET="$TMP/c145/g.sock"; mkdir -p "$TMP/c145" && chmod 700 "$TMP/c145"
+galgo spawn jefe145 -- /bin/cat >/dev/null; galgo spawn codex145 -- /bin/cat >/dev/null; galgo spawn sinhooks145 -- /bin/cat >/dev/null
+check "paneles de prueba" $?
+python3 - "$GALGO_SOCKET" <<'PYEOF'
+import json, socket, subprocess, sys, time
+ruta = sys.argv[1]
+def pedir(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(ruta)
+    s.sendall((json.dumps(req) + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    return json.loads(s.makefile("r").readline())
+def pantalla(p):
+    return subprocess.run(["galgo", "read", p], capture_output=True, text=True).stdout
+# Sin hooks: la tarea queda pendiente y no llega al panel.
+r = pedir({"op": "delegate", "from": "jefe145", "to": "sinhooks145", "task": "esto no debe llegar"})
+assert r["ok"] and r["data"]["status"] == "pendiente", r
+time.sleep(0.4)
+assert "tarea #" not in pantalla("sinhooks145"), "sin hooks no se entrega"
+# Con hook de idle: el destinatario está libre y la tarea se entrega, pegada y con Enter.
+assert pedir({"op": "hook", "pane": "codex145", "event": "idle", "summary": None})["ok"]
+r = pedir({"op": "delegate", "from": "jefe145", "to": "codex145", "task": "crea x.txt", "context": "en la raíz"})
+assert r["ok"] and r["data"]["status"] == "entregada", r
+tid = r["data"]["id"]
+time.sleep(0.6)
+assert "tarea #%d" % tid in pantalla("codex145"), pantalla("codex145")
+# Solo el destinatario cierra la tarea; el resultado llega al remitente.
+assert not pedir({"op": "task_done", "from": "jefe145", "id": tid, "summary": "no", "ok": True})["ok"]
+assert pedir({"op": "task_done", "from": "codex145", "id": tid, "summary": "x.txt creado", "ok": True})["ok"]
+inbox = subprocess.run(["galgo", "inbox", "--pane", "jefe145"], capture_output=True, text=True).stdout
+assert "x.txt creado" in inbox, inbox
+tareas = pedir({"op": "tasks", "pane": "jefe145"})["data"]
+assert any(t["id"] == tid and t["status"] == "lista" for t in tareas), tareas
+PYEOF
+check "la tarea se entrega solo con hooks y el resultado vuelve al remitente" $?
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

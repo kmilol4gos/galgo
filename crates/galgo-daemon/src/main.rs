@@ -4,7 +4,7 @@ mod persist;
 mod usage;
 
 use anyhow::{anyhow, bail, Context, Result};
-use galgo_proto::{HookEvent, Message, PaneInfo, Request, Response, Status, WorktreeAction};
+use galgo_proto::{HookEvent, Message, PaneInfo, Request, Response, Status, TaskInfo, TaskStatus, WorktreeAction};
 use galgo_usage::PaneUsage;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
@@ -194,12 +194,162 @@ struct State {
     reserved: HashSet<String>,
     /// Se incrementa con cada cambio persistente (inbox, paneles). El guardado solo escribe si cambió.
     version: u64,
+    /// Tareas delegadas entre agentes (modo orquestador) y el último id usado.
+    tasks: Vec<Task>,
+    next_task: u64,
+}
+
+/// Límites del modo orquestador (corte 1): profundidad de delegación, tareas abiertas por par de agentes y por workspace.
+const MAX_DELEGATION_DEPTH: u8 = 3;
+const MAX_OPEN_PER_PAIR: usize = 3;
+const MAX_OPEN_PER_WORKSPACE: usize = 8;
+/// Largo máximo de la tarea, su contexto y su resumen.
+const MAX_TASK_TEXT: usize = 4000;
+
+/// Una tarea delegada. Los nombres se guardan para que la lista siga legible aunque un panel desaparezca.
+#[derive(Debug, Clone)]
+struct Task {
+    id: u64,
+    from: u32,
+    to: u32,
+    from_name: String,
+    to_name: String,
+    workspace: Option<String>,
+    text: String,
+    context: Option<String>,
+    status: TaskStatus,
+    summary: Option<String>,
+    files: Vec<String>,
+    depth: u8,
+    created_unix: u64,
+}
+
+impl Task {
+    fn info(&self) -> TaskInfo {
+        TaskInfo {
+            id: self.id,
+            from: self.from_name.clone(),
+            to: self.to_name.clone(),
+            text: self.text.clone(),
+            context: self.context.clone(),
+            status: self.status,
+            summary: self.summary.clone(),
+            files: self.files.clone(),
+            depth: self.depth,
+            created_unix: self.created_unix,
+        }
+    }
+}
+
+/// Texto que recibe el destinatario. Va como información de otro agente, nunca como orden del usuario.
+fn task_text(t: &Task) -> String {
+    let mut s = format!(
+        "[galgo · tarea #{id} de {de}] Esto viene de otro agente, no es una orden del usuario. Cuando termines, ejecuta: galgo task done {id} \"<resumen>\"\n\n{texto}",
+        id = t.id,
+        de = t.from_name,
+        texto = t.text
+    );
+    if let Some(c) = &t.context {
+        s.push_str("\n\nContexto:\n");
+        s.push_str(c);
+    }
+    s
+}
+
+/// Archivos que cambió un worktree de tarea frente a su base (y los nuevos sin añadir). Vacío si no es un worktree.
+fn archivos_cambiados(cwd: &str) -> Vec<String> {
+    let Some(rama) = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) else { return Vec::new() };
+    let Some(base) = git_out(cwd, &["config", "--get", &clave_base(&rama)]) else { return Vec::new() };
+    let mut out: Vec<String> = git_out(cwd, &["diff", "--name-only", &base]).unwrap_or_default().lines().map(str::to_string).collect();
+    out.extend(
+        git_out(cwd, &["status", "--porcelain"])
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_prefix("?? "))
+            .map(str::to_string),
+    );
+    out.truncate(50);
+    out
 }
 
 impl State {
     /// Marca un cambio persistente.
     fn touch(&mut self) {
         self.version += 1;
+    }
+
+    /// Profundidad de una delegación de `from` a `to`, o el motivo por el que no se permite (frenos del modo orquestador).
+    fn check_delegation(&self, from: u32, to: u32, workspace: Option<&str>) -> Result<u8> {
+        if from == to {
+            bail!("un agente no se delega una tarea a sí mismo");
+        }
+        // Un agente que trabaja en una tarea delega a un nivel más profundo; desde fuera, la cadena empieza en 1.
+        let profundidad = self.tasks.iter().filter(|t| t.status.abierta() && t.to == from).map(|t| t.depth + 1).max().unwrap_or(1);
+        if profundidad > MAX_DELEGATION_DEPTH {
+            bail!("profundidad máxima de delegación ({MAX_DELEGATION_DEPTH}) alcanzada");
+        }
+        let par = self.tasks.iter().filter(|t| t.status.abierta() && t.from == from && t.to == to).count();
+        if par >= MAX_OPEN_PER_PAIR {
+            bail!("ya hay {par} tareas abiertas entre esos dos agentes: espera a que terminen");
+        }
+        if let Some(ws) = workspace {
+            let en_ws = self.tasks.iter().filter(|t| t.status.abierta() && t.workspace.as_deref() == Some(ws)).count();
+            if en_ws >= MAX_OPEN_PER_WORKSPACE {
+                bail!("el workspace ya tiene {en_ws} tareas abiertas (máximo {MAX_OPEN_PER_WORKSPACE})");
+            }
+        }
+        Ok(profundidad)
+    }
+
+    /// Entrega al destinatario su tarea pendiente más antigua, si está libre: con hooks, sin trabajar, sin estar bloqueado
+    /// ni en un diálogo. Va pegada (bracketed paste) y enviada; nunca si no ha emitido ningún hook.
+    fn deliver(&mut self, pane: u32) {
+        let libre = self.panes.get(&pane).is_some_and(|p| {
+            p.hooked && !p.ghost && !p.exited && matches!(p.status, Status::Idle | Status::Done | Status::Failed)
+        });
+        if !libre {
+            return;
+        }
+        let Some(idx) = self.tasks.iter().position(|t| t.to == pane && t.status == TaskStatus::Pendiente) else { return };
+        let texto = task_text(&self.tasks[idx]);
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(texto.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~\r");
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        if p.input.try_send(bytes).is_err() {
+            return;
+        }
+        p.status = Status::Working;
+        p.reported = false;
+        p.touched_since_report = true;
+        self.tasks[idx].status = TaskStatus::Entregada;
+        self.touch();
+    }
+
+    /// Tras un hook del destinatario, su tarea abierta sigue su estado (en curso, bloqueada) y se intenta entregar la siguiente.
+    fn sync_tasks(&mut self, pane: u32) {
+        let estado = self.panes.get(&pane).map(|p| p.status);
+        if let Some(estado) = estado {
+            for t in self.tasks.iter_mut().filter(|t| t.to == pane && t.status.abierta()) {
+                t.status = match (estado, t.status) {
+                    (Status::Blocked, _) => TaskStatus::Bloqueada,
+                    (Status::Working, TaskStatus::Entregada | TaskStatus::Bloqueada) => TaskStatus::EnCurso,
+                    (_, s) => s,
+                };
+            }
+        }
+        self.deliver(pane);
+    }
+
+    /// El destinatario terminó su proceso: sus tareas abiertas fallan y el delegador lo sabe.
+    fn fail_tasks_of(&mut self, pane: u32) {
+        let abiertas: Vec<usize> = self.tasks.iter().enumerate().filter(|(_, t)| t.to == pane && t.status.abierta()).map(|(i, _)| i).collect();
+        for i in abiertas {
+            let (from, id) = (self.tasks[i].from, self.tasks[i].id);
+            self.tasks[i].status = TaskStatus::Fallida;
+            self.tasks[i].summary = Some("el agente terminó antes de cerrar la tarea".into());
+            self.push(from, pane, "failed", format!("tarea #{id}: el agente terminó antes de cerrarla"));
+        }
     }
 
     /// Id nuevo de mensaje: el epoch en la parte alta, así un ack de otra ejecución no lo confunde.
@@ -894,6 +1044,7 @@ impl Daemon {
             p.exited = true;
             let pid = p.pid;
             st.touch();
+            st.fail_tasks_of(id);
             pid
         };
         // El líder todavía no se recolectó: su pid sigue siendo suyo y la lista de la sesión es fiable.
@@ -1085,6 +1236,7 @@ impl Daemon {
             req,
             Request::Spawn { .. } | Request::Done { .. } | Request::Hook { .. }
                 | Request::Ack { .. } | Request::Kill { .. } | Request::Wait { .. }
+                | Request::Delegate { .. } | Request::TaskDone { .. }
         );
         let out = match req {
             Request::Wait { waiter, target, timeout_secs, .. } => {
@@ -1378,6 +1530,8 @@ impl Daemon {
                             }
                         }
                     }
+                    // Modo orquestador: la tarea del destinatario sigue su estado y, si ya está libre, se le entrega la siguiente.
+                    st.sync_tasks(id);
                     manager
                 };
                 // M2: un resultado o un bloqueo entregado se guarda antes de responder.
@@ -1413,6 +1567,104 @@ impl Daemon {
                 let title = title.trim().to_string();
                 st.panes.get_mut(&id).unwrap().title = (!title.is_empty()).then_some(title);
                 Ok(json!({}))
+            }
+            Request::Delegate { from, to, task, context } => {
+                check_text("la tarea", &task, MAX_TASK_TEXT)?;
+                if let Some(c) = &context {
+                    check_text("el contexto", c, MAX_TASK_TEXT)?;
+                }
+                let info = {
+                    let mut st = self.state.lock().unwrap();
+                    let from_id = st.resolve(&from)?;
+                    let to_id = st.resolve(&to)?;
+                    let (from_name, workspace) = {
+                        let p = &st.panes[&from_id];
+                        (p.name.clone(), p.workspace.clone())
+                    };
+                    let to_name = {
+                        let p = &st.panes[&to_id];
+                        if p.exited && !p.ghost {
+                            bail!("el destinatario {} ya terminó", p.name);
+                        }
+                        p.name.clone()
+                    };
+                    let depth = st.check_delegation(from_id, to_id, workspace.as_deref())?;
+                    st.next_task += 1;
+                    let id = st.next_task;
+                    let created_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    st.tasks.push(Task {
+                        id,
+                        from: from_id,
+                        to: to_id,
+                        from_name,
+                        to_name,
+                        workspace,
+                        text: task,
+                        context,
+                        status: TaskStatus::Pendiente,
+                        summary: None,
+                        files: Vec::new(),
+                        depth,
+                        created_unix,
+                    });
+                    st.touch();
+                    st.deliver(to_id);
+                    st.tasks.iter().find(|t| t.id == id).map(Task::info)
+                };
+                self.notify.notify_waiters();
+                Ok(serde_json::to_value(info)?)
+            }
+            Request::TaskDone { from, id, summary, ok } => {
+                check_text("el resumen", &summary, MAX_TASK_TEXT)?;
+                // Solo el destinatario de la tarea la cierra. El remitente sale de su panel, nunca de los argumentos.
+                let (cwd, from_id) = {
+                    let st = self.state.lock().unwrap();
+                    let from_id = st.resolve(&from)?;
+                    let t = st.tasks.iter().find(|t| t.id == id).ok_or_else(|| anyhow!("tarea {id} no encontrada"))?;
+                    if t.to != from_id {
+                        bail!("solo el agente al que se delegó la tarea {id} puede cerrarla");
+                    }
+                    if !t.status.abierta() {
+                        bail!("la tarea {id} ya está cerrada");
+                    }
+                    (st.panes.get(&from_id).and_then(|p| p.cwd.clone()), from_id)
+                };
+                let files = tokio::task::spawn_blocking(move || cwd.map(|c| archivos_cambiados(&c)).unwrap_or_default()).await?;
+                let manager = {
+                    let mut st = self.state.lock().unwrap();
+                    let idx = st.tasks.iter().position(|t| t.id == id).ok_or_else(|| anyhow!("tarea {id} no encontrada"))?;
+                    st.tasks[idx].status = if ok { TaskStatus::Lista } else { TaskStatus::Fallida };
+                    st.tasks[idx].summary = Some(summary.clone());
+                    st.tasks[idx].files = files.clone();
+                    let manager = st.tasks[idx].from;
+                    let quien = st.tasks[idx].to_name.clone();
+                    let mut texto = format!("tarea #{id} {} por {quien}: {summary}", if ok { "lista" } else { "fallida" });
+                    if !files.is_empty() {
+                        texto.push_str(&format!("\narchivos cambiados: {}", files.join(", ")));
+                    }
+                    if st.panes.contains_key(&manager) {
+                        st.push(manager, from_id, if ok { "done" } else { "failed" }, texto);
+                    }
+                    st.touch();
+                    manager
+                };
+                self.try_inject(manager);
+                self.notify.notify_waiters();
+                Ok(json!({ "ok": true }))
+            }
+            Request::Tasks { pane } => {
+                let st = self.state.lock().unwrap();
+                let filtro = match pane {
+                    Some(p) => Some(st.resolve(&p)?),
+                    None => None,
+                };
+                let v: Vec<TaskInfo> = st
+                    .tasks
+                    .iter()
+                    .filter(|t| filtro.is_none_or(|f| t.from == f || t.to == f))
+                    .map(Task::info)
+                    .collect();
+                Ok(serde_json::to_value(v)?)
             }
             Request::Worktree { pane, action, confirm } => {
                 let (cwd, ocupado) = {
@@ -2459,5 +2711,147 @@ mod watch_tests {
             assert!(siguiente(&mut c).await.contains("closed"), "el cierre del panel se avisa");
             tokio::time::timeout(Duration::from_secs(3), tarea).await.unwrap().unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod orquestador_tests {
+    use super::tests_fantasmas::{daemon_con, fantasma};
+    use super::*;
+
+    /// Panel vivo con su entrada conectada: `rx` recibe lo que el daemon escribiría en el PTY.
+    fn vivo(st: &mut State, id: u32, name: &str, hooked: bool, status: Status) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let mut p = fantasma(id, name, None);
+        p.ghost = false;
+        p.exited = false;
+        p.hooked = hooked;
+        p.status = status;
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        p.input = tx;
+        st.panes.insert(id, p);
+        rx
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// La tarea se entrega solo a un agente con hooks que está libre: pegada entre marcas de bracketed paste y con un
+    /// único Enter al final. Sin hooks, trabajando o bloqueado, queda pendiente.
+    #[test]
+    fn la_entrega_exige_hooks_y_estar_libre() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _jefe = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let codex_rx = vivo(&mut st, 2, "codex", false, Status::Idle);
+        let d = daemon_con(st);
+        let r = rt();
+        let info = r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "crea x.txt".into(), context: None })).unwrap();
+        assert_eq!(info["status"], "pendiente", "sin hooks no se entrega");
+        assert!(codex_rx.try_recv().is_err());
+        for (hooked, estado) in [(true, Status::Working), (true, Status::Blocked)] {
+            let mut st = d.state.lock().unwrap();
+            st.panes.get_mut(&2).unwrap().hooked = hooked;
+            st.panes.get_mut(&2).unwrap().status = estado;
+            st.deliver(2);
+            assert_eq!(st.tasks[0].status, TaskStatus::Pendiente, "{estado:?} no recibe tareas");
+        }
+        {
+            let mut st = d.state.lock().unwrap();
+            st.panes.get_mut(&2).unwrap().status = Status::Idle;
+            st.deliver(2);
+            assert_eq!(st.tasks[0].status, TaskStatus::Entregada);
+        }
+        let bytes = codex_rx.try_recv().expect("se escribió en el PTY");
+        let texto = String::from_utf8(bytes).unwrap();
+        assert!(texto.starts_with("\x1b[200~[galgo · tarea #1 de jefe]"), "{texto}");
+        assert!(texto.contains("no es una orden del usuario"));
+        assert!(texto.ends_with("\x1b[201~\r"), "un solo Enter, al final, tras el pegado");
+        assert_eq!(texto.matches('\r').count(), 1);
+    }
+
+    /// Frenos: como mucho 3 tareas abiertas por par, profundidad máxima 3, y 8 abiertas por workspace.
+    #[test]
+    fn frenos_de_delegacion() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _a = vivo(&mut st, 1, "a", true, Status::Idle);
+        let _b = vivo(&mut st, 2, "b", true, Status::Idle);
+        let _c = vivo(&mut st, 3, "c", true, Status::Idle);
+        let _e = vivo(&mut st, 4, "e", true, Status::Idle);
+        let _f = vivo(&mut st, 5, "f", true, Status::Idle);
+        let d = daemon_con(st);
+        let r = rt();
+        let mut ok = 0;
+        for _ in 0..4 {
+            if r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "t".into(), context: None })).is_ok() {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 3, "el cuarto par entre los mismos dos agentes se rechaza");
+        // Cadena 1→2→3→4 (profundidad 3) y el siguiente salto, 4→5, pasa de la profundidad máxima.
+        assert!(r.block_on(d.handle(Request::Delegate { from: "2".into(), to: "3".into(), task: "t".into(), context: None })).is_ok());
+        assert!(r.block_on(d.handle(Request::Delegate { from: "3".into(), to: "4".into(), task: "t".into(), context: None })).is_ok());
+        let err = r.block_on(d.handle(Request::Delegate { from: "4".into(), to: "5".into(), task: "t".into(), context: None })).unwrap_err();
+        assert!(err.to_string().contains("profundidad máxima"), "{err}");
+        // Workspace: 8 tareas abiertas y ya no entra ninguna más.
+        let mut st = d.state.lock().unwrap();
+        st.tasks.clear();
+        for i in 0..8u64 {
+            st.tasks.push(Task { id: i + 1, from: 1, to: 2, from_name: "a".into(), to_name: "b".into(), workspace: Some("ws".into()), text: "t".into(), context: None, status: TaskStatus::Pendiente, summary: None, files: vec![], depth: 1, created_unix: 0 });
+        }
+        let e = st.check_delegation(3, 4, Some("ws")).unwrap_err();
+        assert!(e.to_string().contains("workspace"), "{e}");
+        assert!(st.check_delegation(3, 4, Some("otro")).is_ok(), "otro workspace tiene su propio cupo");
+    }
+
+    /// El resultado vuelve al remitente como mensaje de su buzón; solo el destinatario puede cerrar la tarea.
+    #[test]
+    fn el_resultado_vuelve_al_remitente() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _jefe = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _codex = vivo(&mut st, 2, "codex", true, Status::Idle);
+        let d = daemon_con(st);
+        let r = rt();
+        let info = r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "crea x.txt".into(), context: None })).unwrap();
+        let id = info["id"].as_u64().unwrap();
+        assert!(r.block_on(d.handle(Request::TaskDone { from: "1".into(), id, summary: "no soy yo".into(), ok: true })).is_err(), "el remitente no cierra la tarea");
+        r.block_on(d.handle(Request::TaskDone { from: "2".into(), id, summary: "creado".into(), ok: true })).unwrap();
+        let st = d.state.lock().unwrap();
+        assert_eq!(st.tasks[0].status, TaskStatus::Lista);
+        let buzon = &st.panes[&1].inbox;
+        assert!(buzon.iter().any(|m| m.kind == "done" && m.summary.contains("creado")), "el jefe recibe el resultado");
+    }
+
+    /// Si el destinatario termina antes de cerrar la tarea, la tarea falla y el delegador se entera.
+    #[test]
+    fn destinatario_que_termina_falla_la_tarea() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _jefe = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _codex = vivo(&mut st, 2, "codex", true, Status::Idle);
+        let d = daemon_con(st);
+        let r = rt();
+        r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "t".into(), context: None })).unwrap();
+        let mut st = d.state.lock().unwrap();
+        st.fail_tasks_of(2);
+        assert_eq!(st.tasks[0].status, TaskStatus::Fallida);
+        assert!(st.panes[&1].inbox.iter().any(|m| m.kind == "failed"), "el jefe se entera");
+    }
+
+    /// Las tareas sobreviven al reinicio con su estado y su id.
+    #[test]
+    fn tareas_sobreviven_al_reinicio() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _jefe = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _codex = vivo(&mut st, 2, "codex", true, Status::Idle);
+        let d = daemon_con(st);
+        let r = rt();
+        r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "crea x.txt".into(), context: Some("en la raíz".into()) })).unwrap();
+        let guardado = persist::snapshot(&d.state.lock().unwrap());
+        let mut nuevo = State { epoch: 4, ..State::default() };
+        persist::restore(&mut nuevo, guardado);
+        assert_eq!(nuevo.tasks.len(), 1);
+        // El codex tenía hooks y estaba libre: la tarea se entregó al delegarla, y eso sobrevive al reinicio.
+        assert_eq!(nuevo.tasks[0].status, TaskStatus::Entregada);
+        assert_eq!(nuevo.tasks[0].context.as_deref(), Some("en la raíz"));
+        assert_eq!(nuevo.next_task, 1);
     }
 }

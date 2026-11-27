@@ -35,6 +35,29 @@ pub struct Saved {
     pub next_pane: u32,
     pub next_msg: u64,
     pub panes: Vec<SavedPane>,
+    /// Tareas delegadas. Un estado anterior no las tiene: se carga sin tareas.
+    #[serde(default)]
+    pub tasks: Vec<SavedTask>,
+    #[serde(default)]
+    pub next_task: u64,
+}
+
+/// Una tarea delegada tal como se guarda. Ver `Task` en el daemon.
+#[derive(Serialize, Deserialize)]
+pub struct SavedTask {
+    pub id: u64,
+    pub from: u32,
+    pub to: u32,
+    pub from_name: String,
+    pub to_name: String,
+    pub workspace: Option<String>,
+    pub text: String,
+    pub context: Option<String>,
+    pub status: galgo_proto::TaskStatus,
+    pub summary: Option<String>,
+    pub files: Vec<String>,
+    pub depth: u8,
+    pub created_unix: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,6 +243,26 @@ pub fn snapshot(st: &State) -> Saved {
         epoch: st.epoch,
         next_pane: st.next_pane,
         next_msg: st.next_msg,
+        tasks: st
+            .tasks
+            .iter()
+            .map(|t| SavedTask {
+                id: t.id,
+                from: t.from,
+                to: t.to,
+                from_name: t.from_name.clone(),
+                to_name: t.to_name.clone(),
+                workspace: t.workspace.clone(),
+                text: t.text.chars().take(MAX_SUMMARY).collect(),
+                context: t.context.as_ref().map(|c| c.chars().take(MAX_SUMMARY).collect()),
+                status: t.status,
+                summary: t.summary.as_ref().map(|s| s.chars().take(MAX_SUMMARY).collect()),
+                files: t.files.clone(),
+                depth: t.depth,
+                created_unix: t.created_unix,
+            })
+            .collect(),
+        next_task: st.next_task,
         panes: st
             .panes
             .values()
@@ -254,6 +297,26 @@ pub fn snapshot(st: &State) -> Saved {
 pub fn restore(st: &mut State, saved: Saved) {
     st.next_pane = saved.next_pane;
     st.next_msg = saved.next_msg;
+    st.next_task = saved.next_task;
+    st.tasks = saved
+        .tasks
+        .into_iter()
+        .map(|t| super::Task {
+            id: t.id,
+            from: t.from,
+            to: t.to,
+            from_name: t.from_name,
+            to_name: t.to_name,
+            workspace: t.workspace,
+            text: t.text,
+            context: t.context,
+            status: t.status,
+            summary: t.summary,
+            files: t.files,
+            depth: t.depth,
+            created_unix: t.created_unix,
+        })
+        .collect();
     let now_unix = unix_now();
     let mut lost = Vec::new();
     for sp in saved.panes {
@@ -340,6 +403,8 @@ mod tests {
             epoch: 3,
             next_pane: 5,
             next_msg: 9,
+            tasks: vec![],
+            next_task: 0,
             panes: vec![
                 SavedPane { id: 1, name: "mgr".into(), cmd: vec!["bash".into()], manager: None, workspace: None, cwd: None, alive: true, inbox: vec![] },
                 SavedPane {
