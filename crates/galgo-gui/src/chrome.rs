@@ -70,11 +70,11 @@ fn split_path(path: &str) -> (String, String) {
 
 /// Cabecera de sección en minúsculas, como Rex («machines», «agents»), con un texto opcional a la derecha.
 fn lower_section<'a>(label: &'a str, right: Option<&'a str>) -> Element<'a, Message> {
-    let mut r = row![text(label).size(theme::BODY_SIZE).color(theme::MUTED)].align_y(Alignment::Center);
+    let mut r = row![text(label).size(theme::SMALL_SIZE + 1.0).color(theme::DIM)].align_y(Alignment::Center);
     if let Some(t) = right {
         r = r.push(Space::with_width(Length::Fill)).push(text(t).size(theme::SMALL_SIZE).color(theme::DIM));
     }
-    container(r).padding(iced::Padding { top: 10.0, bottom: 4.0, left: 8.0, right: 8.0 }).into()
+    container(r).padding(iced::Padding { top: 14.0, bottom: 6.0, left: 10.0, right: 10.0 }).into()
 }
 
 /// Estado más urgente de un grupo de paneles (el que decide el punto del proyecto).
@@ -108,11 +108,11 @@ fn agent_row<'a>(app: &'a App, pane: &'a PaneInfo) -> Element<'a, Message> {
     let title = sidebar::recortar(&pane.title.clone().unwrap_or_else(|| pane.status.as_str().to_string()), 40);
     let body = column![
         text(&pane.name).size(theme::BODY_SIZE).color(if selected { TEXT } else { theme::TEXT_SOFT }).wrapping(iced::widget::text::Wrapping::None),
-        text(title).size(theme::SMALL_SIZE).color(MUTED).wrapping(iced::widget::text::Wrapping::None),
+        text(title).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(1);
     let line = row![
-        dot(theme::status_color(pane.status), 7.0),
+        dot(theme::status_color(pane.status), 8.0),
         body,
         Space::with_width(Length::Fill),
         text(side).size(theme::SMALL_SIZE).color(side_color).wrapping(iced::widget::text::Wrapping::None),
@@ -134,17 +134,14 @@ fn sidebar_list(app: &App) -> Element<'_, Message> {
     list = list.push(lower_section("machines", None));
     list = list.push(container(text("▾ Local").size(theme::BODY_SIZE).color(TEXT)).padding([3, 8]));
     for project in sidebar::tree(&app.panes) {
-        list = list.push(container(text(project.name.clone()).size(theme::BODY_SIZE).color(theme::TEXT_SOFT)).padding(iced::Padding { top: 4.0, bottom: 0.0, left: 16.0, right: 8.0 }));
+        list = list.push(container(text(project.name.clone()).size(theme::BODY_SIZE).color(theme::TEXT_SOFT)).padding(iced::Padding { top: 6.0, bottom: 0.0, left: 18.0, right: 8.0 }));
         for ws in project.workspaces {
             let state = worst(&ws.panes);
             let first = ws.panes.first().map(|p| p.id);
-            let head = row![
-                dot(theme::status_color(state), 7.0),
-                text(ws.name.clone()).size(theme::SMALL_SIZE + 1.0).color(MUTED).wrapping(iced::widget::text::Wrapping::None),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center);
-            let mut item = theme::btn(container(head).width(Length::Fill).padding(iced::Padding { top: 2.0, bottom: 2.0, left: 30.0, right: 8.0 }).clip(true))
+            // Sin viñeta: la rama va sangrada bajo su proyecto; el color de su estado lo lleva la fila de agente.
+            let _ = state;
+            let head = text(ws.name.clone()).size(theme::SMALL_SIZE + 1.0).color(MUTED).font(theme::MONO).wrapping(iced::widget::text::Wrapping::None);
+            let mut item = theme::btn(container(head).width(Length::Fill).padding(iced::Padding { top: 3.0, bottom: 3.0, left: 30.0, right: 8.0 }).clip(true))
                 .padding(0)
                 .width(Length::Fill)
                 .style(theme::row(false));
@@ -298,7 +295,7 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
             (l.clone(), l)
         }
     };
-    let crumb = row![text(project).size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text("/").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text(branch).size(theme::SMALL_SIZE + 1.0).color(MUTED)]
+    let crumb = row![text(project).size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text("/").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), text(branch).size(theme::SMALL_SIZE + 1.0).color(MUTED).font(theme::MONO)]
         .spacing(4)
         .align_y(Alignment::Center);
     // Pestañas como píldoras separadas por espacio (sin divisores verticales).
@@ -442,7 +439,7 @@ fn leaf_view(app: &App, id: u32, split: bool) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Alignment::Center);
     if !cwd.is_empty() {
-        titulo = titulo.push(text(cwd).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None));
+        titulo = titulo.push(text(cwd).size(theme::SMALL_SIZE).color(theme::DIM).font(theme::MONO).wrapping(iced::widget::text::Wrapping::None));
     }
     let mut acciones = row![].spacing(2).align_y(Alignment::Center);
     if focused {
@@ -503,7 +500,7 @@ pub fn status_bar(app: &App) -> Element<'_, Message> {
             .push(text(&p.name).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT))
             .push(text(p.status.as_str()).size(theme::SMALL_SIZE).color(theme::status_color(p.status)));
         if let Some(cwd) = &p.cwd {
-            left = left.push(sep()).push(text(tilde(cwd)).size(theme::SMALL_SIZE).color(theme::DIM).wrapping(iced::widget::text::Wrapping::None));
+            left = left.push(sep()).push(text(tilde(cwd)).size(theme::SMALL_SIZE).color(theme::DIM).font(theme::MONO).wrapping(iced::widget::text::Wrapping::None));
         }
         if let Some(s) = shown(app) {
             left = left.push(sep()).push(text(format!("{}×{}", s.cols, s.rows)).size(theme::SMALL_SIZE).color(theme::DIM));

@@ -34,6 +34,11 @@ pub const DONE: Color = Color::from_rgb(0.561, 0.749, 0.498);
 pub const FAILED: Color = Color::from_rgb(0.851, 0.451, 0.420);
 pub const IDLE: Color = Color::from_rgb(0.369, 0.337, 0.286);
 
+/// Fuente de la interfaz: proporcional, como el chrome de Rex. El monoespacio queda para el terminal y los datos
+/// técnicos (ramas, rutas), con `MONO`.
+pub const UI_FONT: iced::Font = iced::Font::DEFAULT;
+pub const MONO: iced::Font = iced::Font::MONOSPACE;
+
 /// Esquina de botones, filas y paneles.
 pub const RADIUS: f32 = 8.0;
 /// Grosor de los bordes finos (divisores de splits, foco).
