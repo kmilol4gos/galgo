@@ -1389,5 +1389,36 @@ galgo worktree discard wt140b --yes >/dev/null; check "descartar con --yes" $?
 galgo stop >/dev/null 2>&1; sleep 0.3
 export GALGO_SOCKET="$TMP/galgo.sock"
 
+echo "144. suscripción empujada: un cambio de pantalla llega sin sondeo; el cierre del panel avisa"
+export GALGO_SOCKET="$TMP/c144/g.sock"; mkdir -p "$TMP/c144" && chmod 700 "$TMP/c144"
+galgo spawn w144 -- /bin/cat >/dev/null; check "panel para la suscripción" $?
+python3 - "$GALGO_SOCKET" <<'PYEOF'
+import json, socket, subprocess, sys, time
+ruta = sys.argv[1]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect(ruta)
+s.sendall((json.dumps({"op": "watch", "pane": "w144"}) + "\n").encode())
+f = s.makefile("r")
+def leer():
+    return json.loads(f.readline())
+assert leer()["event"] == "watching"
+assert leer()["event"] == "changed", "el estado actual se avisa al abrir"
+# Un panel recién creado puede emitir un aviso más al arrancar: después del envío se espera el primer aviso
+# posterior, saltando los que lleguen antes del texto.
+subprocess.run(["galgo", "send", "w144", "hola-suscripcion"], check=True, capture_output=True)
+t0 = time.time()
+ev = leer()
+while ev["event"] != "changed" and time.time() - t0 < 3:
+    ev = leer()
+assert ev["event"] == "changed" and time.time() - t0 < 2, ev
+subprocess.run(["galgo", "kill", "w144"], check=True, capture_output=True)
+t0 = time.time()
+ev = leer()
+while ev["event"] == "changed" and time.time() - t0 < 3:
+    ev = leer()
+assert ev["event"] == "closed", ev
+PYEOF
+check "un cambio llega como aviso y el cierre también" $?
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

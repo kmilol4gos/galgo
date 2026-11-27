@@ -104,6 +104,8 @@ struct Pane {
     last_summary: Option<String>,
     /// Título de la tarea que declara el agente (solo en memoria).
     title: Option<String>,
+    /// Se avisa cada vez que cambia la pantalla (la lee el hilo de salida) y al cerrar el panel: lo usan las suscripciones.
+    changed: Arc<Notify>,
     /// Ha enviado eventos de hook de agente (un agente real, aunque no lo lanzara galgo). Solo en memoria.
     hooked: bool,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
@@ -169,6 +171,7 @@ impl Pane {
             title: None,
             last_blocked: None,
             hooked: false,
+            changed: Arc::new(Notify::new()),
             orphans: Vec::new(),
             waiting_on: None,
             reported: false,
@@ -802,6 +805,7 @@ impl Daemon {
         );
         let screen = Arc::new(Mutex::new(vt100::Parser::new(v_rows, v_cols, 2000)));
         let gen = Arc::new(AtomicU64::new(fresh_gen()));
+        let changed = Arc::new(Notify::new());
 
         let (input, input_rx) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
         std::thread::spawn(move || {
@@ -837,6 +841,7 @@ impl Daemon {
             title: None,
             last_blocked: None,
             hooked: false,
+            changed: Arc::clone(&changed),
             orphans: Vec::new(),
             waiting_on: None,
             reported: false,
@@ -865,9 +870,12 @@ impl Daemon {
                         let mut parser = screen.lock().unwrap();
                         parser.process(&buf[..n]);
                         gen.fetch_add(1, Ordering::SeqCst);
+                        // Las suscripciones se enteran sin sondear: un aviso por trozo de salida.
+                        changed.notify_waiters();
                     }
                 }
             }
+            changed.notify_waiters();
             // El hijo se recolecta aquí, sin candados: no queda <defunct> y sabemos cómo terminó.
             // Antes de recolectar al hijo, el panel queda marcado como terminado: un kill que llegue
             // ahora ya no le envía señales, así que nunca actúa sobre un pid recolectado.
@@ -1418,6 +1426,7 @@ impl Daemon {
                 Ok(v)
             }
             Request::Wait { .. } => unreachable!("se atiende en dispatch"),
+            Request::Watch { .. } => Err(anyhow!("la suscripción se atiende en su conexión")),
             Request::Inbox { pane } => {
                 let st = self.state.lock().unwrap();
                 let p = &st.panes[&st.resolve(&pane)?];
@@ -1586,6 +1595,64 @@ fn kill_members(sid: i32, pids: &[i32]) {
     }
 }
 
+/// Escribe una línea JSON; `false` si el cliente no la lee (o la conexión cayó).
+async fn send_json<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, v: Value) -> bool {
+    let mut out = v.to_string();
+    out.push('\n');
+    matches!(tokio::time::timeout(Duration::from_secs(5), w.write_all(out.as_bytes())).await, Ok(Ok(())))
+}
+
+impl Daemon {
+    /// Suscripción a un panel: escribe `changed` cada vez que su pantalla cambia (sin sondeo: el hilo de salida avisa),
+    /// y `closed` al cerrarse el panel. Termina si el cliente corta la conexión o escribe algo.
+    async fn watch<R, W>(self: &Arc<Self>, pane: String, lines: &mut tokio::io::Lines<BufReader<R>>, w: &mut W)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let found = {
+            let st = self.state.lock().unwrap();
+            st.resolve(&pane).ok().and_then(|id| st.panes.get(&id).map(|p| (id, Arc::clone(&p.changed), Arc::clone(&p.gen))))
+        };
+        let Some((id, changed, gen)) = found else {
+            let _ = send_json(w, json!({ "ok": false, "error": format!("panel no encontrado: {pane}") })).await;
+            return;
+        };
+        if !send_json(w, json!({ "ok": true, "event": "watching", "pane": id })).await {
+            return;
+        }
+        let mut last = None;
+        loop {
+            // El aviso queda registrado antes de leer la generación: un cambio entre las dos cosas no se pierde
+            // (sin `enable`, un aviso que llega antes de la primera espera se perdería hasta el respaldo de 1 s).
+            let aviso = changed.notified();
+            tokio::pin!(aviso);
+            aviso.as_mut().enable();
+            let g = gen.load(Ordering::SeqCst);
+            if last != Some(g) {
+                last = Some(g);
+                if !send_json(w, json!({ "ok": true, "event": "changed", "gen": g })).await {
+                    return;
+                }
+            }
+            let cerrado = {
+                let st = self.state.lock().unwrap();
+                st.panes.get(&id).map_or(true, |p| p.exited)
+            };
+            if cerrado {
+                let _ = send_json(w, json!({ "ok": true, "event": "closed", "pane": id })).await;
+                return;
+            }
+            tokio::select! {
+                _ = &mut aviso => {}
+                // Un red de seguridad por si un aviso se pierde: revisa el estado del panel una vez por segundo.
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = lines.next_line() => return,
+            }
+        }
+    }
+}
+
 async fn serve(d: Arc<Daemon>, stream: UnixStream) {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
@@ -1601,6 +1668,11 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
         };
         let mut client_ack = false;
         let (resp, ack) = match serde_json::from_str::<Request>(&line) {
+            // La suscripción es dueña de la conexión: al terminar, se cierra.
+            Ok(Request::Watch { pane }) => {
+                d.watch(pane, &mut lines, &mut w).await;
+                break;
+            }
             Ok(req) if matches!(req, Request::Wait { .. }) => {
                 client_ack = matches!(req, Request::Wait { client_ack: true, .. });
                 let mut fut = std::pin::pin!(d.dispatch(req));
@@ -2335,5 +2407,56 @@ mod agente_tests {
         d.state.lock().unwrap().panes.get_mut(&1).unwrap().hooked = true;
         let despues = { let st = d.state.lock().unwrap(); st.info(&st.panes[&1], 30).agent };
         assert!(despues, "con hooks, el panel es un agente real");
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use super::tests_fantasmas::{daemon_con, fantasma};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    /// Siguiente línea de la suscripción, con tiempo límite (si no llega, la prueba falla en vez de colgarse).
+    async fn siguiente(c: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>) -> String {
+        tokio::time::timeout(Duration::from_secs(3), c.next_line()).await.unwrap().unwrap().unwrap()
+    }
+
+    /// La suscripción empuja: un aviso al abrir (estado actual), uno por cada cambio de pantalla y un `closed` al
+    /// cerrarse el panel. El cliente no sondea: solo lee lo que llega.
+    #[test]
+    fn suscripcion_empuja_cambios_y_cierre() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let mut p = fantasma(1, "shell", None);
+        p.ghost = false;
+        p.exited = false;
+        st.panes.insert(1, p);
+        let d = daemon_con(st);
+        let (gen, changed) = {
+            let st = d.state.lock().unwrap();
+            (Arc::clone(&st.panes[&1].gen), Arc::clone(&st.panes[&1].changed))
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (cliente, servidor) = tokio::io::duplex(4096);
+            let (r, w) = tokio::io::split(servidor);
+            let d2 = Arc::clone(&d);
+            let tarea = tokio::spawn(async move {
+                let mut lines = BufReader::new(r).lines();
+                let mut w = w;
+                d2.watch("1".into(), &mut lines, &mut w).await;
+            });
+            let mut c = BufReader::new(cliente).lines();
+            assert!(siguiente(&mut c).await.contains("watching"));
+            assert!(siguiente(&mut c).await.contains("\"changed\""), "el estado actual se avisa al abrir");
+            gen.fetch_add(1, Ordering::SeqCst);
+            changed.notify_waiters();
+            let linea = siguiente(&mut c).await;
+            assert!(linea.contains("\"changed\""), "un cambio de pantalla se avisa: {linea}");
+            d.state.lock().unwrap().panes.get_mut(&1).unwrap().exited = true;
+            changed.notify_waiters();
+            assert!(siguiente(&mut c).await.contains("closed"), "el cierre del panel se avisa");
+            tokio::time::timeout(Duration::from_secs(3), tarea).await.unwrap().unwrap();
+        });
     }
 }

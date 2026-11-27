@@ -230,6 +230,11 @@ struct App {
     error: Option<String>,
     loading: bool,
     listing: bool,
+    /// Llegó un aviso mientras había una lectura en vuelo: al volver, se pide otra (el daemon no avisa dos veces del
+    /// mismo cambio, así que sin esto la pantalla se quedaría vieja).
+    refresh_wanted: bool,
+    /// La suscripción al panel enfocado no funciona: se sondea su pantalla hasta que vuelva a funcionar.
+    watch_down: bool,
     /// Modificadores del teclado (para Cmd+clic) y el último clic (para doble y triple clic: celda, instante, n).
     mods: keyboard::Modifiers,
     clicks: Option<(Cell, std::time::Instant, u8)>,
@@ -334,6 +339,10 @@ enum Message {
     SubmitForm,
     Spawned(Result<serde_json::Value, String>),
     AskClose,
+    /// El daemon avisa que la pantalla de un panel cambió (suscripción `Watch`): se pide la nueva.
+    PaneChanged(u32, u64),
+    /// No hubo forma de suscribirse al panel: mientras tanto, la pantalla se sondea.
+    WatchDown(u32),
     /// Cmd+K: limpia la pantalla del panel enfocado (Ctrl+L al shell).
     ClearScreen,
     /// Un archivo arrastrado a la ventana: su ruta se pega en el panel enfocado.
@@ -993,6 +1002,65 @@ fn selected_cols(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
     (start <= end).then_some((start, end))
 }
 
+/// Suscripción a los cambios de un panel: el daemon escribe un aviso cada vez que su pantalla cambia. Si la conexión
+/// no se puede abrir, se avisa para sondear; si se cae, se vuelve a conectar despacio; si el panel se cierra, termina.
+fn watch_stream(pane: u32) -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(16, move |mut salida| async move {
+        let mut primera = true;
+        loop {
+            match watch_once(pane, &mut salida, primera).await {
+                WatchEnd::Cerrado => break,
+                WatchEnd::Cayo => {
+                    primera = false;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })
+}
+
+enum WatchEnd {
+    /// El panel terminó: no hay nada más que vigilar.
+    Cerrado,
+    /// La conexión cayó: se reintenta.
+    Cayo,
+}
+
+/// Una conexión de suscripción: pide `Watch` y reenvía cada aviso de cambio a la app.
+async fn watch_once(pane: u32, salida: &mut iced::futures::channel::mpsc::Sender<Message>, primera: bool) -> WatchEnd {
+    use iced::futures::SinkExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let conexion = tokio::net::UnixStream::connect(galgo_proto::socket_path()).await;
+    let Ok(stream) = conexion else {
+        if primera {
+            let _ = salida.send(Message::WatchDown(pane)).await;
+        }
+        return WatchEnd::Cayo;
+    };
+    let (r, mut w) = stream.into_split();
+    let pedido = serde_json::to_string(&Request::Watch { pane: pane.to_string() }).unwrap_or_default() + "\n";
+    if w.write_all(pedido.as_bytes()).await.is_err() {
+        return WatchEnd::Cayo;
+    }
+    let mut lineas = tokio::io::BufReader::new(r).lines();
+    while let Ok(Some(linea)) = lineas.next_line().await {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&linea) else { break };
+        match v["event"].as_str() {
+            Some("changed") => {
+                let gen = v["gen"].as_u64().unwrap_or(0);
+                if salida.send(Message::PaneChanged(pane, gen)).await.is_err() {
+                    return WatchEnd::Cerrado;
+                }
+            }
+            Some("closed") => return WatchEnd::Cerrado,
+            Some("watching") => {}
+            // Un `ok: false` (panel desconocido) o cualquier otra cosa: no hay suscripción que mantener.
+            _ => return WatchEnd::Cerrado,
+        }
+    }
+    WatchEnd::Cayo
+}
+
 /// Abre una URL o una ruta con el visor del sistema (`open`). Un fallo se avisa y no detiene la app.
 fn open_target(objetivo: &str) {
     if let Err(e) = std::process::Command::new("open").arg(objetivo).spawn() {
@@ -1220,6 +1288,32 @@ fn keep_focus_visible(app: &mut App) {
 
 fn update_inner(app: &mut App, message: Message) -> Task<Message> {
     match message {
+        Message::PaneChanged(id, gen) => {
+            app.watch_down = false;
+            if app.selected == Some(id) && app.snap_gen != Some(gen) {
+                if app.loading {
+                    app.refresh_wanted = true;
+                    return Task::none();
+                }
+                app.loading = true;
+                // Solo se pide "lo que cambió" si la última respuesta completa es del mismo desplazamiento.
+                let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
+                return load_screen(id, app.scroll, since);
+            }
+            Task::none()
+        }
+        Message::WatchDown(id) => {
+            if app.selected == Some(id) {
+                app.watch_down = true;
+                // Una lectura ahora mismo, para no quedarse con la pantalla vieja mientras se sondea.
+                if !app.loading {
+                    app.loading = true;
+                    let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
+                    return load_screen(id, app.scroll, since);
+                }
+            }
+            Task::none()
+        }
         Message::ClearScreen => match app.selected {
             // Ctrl+L: el shell redibuja el prompt en lo alto y limpia la pantalla.
             Some(id) => send_request(Request::Send { pane: id.to_string(), text: "\u{c}".into(), enter: false }, |_| Message::Echo),
@@ -1277,8 +1371,9 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             // M3: los paneles del layout se redimensionan a su rectángulo cuando cambia (split, cierre, ventana).
             resize_if_needed(app);
+            // El panel enfocado no se sondea: le avisa el daemon (`PaneChanged`). Solo si esa suscripción falla, se sondea.
             let focus_task = match app.selected {
-                Some(id) if !app.loading => {
+                Some(id) if !app.loading && app.watch_down => {
                     app.loading = true;
                     // Solo se pide "lo que cambió" si la última respuesta completa es del mismo desplazamiento.
                     let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
@@ -1697,6 +1792,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Screen(id, offset, sent_since, result) => {
             app.loading = false;
+            let repetir = std::mem::take(&mut app.refresh_wanted);
             if app.selected == Some(id) {
                 match result {
                     // Sin cambios. Solo vale si esta respuesta corresponde a la vista que se muestra
@@ -1721,6 +1817,12 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                         app.snap_gen = None;
                     }
                 }
+            }
+            // Un aviso llegó durante esta lectura: ahora se pide la pantalla que ya cambió.
+            if let (true, Some(sel)) = (repetir, app.selected) {
+                app.loading = true;
+                let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
+                return load_screen(sel, app.scroll, since);
             }
             Task::none()
         }
@@ -2221,8 +2323,14 @@ fn main() -> iced::Result {
         .theme(|_| theme::app())
         // Rex: fuente monoespaciada en toda la interfaz, no solo en el terminal.
         .default_font(theme::UI_FONT)
-        .subscription(|_: &App| Subscription::batch([
-            iced::time::every(Duration::from_millis(50)).map(|_| Message::TickScreen),
+        .subscription(|app: &App| Subscription::batch([
+            // Latido de 250 ms: paneles visibles sin foco y redimensiones. El panel enfocado no se sondea.
+            iced::time::every(Duration::from_millis(250)).map(|_| Message::TickScreen),
+            // Suscripción al panel enfocado: el daemon avisa cuando su pantalla cambia (sin sondeo).
+            match app.selected {
+                Some(id) => Subscription::run_with_id(id, watch_stream(id)),
+                None => Subscription::none(),
+            },
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TickList),
             event::listen_with(|event, status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::Keyboard(keyboard::Event::ModifiersChanged(_)) => Some(Message::Event(event)),
@@ -2640,6 +2748,32 @@ mod tests {
         app.panes.push(pane_info(2, "otro", Status::Idle));
         app.panes[1].workspace = Some("otro/rama".into());
         assert_eq!(marco_para(&app).filas_top, 2, "dos workspaces: la fila de sesiones aparece");
+    }
+
+    /// Un aviso que llega durante una lectura en vuelo deja otra pendiente, que se pide al volver la primera.
+    #[test]
+    fn aviso_durante_una_lectura_no_se_pierde() {
+        let mut app = App::default();
+        app.panes = vec![pane_info(1, "a", Status::Idle)];
+        app.selected = Some(1);
+        app.loading = true;
+        let _ = update(&mut app, Message::PaneChanged(1, 9));
+        assert!(app.refresh_wanted, "el aviso queda pendiente mientras se lee");
+        let _ = update(&mut app, Message::Screen(1, 0, None, Ok(ScreenReply::Unchanged(3))));
+        assert!(!app.refresh_wanted);
+        assert!(app.loading, "al volver la lectura en curso se pide la pantalla nueva");
+    }
+
+    /// Suscripción (principio de la divulgación): un aviso del panel enfocado pide su pantalla; uno de otro panel no.
+    #[test]
+    fn aviso_de_cambio_pide_solo_el_panel_enfocado() {
+        let mut app = App::default();
+        app.panes = vec![pane_info(1, "a", Status::Idle), pane_info(2, "b", Status::Idle)];
+        app.selected = Some(1);
+        let _ = update(&mut app, Message::PaneChanged(2, 9));
+        assert!(!app.loading, "un panel que no está enfocado no se pide");
+        let _ = update(&mut app, Message::PaneChanged(1, 9));
+        assert!(app.loading, "el panel enfocado pide su pantalla nueva");
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la

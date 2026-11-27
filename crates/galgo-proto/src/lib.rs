@@ -131,6 +131,12 @@ pub enum Request {
     Read {
         pane: String,
     },
+    /// Suscripción empujada a un panel: la conexión se queda abierta y el daemon escribe una línea
+    /// `{"ok":true,"event":"changed","gen":N}` cada vez que cambia su pantalla (y `"closed"` al terminar el panel).
+    /// El cliente pide el `Snapshot` cuando le avisan; no hace falta sondear. Cerrar la conexión la termina.
+    Watch {
+        pane: String,
+    },
     /// Pantalla con estilos y cursor, para clientes gráficos.
     Snapshot {
         pane: String,
@@ -461,5 +467,17 @@ mod tests_grupos {
     #[test]
     fn lista_vacia_no_tiene_grupos() {
         assert!(group_by_workspace(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod watch_proto_tests {
+    use super::*;
+
+    /// El pedido de suscripción tiene el formato del protocolo: `{"op":"watch","pane":...}`.
+    #[test]
+    fn watch_se_lee_del_protocolo() {
+        let req: Request = serde_json::from_str(r#"{"op":"watch","pane":"3"}"#).unwrap();
+        assert!(matches!(req, Request::Watch { ref pane } if pane == "3"));
     }
 }
