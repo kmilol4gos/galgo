@@ -1534,5 +1534,8 @@ ok=0; for i in $(seq 1 60); do galgo inbox --pane jefe147 2>/dev/null | grep -q 
 galgo tasks --pane jefe147 | grep -q "lista"; check "la tarea queda lista en el registro" $?
 galgo read w147 | grep -q "tarea #"; check "el texto llegó al worker pegado en su terminal" $?
 export PATH="$ANTES_PATH"; unset TMP_ARGS_DIR TMP_FAKE_DIR DESTINO
+# Ningún daemon de esta corrida puede quedar vivo: se comprueba (y se para) lo que quede bajo $TMP.
+"$(cd "$(dirname "$0")" && pwd)/comprobar-huerfanos.sh" "$TMP" >"$TMP/huerfanos" 2>&1
+check "no queda ningún galgod de esta corrida ($(tail -1 "$TMP/huerfanos"))" $?
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]
