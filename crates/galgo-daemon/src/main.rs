@@ -2283,7 +2283,14 @@ impl Daemon {
         }
         // SIGHUP no basta para quien lo ignora, ni para los trabajos que una shell puso en
         // otro grupo de la misma sesión. Tras una espera breve, SIGKILL a los miembros.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // La espera es un máximo: en cuanto la sesión se vacía se sigue (cerrar una pestaña no debe tardar un segundo).
+        let hasta = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < hasta {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if tokio::task::spawn_blocking(move || session_pids(sid)).await?.is_empty() {
+                break;
+            }
+        }
         tokio::task::spawn_blocking(move || kill_members(sid, &before)).await?;
         Ok(json!({}))
     }
@@ -2307,7 +2314,7 @@ impl Daemon {
             if self.state.lock().unwrap().panes.get(&id).is_none_or(|p| p.exited) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         {
             let st = self.state.lock().unwrap();
