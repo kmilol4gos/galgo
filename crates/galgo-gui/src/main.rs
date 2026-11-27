@@ -86,12 +86,11 @@ const LEAF_TOP: f32 = LEAF_PAD + HEADER_H;
 struct Marco {
     sidebar: bool,
     status: bool,
-    filas_top: u8,
 }
 // Por hilo: la app entera (update y view) corre en el hilo principal, y cada prueba tiene el suyo, así que las
 // pruebas en paralelo no se pisan la geometría.
 thread_local! {
-    static MARCO: std::cell::Cell<Marco> = const { std::cell::Cell::new(Marco { sidebar: false, status: false, filas_top: 1 }) };
+    static MARCO: std::cell::Cell<Marco> = const { std::cell::Cell::new(Marco { sidebar: false, status: false }) };
 }
 
 fn marco() -> Marco {
@@ -103,9 +102,9 @@ fn sidebar_w() -> f32 {
 fn status_h() -> f32 {
     if marco().status { STATUS_H } else { 0.0 }
 }
-/// Alto de la zona superior: una fila de pestañas, o dos si hay varios workspaces (la de sesiones arriba).
+/// Alto de la zona superior: una sola fila de pestañas (píldoras planas; el grupo solo si se creó un workspace).
 fn top_h() -> f32 {
-    marco().filas_top as f32 * TABS_H
+    TABS_H
 }
 #[cfg(test)]
 const LINE_H: f32 = 18.0;
@@ -118,8 +117,7 @@ fn term_origin() -> (f32, f32) {
 
 /// Geometría del marco que corresponde al estado de la app (función pura, para probarla).
 fn marco_para(app: &App) -> Marco {
-    let filas_top = if sidebar::workspaces(&app.panes).len() > 1 { 2 } else { 1 };
-    Marco { sidebar: app.sidebar, status: app.status, filas_top }
+    Marco { sidebar: app.sidebar, status: app.status }
 }
 
 /// Fija la geometría del marco según el estado de la app.
@@ -2722,9 +2720,8 @@ fn view(app: &App) -> Element<'_, Message> {
         }
         col.into()
     };
-    // Rex: la barra de sesiones va arriba del todo, sobre la barra lateral y el cuerpo.
+    // Una sola fila arriba (pestañas), sobre la barra lateral y el cuerpo.
     let base: Element<'_, Message> = container(column![
-        if marco().filas_top == 2 { chrome::session_bar(app) } else { iced::widget::Space::new(Length::Fill, Length::Shrink).into() },
         chrome::tabs_bar(app),
         if marco().sidebar { row![chrome::sidebar_view(app), main].into() } else { main },
     ])
@@ -3145,19 +3142,20 @@ mod tests {
         assert_eq!(shell_quote("a b'c"), "'a b'\\''c'");
     }
 
-    /// Terminal primero: sin barra lateral ni de estado, y una sola fila superior mientras haya un workspace.
+    /// Terminal primero: sin barra lateral ni de estado, y una sola fila superior aunque haya varios paneles o
+    /// carpetas (no hay fila de sesiones por carpeta).
     #[test]
     fn marco_por_defecto_es_terminal_primero() {
         let mut app = App::default();
         app.panes = vec![pane_info(1, "shell", Status::Idle)];
         let m = marco_para(&app);
         assert!(!m.sidebar && !m.status);
-        assert_eq!(m.filas_top, 1);
+        assert_eq!(top_h(), TABS_H);
         app.sidebar = true;
         assert!(marco_para(&app).sidebar);
         app.panes.push(pane_info(2, "otro", Status::Idle));
         app.panes[1].workspace = Some("otro/rama".into());
-        assert_eq!(marco_para(&app).filas_top, 2, "dos workspaces: la fila de sesiones aparece");
+        assert_eq!(top_h(), TABS_H, "dos carpetas: sigue una sola fila");
     }
 
     /// Un aviso que llega durante una lectura en vuelo deja otra pendiente, que se pide al volver la primera.

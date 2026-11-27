@@ -197,39 +197,6 @@ fn limits_footer(app: &App) -> Element<'_, Message> {
     column![theme::rule(false), container(col).padding([10, 14])].into()
 }
 
-/// Barra superior de sesiones, dentro de la barra de título (Rex): una sesión por workspace, la activa resaltada,
-/// y a la derecha las acciones. El hueco de la izquierda deja sitio a los semáforos de macOS.
-pub fn session_bar(app: &App) -> Element<'_, Message> {
-    let current = focus_key(app);
-    // M1: la ventana no muestra «(n)» en la barra de título (título oculto): el contador va aquí.
-    let atencion = app.attention.count(&app.panes);
-    // M3: los huecos de la barra arrastran la ventana (window::drag); los botones de sesión siguen siendo clics.
-    let arrastre = || mouse_area(Space::with_width(Length::Fill)).on_press(Message::DragWindow);
-    let mut bar = row![mouse_area(Space::with_width(78.0)).on_press(Message::DragWindow), text("galgo").size(theme::BODY_SIZE).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT)]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .height(TABS_H);
-    if atencion > 0 {
-        bar = bar.push(text(atencion.to_string()).size(theme::SMALL_SIZE).color(theme::BLOCKED));
-    }
-    bar = bar.push(Space::with_width(12.0));
-    for ws in sidebar::workspaces(&app.panes) {
-        let key = ws.label.clone().unwrap_or_default();
-        let active = current.as_deref().is_some_and(|k| k == key);
-        let state = ws.panes.iter().map(|p| p.status).min_by_key(|s| sidebar::priority(*s)).unwrap_or(Status::Idle);
-        let label = row![dot(theme::status_color(state), 6.0), text(ws.label.clone().unwrap_or_else(|| ws.name.clone())).size(theme::SMALL_SIZE + 1.0).color(if active { TEXT } else { MUTED }).wrapping(iced::widget::text::Wrapping::None)]
-            .spacing(7)
-            .align_y(Alignment::Center);
-        // B4: la sesión se elige por su clave, no por su posición, que puede cambiar entre el dibujo y el clic.
-        bar = bar.push(theme::btn(container(label).padding([5, 12])).padding(0).on_press(Message::SelectWorkspace(key.clone())).style(theme::tab(active)));
-    }
-    bar = bar
-        .push(arrastre())
-        .push(icon_button(text("⌘").size(14).color(MUTED).into(), "Buscar o ejecutar  ⌘K", Message::OpenPalette))
-        .push(Space::with_width(8));
-    container(bar).width(Length::Fill).style(theme::surface(SIDEBAR)).into()
-}
-
 /// Hora local HH:MM, sin dependencias de fecha: `localtime_r` de libc.
 pub fn clock_hm() -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as libc::time_t).unwrap_or(0);
