@@ -228,8 +228,9 @@ pub struct Capa {
 impl<M> canvas::Program<M> for Capa {
     type State = ();
 
-    fn draw(&self, _state: &(), renderer: &Renderer, _theme: &Theme, _bounds: Rectangle, _cursor: mouse::Cursor) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, Size::new(0.0, 0.0));
+    fn draw(&self, _state: &(), renderer: &Renderer, _theme: &Theme, bounds: Rectangle, _cursor: mouse::Cursor) -> Vec<Geometry> {
+        // El marco tiene el tamaño del área: con 0×0 el renderer real no pinta nada (solo lo veían las pruebas).
+        let mut frame = Frame::new(renderer, bounds.size());
         for &(col, fila, ch, color) in &self.celdas {
             let (x0, y0) = (col as f32 * self.cw, fila as f32 * self.lh);
             let Some(prims) = primitivas(ch, self.cw, self.lh, self.ligero) else { continue };
