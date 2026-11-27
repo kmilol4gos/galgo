@@ -528,7 +528,25 @@ fn sep<'a>() -> Element<'a, Message> {
     text("·").size(theme::SMALL_SIZE).color(theme::DIM).into()
 }
 
-/// Barra inferior: el panel enfocado (estado, carpeta, tamaño), y a la derecha lo pasajero: confirmación de cierre,
+/// Diálogo de cierre. Va en una capa propia: la barra de estado está oculta por defecto y ahí no se veía.
+pub fn close_confirm_panel(app: &App) -> Element<'_, Message> {
+    let name = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id)).map_or("", |p| p.name.as_str());
+    column![
+        text(format!("¿Cerrar «{name}»?")).size(15.0),
+        text("Hay un proceso en marcha y terminará.").size(theme::SMALL_SIZE).color(MUTED),
+        row![
+            Space::with_width(Length::Fill),
+            theme::btn(text("Cancelar  esc").size(theme::SMALL_SIZE).color(MUTED)).padding([4, 12]).on_press(Message::CancelClose),
+            theme::btn(text("Cerrar  ⏎").size(theme::SMALL_SIZE).color(theme::FAILED)).padding([4, 12]).on_press(Message::ConfirmClose),
+        ]
+        .spacing(8),
+    ]
+    .spacing(10)
+    .padding(18)
+    .into()
+}
+
+/// Barra inferior: el panel enfocado (estado, carpeta, tamaño), y a la derecha lo pasajero:
 /// error, historial, vista congelada y uso. Tiene altura fija: nada de esto mueve el terminal.
 pub fn status_bar(app: &App) -> Element<'_, Message> {
     let pane = app.selected.and_then(|id| app.panes.iter().find(|p| p.id == id));
@@ -546,13 +564,7 @@ pub fn status_bar(app: &App) -> Element<'_, Message> {
         }
     }
     let mut right = row![].spacing(8).align_y(Alignment::Center);
-    if app.confirm_close && pane.is_some() {
-        let name = pane.map_or("", |p| p.name.as_str());
-        right = right
-            .push(text(format!("¿Cerrar «{name}»? El proceso termina.")).size(theme::SMALL_SIZE).color(theme::BLOCKED))
-            .push(theme::btn(text("Cerrar").size(theme::SMALL_SIZE).color(theme::FAILED)).padding([1, 8]).on_press(Message::ConfirmClose))
-            .push(theme::btn(text("Cancelar").size(theme::SMALL_SIZE).color(MUTED)).padding([1, 8]).on_press(Message::CancelClose));
-    } else {
+    {
         if let Some(e) = &app.error {
             right = right.push(text(format!("⚠ {e}")).size(theme::SMALL_SIZE).color(theme::FAILED).wrapping(iced::widget::text::Wrapping::None));
         }

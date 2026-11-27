@@ -572,8 +572,10 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
 
 /// M2: un panel que puede tener trabajo en curso (todo salvo los terminados o caídos) pide confirmación al cerrarse.
 fn needs_confirm(p: &PaneInfo) -> bool {
-    // Solo un proceso ya terminado se cierra sin preguntar: un agente en Done o Failed sigue vivo y puede tener estado.
-    !matches!(p.status, Status::Exited)
+    // Como en cualquier terminal, un shell libre en su prompt se cierra sin preguntar. Un proceso en primer plano o un
+    // agente (aunque esté en Done o Failed, puede tener estado) piden confirmación; uno ya terminado, no.
+    let shell_libre = !p.agent && !p.hooked && p.programa.as_deref().is_some_and(|n| SHELLS.contains(&n));
+    !matches!(p.status, Status::Exited) && !shell_libre
 }
 
 /// M2: con el formulario abierto, Cmd+W cierra el formulario (no el panel de detrás) y Cmd+N sigue valiendo;
@@ -893,6 +895,7 @@ enum Body {
     Launcher,
     Palette,
     Settings,
+    CloseConfirm,
     Screen,
 }
 
@@ -900,6 +903,8 @@ fn body_mode(app: &App) -> Body {
     if app.settings.is_some() {
         // M4: con los ajustes abiertos, ningún atajo ni clic del terminal de detrás cuenta.
         Body::Settings
+    } else if app.confirm_close && !app.panes.is_empty() {
+        Body::CloseConfirm
     } else if app.palette.is_some() {
         Body::Palette
     } else if app.launcher {
@@ -2724,6 +2729,15 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Event(Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })) => {
+            // Confirmación de cierre: Enter o Cmd+W cierran, Esc cancela; nada llega al terminal.
+            if app.confirm_close {
+                return match &key {
+                    Key::Named(Named::Enter) => update(app, Message::ConfirmClose),
+                    Key::Named(Named::Escape) => update(app, Message::CancelClose),
+                    Key::Character(c) if modifiers.command() && c.as_str() == "w" => update(app, Message::ConfirmClose),
+                    _ => Task::none(),
+                };
+            }
             // La paleta tiene su propio teclado: flechas, Enter y Esc; lo demás lo escribe su campo.
             if app.palette.is_some() {
                 return match &key {
@@ -3195,6 +3209,7 @@ fn view(app: &App) -> Element<'_, Message> {
         Body::AgentForm => chrome::floating(base, chrome::agent_form_panel(app), 480.0, Message::CloseAgentForm),
         Body::TeamConfirm => chrome::floating(base, chrome::team_confirm_panel(app), 500.0, Message::TeamCancel),
         Body::Settings => chrome::floating(base, chrome::settings_panel(app), 820.0, Message::CloseSettings),
+        Body::CloseConfirm => chrome::floating(base, chrome::close_confirm_panel(app), 420.0, Message::CancelClose),
         Body::Welcome | Body::Screen => base,
     }
 }
@@ -4366,6 +4381,24 @@ mod tests {
         let mut app = App { panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::CloseFocused);
         assert!(app.confirm_close, "parado: también pregunta (M2)");
+    }
+
+    /// Un shell en su prompt se cierra sin preguntar; con un programa dentro pregunta, y el diálogo es dueño del teclado.
+    #[test]
+    fn cmd_w_cierra_un_shell_libre_y_pregunta_con_algo_dentro() {
+        let mut p = pane_info(1, "p", Status::Idle);
+        p.programa = Some("zsh".into());
+        assert!(!needs_confirm(&p), "shell en el prompt");
+        p.programa = Some("vim".into());
+        assert!(needs_confirm(&p), "vim abierto");
+        let mut app = App { panes: vec![p], selected: Some(1), ..Default::default() };
+        let _ = update(&mut app, Message::CloseFocused);
+        assert_eq!(body_mode(&app), Body::CloseConfirm, "el diálogo se ve aunque la barra de estado esté oculta");
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Escape), None)));
+        assert!(!app.confirm_close);
+        let _ = update(&mut app, Message::CloseFocused);
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
+        assert!(!app.confirm_close, "Enter confirma");
     }
 
     /// C: la paleta lista workspaces, paneles y acciones; la búsqueda los filtra y Enter ejecuta el elegido.
