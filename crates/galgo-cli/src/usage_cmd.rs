@@ -282,7 +282,7 @@ mod tests {
             cwd: Some("/Users/alguien/secreto".into()),
             usage,
             title: None,
-            agent: false,
+            agent: false, hooked: false,
         }
     }
 

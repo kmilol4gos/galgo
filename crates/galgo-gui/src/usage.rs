@@ -296,7 +296,7 @@ mod tests {
             cwd: None,
             usage: None,
             title: None,
-            agent: false,
+            agent: false, hooked: false,
         }
     }
 }

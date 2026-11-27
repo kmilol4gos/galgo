@@ -257,6 +257,8 @@ struct App {
     agent_form: Option<AgentForm>,
     roles: BTreeMap<String, String>,
     roles_saved: String,
+    /// Prompts iniciales de equipo aún no entregados (nombre de panel → texto). Se pegan cuando el agente avisa por hook.
+    prompts_pending: BTreeMap<String, String>,
     /// Equipo que espera la confirmación de su primera vez en el repo, y la confianza ya dada (repo → huella).
     team_pending: Option<TeamPending>,
     team_trust: serde_json::Value,
@@ -720,6 +722,7 @@ fn launch_team(app: &mut App, key: Option<String>, root: String, team: team::Tea
     let mut reservados: Vec<String> = Vec::new();
     let mut manager_name: Option<String> = None;
     let mut trabajos = Vec::new();
+    let mut prompts: Vec<(String, String)> = Vec::new();
     let ordenados = team.agents.iter().filter(|a| a.role == launch::Role::Manager).chain(team.agents.iter().filter(|a| a.role != launch::Role::Manager));
     for a in ordenados {
         let taken: Vec<&str> = names(app).into_iter().chain(reservados.iter().map(String::as_str)).collect();
@@ -733,8 +736,13 @@ fn launch_team(app: &mut App, key: Option<String>, root: String, team: team::Tea
         let req = launch::agent_request(&nombre, cmd, &root, Some(key.clone()), manager, worktree, rows, cols);
         app.roles.insert(nombre.clone(), a.role.label().to_string());
         reservados.push(nombre.clone());
-        trabajos.push((nombre, req, a.prompt.clone()));
+        if let Some(texto) = a.prompt.clone() {
+            prompts.push((nombre.clone(), texto));
+        }
+        trabajos.push((nombre, req));
     }
+    // El prompt no se envía con el arranque: espera a que el agente avise por hook (ver `prompts_task`).
+    app.prompts_pending.extend(prompts);
     app.inflight.extend(reservados.iter().cloned());
     let clave = key.clone();
     Task::perform(
@@ -742,15 +750,8 @@ fn launch_team(app: &mut App, key: Option<String>, root: String, team: team::Tea
             tokio::task::spawn_blocking(move || {
                 trabajos
                     .into_iter()
-                    .map(|(nombre, req, prompt)| {
+                    .map(|(nombre, req)| {
                         let r = request(req).and_then(|d| serde_json::from_value::<PaneInfo>(d).map_err(|e| e.to_string()));
-                        // El prompt inicial va cuando el panel ya arrancó; si no alcanza, queda en su entrada (el usuario lo ve).
-                        if r.is_ok() {
-                            if let Some(texto) = prompt {
-                                std::thread::sleep(Duration::from_millis(1500));
-                                let _ = request(Request::Send { pane: nombre.clone(), text: texto, enter: true });
-                            }
-                        }
                         (nombre, r)
                     })
                     .collect::<Vec<_>>()
@@ -763,6 +764,32 @@ fn launch_team(app: &mut App, key: Option<String>, root: String, team: team::Tea
             Err(e) => Message::TeamLaunched(clave.clone(), None, vec![(String::new(), Err(e))]),
         },
     )
+}
+
+/// Texto envuelto en bracketed paste: los saltos de línea llegan como texto y no como envíos (ni Enter ni `\r`).
+fn bracketed_paste(text: &str) -> String {
+    format!("\u{1b}[200~{text}\u{1b}[201~")
+}
+
+/// Entrega los prompts pendientes cuyo agente ya avisó por hook: se pegan sin Enter, para que el usuario confirme. Un
+/// panel que terminó sin avisar deja el prompt sin enviar y lo dice. Sin hooks, nunca se envía solo.
+fn prompts_task(app: &mut App) -> Task<Message> {
+    let mut envios = Vec::new();
+    let nombres: Vec<String> = app.prompts_pending.keys().cloned().collect();
+    for nombre in nombres {
+        let Some(p) = app.panes.iter().find(|p| p.name == nombre) else {
+            app.prompts_pending.remove(&nombre);
+            continue;
+        };
+        if p.hooked {
+            let texto = app.prompts_pending.remove(&nombre).unwrap_or_default();
+            envios.push(send_request(Request::Send { pane: nombre.clone(), text: bracketed_paste(&texto), enter: false }, |_| Message::Echo));
+        } else if p.status == Status::Exited {
+            app.prompts_pending.remove(&nombre);
+            app.error = Some(format!("el prompt de {nombre} no se envió: el agente terminó sin avisar (sin hooks)"));
+        }
+    }
+    Task::batch(envios)
 }
 
 /// Estado del formulario «+ Agente…»: qué lanzar, con qué rol y dónde trabajar.
@@ -2171,6 +2198,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         Message::Panes(result) => {
             app.listing = false;
             let mut arranque = None;
+            let mut envios = Task::none();
             match result {
                 Ok(panes) => {
                     app.error = None;
@@ -2192,6 +2220,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     }
                     // Los roles de paneles que ya no existen se olvidan.
                     app.roles.retain(|n, _| app.panes.iter().any(|p| &p.name == n) || app.inflight.contains(n));
+                    envios = prompts_task(app);
                     // Abrir la app ya es un terminal: si el daemon no tiene paneles, un shell en ~ (la bienvenida queda
                     // solo para cuando no se puede crear el panel).
                     if !app.started {
@@ -2231,7 +2260,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.snap_gen = None;
                 }
             }
-            arranque.unwrap_or_else(Task::none)
+            Task::batch([arranque.unwrap_or_else(Task::none), envios])
         }
         Message::Screen(id, offset, sent_since, result) => {
             app.loading = false;
@@ -3027,7 +3056,7 @@ mod tests {
             cwd: None,
             usage: None,
             title: None,
-            agent: false,
+            agent: false, hooked: false,
         }
     }
 
@@ -3395,6 +3424,31 @@ mod tests {
         });
         let _ = update(&mut app, Message::Event(esc));
         assert!(app.agent_form.is_none() && !overlay_owns_keyboard(&app), "Esc cierra el diálogo");
+    }
+
+    /// review-15 A3: el prompt inicial espera al primer hook del agente; sin hook no se envía; si el panel termina sin
+    /// avisar, se dice. Nunca con Enter.
+    #[test]
+    fn prompt_inicial_espera_al_hook() {
+        let mut app = App::default();
+        let mut p = pane_info(1, "jefe", Status::Idle);
+        p.hooked = false;
+        app.panes = vec![p];
+        app.prompts_pending.insert("jefe".into(), "Coordina.\nDespués, resume.".into());
+        let listado = app.panes.clone();
+        let _ = update(&mut app, Message::Panes(Ok(listado)));
+        assert!(app.prompts_pending.contains_key("jefe"), "sin hook, el prompt sigue pendiente");
+        let mut vivo = pane_info(1, "jefe", Status::Idle);
+        vivo.hooked = true;
+        let _ = update(&mut app, Message::Panes(Ok(vec![vivo])));
+        assert!(app.prompts_pending.is_empty(), "con el hook, se entrega (pegado, sin Enter) y sale de pendientes");
+        assert_eq!(bracketed_paste("a\nb"), "\u{1b}[200~a\nb\u{1b}[201~");
+        let mut muerto = pane_info(2, "codex", Status::Exited);
+        muerto.hooked = false;
+        app.prompts_pending.insert("codex".into(), "hola".into());
+        app.panes.push(muerto.clone());
+        let _ = update(&mut app, Message::Panes(Ok(vec![muerto])));
+        assert!(app.prompts_pending.is_empty() && app.error.is_some(), "un agente que sale sin avisar deja el prompt sin enviar, y lo dice");
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la
@@ -3966,7 +4020,7 @@ mod render {
     use iced_runtime::user_interface::{Cache, UserInterface};
 
     fn pane_info(id: u32, name: &str, status: Status) -> PaneInfo {
-        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false }
+        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false, hooked: false }
     }
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
@@ -4308,7 +4362,7 @@ mod lanzador_tests {
             cwd: None,
             usage: None,
             title: None,
-            agent: false,
+            agent: false, hooked: false,
         };
         let mut app = App { panes: vec![uno], window: (1100.0, 700.0), ..Default::default() };
         let _ = update(&mut app, Message::LauncherModel("claude".into(), "opus".into()));
@@ -4369,7 +4423,7 @@ mod atencion_tests {
     /// M1 (review-14): un resultado sin leer se distingue en la fila del agente; un Done ya visto no.
     #[test]
     fn r14_fila_muestra_la_insignia_de_sin_leer() {
-        let mut working = PaneInfo { id: 1, name: "codex".into(), status: Status::Working, manager: None, cmd: vec!["codex".into()], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false };
+        let mut working = PaneInfo { id: 1, name: "codex".into(), status: Status::Working, manager: None, cmd: vec!["codex".into()], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false, hooked: false };
         let mut app = App::default();
         app.attention.observe(&[working.clone()], None);
         working.status = Status::Done;
@@ -4413,7 +4467,7 @@ mod arrastre_tests {
     /// M3 (review-14): arrastrar la barra no cambia el panel, la vista ni las capas.
     #[test]
     fn r14_arrastrar_la_barra_no_toca_el_estado() {
-        let p = PaneInfo { id: 1, name: "p".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false };
+        let p = PaneInfo { id: 1, name: "p".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false, hooked: false };
         let mut app = App { window: (1100.0, 700.0), panes: vec![p], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::DragWindow);
         assert_eq!(app.selected, Some(1));
@@ -4440,7 +4494,7 @@ mod capas_tests {
     /// no maximiza el panel de detrás.
     #[test]
     fn r14_atajos_no_actuan_bajo_las_capas() {
-        let mut uno = PaneInfo { id: 1, name: "a".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some("w".into()), cwd: None, usage: None, title: None, agent: false };
+        let mut uno = PaneInfo { id: 1, name: "a".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some("w".into()), cwd: None, usage: None, title: None, agent: false, hooked: false };
         let dos = PaneInfo { id: 2, name: "b".into(), ..uno.clone() };
         uno.id = 1;
         let mut app = App { panes: vec![uno, dos], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
@@ -4463,7 +4517,7 @@ mod r14_b_tests {
     use super::*;
 
     fn pane(id: u32, ws: &str) -> PaneInfo {
-        PaneInfo { id, name: format!("p{id}"), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some(ws.into()), cwd: None, usage: None, title: None, agent: false }
+        PaneInfo { id, name: format!("p{id}"), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some(ws.into()), cwd: None, usage: None, title: None, agent: false, hooked: false }
     }
 
     /// B4 (review-14): elegir un workspace por clave lleva a su panel aunque cambie el orden de la lista.

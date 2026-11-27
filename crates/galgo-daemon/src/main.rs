@@ -314,6 +314,7 @@ impl State {
             usage: usage::merged(p.usage.as_ref(), p.usage_report.as_ref()),
             title: p.title.clone(),
             agent: p.hooked || is_agent_cmd(&p.cmd) || p.usage.is_some() || p.usage_report.is_some(),
+            hooked: p.hooked,
         }
     }
 }

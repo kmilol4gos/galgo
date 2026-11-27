@@ -355,6 +355,9 @@ pub struct PaneInfo {
     /// normal es `false`; con `claude` a mano en un shell, pasa a `true` en cuanto su hook avisa.
     #[serde(default)]
     pub agent: bool,
+    /// El agente del panel ha enviado algún evento de hook: ya arrancó y avisa de su estado (no es solo un comando).
+    #[serde(default)]
+    pub hooked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,7 +447,7 @@ mod tests_grupos {
             cwd: None,
             usage: None,
             title: None,
-            agent: false,
+            agent: false, hooked: false,
         }
     }
 
