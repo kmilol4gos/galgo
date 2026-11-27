@@ -1536,6 +1536,17 @@ galgo tasks --pane jefe147 | grep -q "lista"; check "la tarea queda lista en el 
 galgo read w147 | grep -q "tarea #"; check "el texto llegó al worker pegado en su terminal" $?
 export PATH="$ANTES_PATH"; unset TMP_ARGS_DIR TMP_FAKE_DIR DESTINO
 # Ningún daemon de esta corrida puede quedar vivo: se comprueba (y se para) lo que quede bajo $TMP.
+echo "148. cerrar una pestaña quita el panel; kill a secas lo deja como exited"
+export GALGO_SOCKET="$TMP/c148/g.sock"; mkdir -p "$TMP/c148" && chmod 700 "$TMP/c148"
+galgo spawn queda148 -- bash --norc >/dev/null; galgo spawn fuera148 -- bash --norc >/dev/null
+galgo kill queda148 >/dev/null; sleep 0.3
+galgo ls | grep queda148 | grep -q exited; check "kill a secas deja el panel como exited" $?
+galgo kill queda148 --remove >/dev/null; check "cerrar un panel ya terminado" $?
+galgo kill fuera148 --remove >/dev/null; check "cerrar un panel vivo" $?
+sleep 0.3; ! galgo ls | grep -qE "queda148|fuera148"; check "ninguno de los dos queda en la lista" $?
+galgo stop >/dev/null 2>&1
+export GALGO_SOCKET="$TMP/galgo.sock"
+
 "$(cd "$(dirname "$0")" && pwd)/comprobar-huerfanos.sh" "$TMP" >"$TMP/huerfanos" 2>&1
 check "no queda ningún galgod de esta corrida ($(tail -1 "$TMP/huerfanos"))" $?
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"

@@ -309,6 +309,10 @@ struct App {
     attention: Attention,
     /// Pide confirmación antes de cerrar el panel seleccionado.
     confirm_close: bool,
+    /// Shells ya terminados cuyo cierre se pidió (una sola vez cada uno).
+    cierres_pedidos: std::collections::HashSet<u32>,
+    /// El usuario cerró el último panel (o su shell terminó): al vaciarse el listado se cierra la ventana.
+    salir_al_vaciar: bool,
     /// Cuotas por agente del daemon, y el último error si no se pudieron leer.
     limits: Vec<Limits>,
     limits_error: Option<String>,
@@ -1621,6 +1625,18 @@ fn titulo_pestana(p: &PaneInfo) -> String {
     }
 }
 
+/// Shells que terminaron solos (`exit`, Ctrl-D): su pestaña se cierra, como en cualquier terminal. Un agente, un
+/// comando suelto, un manager o un panel con resultados sin confirmar se quedan para poder leerlos.
+fn shells_terminados(panes: &[PaneInfo]) -> Vec<u32> {
+    panes
+        .iter()
+        .filter(|p| p.status == Status::Exited && !p.agent && !p.hooked && p.unacked == 0)
+        .filter(|p| p.cmd.first().and_then(|c| std::path::Path::new(c).file_name()).and_then(|n| n.to_str()).is_some_and(|n| SHELLS.contains(&n)))
+        .filter(|p| !panes.iter().any(|o| o.manager.as_deref() == Some(p.name.as_str())))
+        .map(|p| p.id)
+        .collect()
+}
+
 /// Ruta o texto entre comillas simples para la shell, con las comillas internas escapadas.
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -2482,7 +2498,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             app.explicit.remove(&key);
             let ids: Vec<u32> = app.panes.iter().filter(|p| p.workspace.as_deref() == Some(key.as_str())).map(|p| p.id).collect();
             app.layouts.by_key.remove(&key);
-            Task::batch(ids.into_iter().map(|id| send_request(Request::Kill { pane: id.to_string() }, |_| Message::Echo)))
+            Task::batch(ids.into_iter().map(|id| send_request(Request::Kill { pane: id.to_string(), remove: true }, |_| Message::Echo)))
         }
         Message::WorkspaceOpened(_, Ok(data)) => {
             traza("shell: spawn respondido");
@@ -2591,6 +2607,16 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     if app.selected.is_none() {
                         if let Some(id) = app.panes.first().map(|p| p.id) {
                             app.selected = Some(id);
+                        }
+                    }
+                    // Como en cualquier terminal: cerrar la última pestaña cierra la ventana.
+                    if app.salir_al_vaciar && app.panes.is_empty() {
+                        restaurar = Task::batch([restaurar, iced::exit()]);
+                    }
+                    for id in shells_terminados(&app.panes) {
+                        app.salir_al_vaciar |= app.panes.len() == 1;
+                        if app.cierres_pedidos.insert(id) {
+                            restaurar = Task::batch([restaurar, send_request(Request::Kill { pane: id.to_string(), remove: true }, |_| Message::Echo)]);
                         }
                     }
                     let alerts = app.attention.observe(&app.panes, app.selected);
@@ -2972,10 +2998,11 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ConfirmClose => {
             app.confirm_close = false;
+            app.salir_al_vaciar = app.panes.len() == 1 && app.selected.is_some();
             // M1: el foco se decide antes de cerrar, mientras el panel y su hermano aún están en el layout.
             app.pending_focus = app.selected.and_then(|id| successor(app, id));
             match app.selected {
-                Some(id) => send_request(Request::Kill { pane: id.to_string() }, Message::Killed),
+                Some(id) => send_request(Request::Kill { pane: id.to_string(), remove: true }, Message::Killed),
                 None => Task::none(),
             }
         }
@@ -4399,6 +4426,32 @@ mod tests {
         let _ = update(&mut app, Message::CloseFocused);
         let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
         assert!(!app.confirm_close, "Enter confirma");
+    }
+
+    /// `exit` en un shell cierra su pestaña; un agente o un comando terminado se quedan para leerlos.
+    #[test]
+    fn un_shell_que_termina_solo_se_cierra() {
+        let mut shell = pane_info(1, "s", Status::Exited);
+        shell.cmd = vec!["/bin/zsh".into(), "-l".into()];
+        let mut agente = pane_info(2, "a", Status::Exited);
+        agente.cmd = vec!["zsh".into()];
+        agente.agent = true;
+        let mut build = pane_info(3, "b", Status::Exited);
+        build.cmd = vec!["cargo".into()];
+        let mut vivo = pane_info(4, "v", Status::Idle);
+        vivo.cmd = vec!["zsh".into()];
+        assert_eq!(shells_terminados(&[shell, agente, build, vivo]), vec![1]);
+    }
+
+    /// Cerrar la última pestaña marca la ventana para salir; con otra abierta, no.
+    #[test]
+    fn cerrar_la_ultima_pestana_cierra_la_ventana() {
+        let mut app = App { panes: vec![pane_info(1, "a", Status::Exited), pane_info(2, "b", Status::Idle)], selected: Some(1), ..Default::default() };
+        let _ = update(&mut app, Message::ConfirmClose);
+        assert!(!app.salir_al_vaciar);
+        let mut app = App { panes: vec![pane_info(1, "a", Status::Exited)], selected: Some(1), ..Default::default() };
+        let _ = update(&mut app, Message::ConfirmClose);
+        assert!(app.salir_al_vaciar);
     }
 
     /// C: la paleta lista workspaces, paneles y acciones; la búsqueda los filtra y Enter ejecuta el elegido.

@@ -103,7 +103,12 @@ enum Cmd {
         pane: String,
     },
     /// Termina el proceso de un panel.
-    Kill { pane: String },
+    Kill {
+        pane: String,
+        /// Quita además el panel de la lista.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Detiene el daemon.
     Stop,
     /// Lo invoca el agente en cada evento (lee el JSON del evento por stdin). No imprime nada.
@@ -259,7 +264,7 @@ fn run() -> Result<()> {
         },
         Cmd::Inbox { pane } => Request::Inbox { pane: pane.clone() },
         Cmd::Ack { msg, pane } => Request::Ack { pane: pane.clone(), msg: *msg },
-        Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
+        Cmd::Kill { pane, remove } => Request::Kill { pane: pane.clone(), remove: *remove },
         Cmd::Stop => Request::Shutdown,
         Cmd::Title { text, pane } => Request::SetTitle { pane: pane.clone(), title: text.clone() },
         Cmd::Delegate { to, task, context } => Request::Delegate { to: to.clone(), task: task.join(" "), context: context.clone() },

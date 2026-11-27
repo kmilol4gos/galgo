@@ -602,13 +602,16 @@ fn action_row<'a>(label: &'a str, keys: Option<&'a str>, message: Message, prima
 }
 
 pub fn welcome_view(app: &App) -> Element<'_, Message> {
-    // Solo se ve si el daemon no pudo crear el panel de inicio: sin carpetas que elegir, se reintenta en ~.
-    let _ = app;
+    // Sin paneles: porque falló crear el de inicio, o porque se quitaron desde fuera. Se abre uno nuevo en ~.
+    let (mensaje, accion) = match app.error {
+        Some(_) => ("No pude abrir una terminal.", "Reintentar"),
+        None => ("No hay terminales abiertas.", "Nueva terminal"),
+    };
     let col = column![
         text("galgo").size(30).font(Font { weight: font::Weight::Bold, ..terminal_font() }).color(TEXT),
-        text("No pude abrir una terminal.").size(theme::BODY_SIZE).color(MUTED),
+        text(mensaje).size(theme::BODY_SIZE).color(MUTED),
         Space::with_height(14),
-        action_row("Reintentar", None, Message::RetryStart, true),
+        action_row(accion, None, Message::RetryStart, true),
         action_row("Paleta de comandos", Some("Cmd+K"), Message::OpenPalette, false),
     ]
     .spacing(2)

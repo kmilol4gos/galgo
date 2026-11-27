@@ -1687,7 +1687,7 @@ impl Daemon {
             | Request::Snapshot { pane, .. }
             | Request::Resize { pane, .. }
             | Request::Watch { pane }
-            | Request::Kill { pane }
+            | Request::Kill { pane, .. }
             | Request::Worktree { pane, .. } => alcance(pane)?,
             Request::Spawn { .. } if orquestado => bail!("un agente orquestado no lanza paneles"),
             Request::Shutdown => bail!("un panel no detiene el daemon"),
@@ -2218,56 +2218,8 @@ impl Daemon {
                 self.notify.notify_waiters();
                 Ok(json!({}))
             }
-            Request::Kill { pane } => {
-                if let Some(out) = self.forget_ghost(&pane)? {
-                    return Ok(out);
-                }
-                let (id, name, sid, exited, orphans) = {
-                    let st = self.state.lock().unwrap();
-                    let id = st.resolve(&pane)?;
-                    let p = &st.panes[&id];
-                    (id, p.name.clone(), p.pid, p.exited, p.orphans.clone())
-                };
-                let Some(sid) = sid else { bail!("el panel {name} ya terminó") };
-                let sid = sid as i32;
-                // Miembros de la sesión antes de cualquier señal: solo estos se barren (#13).
-                // Con el líder ya salido no se vuelve a listar: su pid pudo reutilizarse.
-                let before = if exited {
-                    // Solo los capturados al salir el líder que siguen en la sesión.
-                    orphans.iter().copied().filter(|&p| unsafe { libc::getsid(p) } == sid).collect()
-                } else {
-                    tokio::task::spawn_blocking(move || session_pids(sid)).await?
-                };
-                let mut exited = exited;
-                if !exited {
-                    let mut st = self.state.lock().unwrap();
-                    if let Some(p) = st.panes.get_mut(&id) {
-                        if p.exited {
-                            exited = true;
-                        } else if let Err(e) = p.killer.kill() {
-                            // ESRCH: el líder terminó justo ahora.
-                            if e.raw_os_error() == Some(ESRCH) {
-                                exited = true;
-                            } else {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                if exited {
-                    // El líder ya salió: solo se barre si quedan procesos de su sesión (#12).
-                    if before.is_empty() {
-                        bail!("el panel {name} ya terminó");
-                    }
-                    tokio::task::spawn_blocking(move || kill_members(sid, &before)).await?;
-                    return Ok(json!({}));
-                }
-                // SIGHUP no basta para quien lo ignora, ni para los trabajos que una shell puso en
-                // otro grupo de la misma sesión. Tras una espera breve, SIGKILL a los miembros.
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                tokio::task::spawn_blocking(move || kill_members(sid, &before)).await?;
-                Ok(json!({}))
-            }
+            Request::Kill { pane, remove: false } => self.kill_pane(&pane).await,
+            Request::Kill { pane, remove: true } => self.close_pane(&pane).await,
             Request::Shutdown => {
                 let socket = self.socket.clone();
                 let me = Arc::clone(self);
@@ -2283,13 +2235,105 @@ impl Daemon {
         }
     }
 
+    /// Termina el proceso de un panel. El panel sigue en la lista como `exited`.
+    async fn kill_pane(self: &Arc<Self>, pane: &str) -> Result<Value> {
+        let pane = pane.to_string();
+        if let Some(out) = self.forget_ghost(&pane)? {
+            return Ok(out);
+        }
+        let (id, name, sid, exited, orphans) = {
+            let st = self.state.lock().unwrap();
+            let id = st.resolve(&pane)?;
+            let p = &st.panes[&id];
+            (id, p.name.clone(), p.pid, p.exited, p.orphans.clone())
+        };
+        let Some(sid) = sid else { bail!("el panel {name} ya terminó") };
+        let sid = sid as i32;
+        // Miembros de la sesión antes de cualquier señal: solo estos se barren (#13).
+        // Con el líder ya salido no se vuelve a listar: su pid pudo reutilizarse.
+        let before = if exited {
+            // Solo los capturados al salir el líder que siguen en la sesión.
+            orphans.iter().copied().filter(|&p| unsafe { libc::getsid(p) } == sid).collect()
+        } else {
+            tokio::task::spawn_blocking(move || session_pids(sid)).await?
+        };
+        let mut exited = exited;
+        if !exited {
+            let mut st = self.state.lock().unwrap();
+            if let Some(p) = st.panes.get_mut(&id) {
+                if p.exited {
+                    exited = true;
+                } else if let Err(e) = p.killer.kill() {
+                    // ESRCH: el líder terminó justo ahora.
+                    if e.raw_os_error() == Some(ESRCH) {
+                        exited = true;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        if exited {
+            // El líder ya salió: solo se barre si quedan procesos de su sesión (#12).
+            if before.is_empty() {
+                bail!("el panel {name} ya terminó");
+            }
+            tokio::task::spawn_blocking(move || kill_members(sid, &before)).await?;
+            return Ok(json!({}));
+        }
+        // SIGHUP no basta para quien lo ignora, ni para los trabajos que una shell puso en
+        // otro grupo de la misma sesión. Tras una espera breve, SIGKILL a los miembros.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::task::spawn_blocking(move || kill_members(sid, &before)).await?;
+        Ok(json!({}))
+    }
+
+    /// Cerrar una pestaña: termina el proceso y quita el panel. Con resultados sin confirmar y sin manager que los
+    /// reciba se rechaza (nunca se descarta un resultado); un panel con worktree propio se queda, porque
+    /// `galgo worktree` lo necesita para ver, fusionar o descartar sus cambios.
+    async fn close_pane(self: &Arc<Self>, pane: &str) -> Result<Value> {
+        let id = self.state.lock().unwrap().resolve(pane)?;
+        let key = id.to_string();
+        if let Some(out) = self.forget_ghost(&key)? {
+            return Ok(out);
+        }
+        // «Ya terminó» no es un error al cerrar: es justo lo que queda por quitar.
+        if let Err(e) = self.kill_pane(&key).await {
+            if !self.state.lock().unwrap().panes.get(&id).is_some_and(|p| p.exited) {
+                return Err(e);
+            }
+        }
+        for _ in 0..40 {
+            if self.state.lock().unwrap().panes.get(&id).is_none_or(|p| p.exited) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        {
+            let st = self.state.lock().unwrap();
+            let Some(p) = st.panes.get(&id) else { return Ok(json!({})) };
+            if !p.exited {
+                bail!("el panel {} no terminó", p.name);
+            }
+            if p.cwd.as_deref().is_some_and(|c| c.contains("/.galgo/worktrees/")) {
+                return Ok(json!({ "kept": p.name }));
+            }
+        }
+        Ok(self.forget(&key, true)?.unwrap_or_else(|| json!({})))
+    }
+
     /// Quita un panel restaurado (sin proceso). Su inbox sin confirmar pasa a su manager vivo. Si tiene
     /// mensajes pendientes y no hay manager al que pasarlos, se rechaza sin tocar nada: nunca se descarta
     /// un resultado en silencio.
     fn forget_ghost(&self, pane: &str) -> Result<Option<Value>> {
+        self.forget(pane, false)
+    }
+
+    /// Quita un panel sin proceso: un fantasma, o también uno terminado si `terminado` (al cerrar su pestaña).
+    fn forget(&self, pane: &str, terminado: bool) -> Result<Option<Value>> {
         let mut st = self.state.lock().unwrap();
         let id = st.resolve(pane)?;
-        if !st.panes[&id].ghost {
+        if !(st.panes[&id].ghost || terminado && st.panes[&id].exited) {
             return Ok(None);
         }
         let manager = st.panes[&id].manager.filter(|m| st.panes.contains_key(m));

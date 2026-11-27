@@ -297,6 +297,10 @@ pub enum Request {
     },
     Kill {
         pane: String,
+        /// Además de terminar el proceso, quita el panel de la lista (cerrar una pestaña). Sin esto queda como
+        /// `exited` para poder leer su pantalla y su resultado.
+        #[serde(default)]
+        remove: bool,
     },
     Shutdown,
 }
