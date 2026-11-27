@@ -141,8 +141,6 @@ enum Cmd {
         /// Contexto adicional que acompaña a la tarea.
         #[arg(long)]
         context: Option<String>,
-        #[arg(long, env = "GALGO_PANE")]
-        from: String,
     },
     /// Tareas delegadas en las que participa este panel (o todas, con --all).
     Tasks {
@@ -179,8 +177,6 @@ enum TaskCmd {
         summary: Vec<String>,
         #[arg(long)]
         fail: bool,
-        #[arg(long, env = "GALGO_PANE")]
-        from: String,
     },
 }
 
@@ -265,10 +261,10 @@ fn run() -> Result<()> {
         Cmd::Kill { pane } => Request::Kill { pane: pane.clone() },
         Cmd::Stop => Request::Shutdown,
         Cmd::Title { text, pane } => Request::SetTitle { pane: pane.clone(), title: text.clone() },
-        Cmd::Delegate { to, task, context, from } => Request::Delegate { from: from.clone(), to: to.clone(), task: task.join(" "), context: context.clone() },
+        Cmd::Delegate { to, task, context } => Request::Delegate { to: to.clone(), task: task.join(" "), context: context.clone() },
         Cmd::Tasks { all, pane } => Request::Tasks { pane: if *all { None } else { pane.clone() } },
-        Cmd::Task { action: TaskCmd::Done { id, summary, fail, from } } => {
-            Request::TaskDone { from: from.clone(), id: *id, summary: summary.join(" "), ok: !fail }
+        Cmd::Task { action: TaskCmd::Done { id, summary, fail } } => {
+            Request::TaskDone { id: *id, summary: summary.join(" "), ok: !fail }
         }
         Cmd::Worktree { action } => {
             let (pane, action, confirm) = match action {
@@ -500,38 +496,33 @@ mod tests_orquestador {
     /// Las dos pruebas tocan GALGO_PANE: una a la vez, o una vería la variable de la otra.
     static ENTORNO: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// El remitente de `delegate` y `task done` sale de GALGO_PANE: sin él, la CLI no delega ni cierra nada.
+    /// El remitente de `delegate` y `task done` lo deduce el daemon del socket: la CLI no tiene `--from`.
     #[test]
-    fn delegate_exige_el_panel_propio() {
+    fn delegate_no_declara_remitente() {
         let _g = ENTORNO.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("GALGO_PANE");
-        assert!(Cli::try_parse_from(["galgo", "delegate", "codex", "crea", "x.txt"]).is_err());
-        std::env::set_var("GALGO_PANE", "jefe");
+        assert!(Cli::try_parse_from(["galgo", "delegate", "codex", "crea", "x.txt", "--from", "jefe"]).is_err(), "sin --from");
         let cli = Cli::try_parse_from(["galgo", "delegate", "codex", "crea", "x.txt", "--context", "raíz"]).unwrap();
         match cli.cmd {
-            Cmd::Delegate { to, task, context, from } => {
-                assert_eq!((to.as_str(), from.as_str()), ("codex", "jefe"));
+            Cmd::Delegate { to, task, context } => {
+                assert_eq!(to.as_str(), "codex");
                 assert_eq!(task.join(" "), "crea x.txt");
                 assert_eq!(context.as_deref(), Some("raíz"));
             }
             _ => panic!("no es delegate"),
         }
-        std::env::remove_var("GALGO_PANE");
     }
 
     #[test]
     fn task_done_con_id_y_resumen() {
-        let _g = ENTORNO.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("GALGO_PANE", "codex");
         let cli = Cli::try_parse_from(["galgo", "task", "done", "4", "x.txt", "creado", "--fail"]).unwrap();
         match cli.cmd {
-            Cmd::Task { action: TaskCmd::Done { id, summary, fail, from } } => {
-                assert_eq!((id, from.as_str(), fail), (4, "codex", true));
+            Cmd::Task { action: TaskCmd::Done { id, summary, fail } } => {
+                assert_eq!((id, fail), (4, true));
                 assert_eq!(summary.join(" "), "x.txt creado");
             }
             _ => panic!("no es task done"),
         }
-        std::env::remove_var("GALGO_PANE");
     }
 }
 

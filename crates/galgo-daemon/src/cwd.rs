@@ -29,9 +29,9 @@ pub fn cwd_de_pid(pid: i32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Nombre del ejecutable de un proceso (`vim`, `claude`, `zsh`…). macOS: `proc_pidpath`; Linux: `/proc/<pid>/comm`.
+/// Ruta completa del ejecutable de un proceso. macOS: `proc_pidpath`; Linux: `/proc/<pid>/exe`.
 #[cfg(target_os = "macos")]
-pub fn nombre_de_pid(pid: i32) -> Option<String> {
+pub fn ruta_de_pid(pid: i32) -> Option<String> {
     use std::os::raw::{c_char, c_int, c_void};
     extern "C" {
         fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
@@ -43,13 +43,18 @@ pub fn nombre_de_pid(pid: i32) -> Option<String> {
         return None;
     }
     let bytes: Vec<u8> = buf[..n as usize].iter().map(|&c| c as u8).collect();
-    let ruta = std::path::PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
-    ruta.file_name().map(|f| f.to_string_lossy().into_owned())
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(not(target_os = "macos"))]
+pub fn ruta_de_pid(pid: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Nombre del ejecutable de un proceso (`vim`, `claude`, `zsh`…).
 pub fn nombre_de_pid(pid: i32) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    let ruta = ruta_de_pid(pid)?;
+    std::path::Path::new(&ruta).file_name().map(|f| f.to_string_lossy().into_owned())
 }
 
 /// Ruta de una URI `file://host/ruta` (OSC 7), con los `%XX` decodificados. El host se ignora.

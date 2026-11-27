@@ -1,6 +1,7 @@
 //! galgod: daemon que posee los PTYs, el estado de pantalla y la entrega de mensajes entre agentes.
 
 mod cwd;
+mod peer;
 mod persist;
 mod usage;
 
@@ -101,6 +102,8 @@ struct Pane {
     cwd: Option<String>,
     /// Último directorio anunciado por el shell con OSC 7 (lo escribe el hilo lector).
     osc_cwd: Arc<Mutex<Option<String>>>,
+    /// Profundidad de la última tarea que recibió este panel (0 si ninguna). No se reinicia al cerrarla (M2).
+    profundidad_recibida: u8,
     /// Último título que el programa anunció por OSC 0/2 (lo escribe el hilo lector).
     osc_titulo: Arc<Mutex<Option<String>>>,
     /// Uso del transcript (lo rellena el hilo de sondeo) y último informe del agente. Solo en memoria.
@@ -116,6 +119,10 @@ struct Pane {
     hooked: bool,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
     last_blocked: Option<String>,
+    /// Desde cuándo el agente terminó su turno (Stop). Solo entonces se le entregan tareas (A2). Solo en memoria.
+    listo_desde: Option<Instant>,
+    /// Última entrada del usuario o del CLI en el pty. No se entrega tras teclear hace poco (A2). Solo en memoria.
+    ultima_entrada: Option<Instant>,
     /// Procesos que seguían en la sesión del panel cuando el líder salió (el líder aún sin recolectar,
     /// así que su pid no pudo reutilizarse). Solo estos se barren después: nunca un pid nuevo.
     orphans: Vec<i32>,
@@ -139,6 +146,33 @@ impl ChildKiller for GhostKiller {
 }
 
 impl Pane {
+    /// El agente de este panel tiene el terminal: el proceso en primer plano es un agente (por su ruta), o es el propio
+    /// proceso del panel y el panel se lanzó como agente. Un shell libre, o un programa ajeno, no lo es (A1). Un panel
+    /// sin pty (solo en pruebas) no tiene nada que comprobar.
+    fn agente_en_primer_plano(&self) -> bool {
+        if self.ghost || self.exited {
+            return false;
+        }
+        let Some(master) = self._master.as_ref() else { return true };
+        let Some(fg) = master.process_group_leader() else { return false };
+        if cwd::ruta_de_pid(fg).is_some_and(|r| es_agente_ruta(&r)) {
+            return true;
+        }
+        self.pid.is_some_and(|p| p as i32 == fg) && is_agent_cmd(&self.cmd)
+    }
+
+    /// La línea del cursor es un prompt vacío: el agente espera una orden y no hay texto a medias (A2). Lo que hay
+    /// tras el prompt, sin contar los bordes de caja de la TUI, tiene que ser nada.
+    fn linea_de_prompt_libre(&self) -> bool {
+        let Ok(parser) = self.screen.lock() else { return false };
+        let s = parser.screen();
+        let (fila, _) = s.cursor_position();
+        let (_, cols) = s.size();
+        let texto = s.contents_between(fila, 0, fila, cols.get());
+        let limpio = texto.trim_end().trim_end_matches(|c: char| matches!(c, '│' | '║' | '|')).trim_end();
+        limpio.is_empty() || limpio.ends_with(['>', '❯', '›', '$', '%', '#'])
+    }
+
     /// Nombre del programa en primer plano (`vim`, `claude`, o el shell si está libre).
     fn programa(&self) -> Option<String> {
         if self.ghost || self.exited {
@@ -203,6 +237,9 @@ impl Pane {
             title: None,
             last_blocked: None,
             hooked: false,
+            profundidad_recibida: 0,
+            listo_desde: None,
+            ultima_entrada: None,
             changed: Arc::new(Notify::new()),
             orphans: Vec::new(),
             waiting_on: None,
@@ -229,12 +266,18 @@ struct State {
     /// Tareas delegadas entre agentes (modo orquestador) y el último id usado.
     tasks: Vec<Task>,
     next_task: u64,
+    /// Delegaciones recientes (remitente, momento unix) para el tope por hora (M2). Solo en memoria.
+    delegaciones: Vec<(u32, u64)>,
 }
 
 /// Límites del modo orquestador (corte 1): profundidad de delegación, tareas abiertas por par de agentes y por workspace.
 const MAX_DELEGATION_DEPTH: u8 = 3;
 const MAX_OPEN_PER_PAIR: usize = 3;
 const MAX_OPEN_PER_WORKSPACE: usize = 8;
+/// Tiempo que un agente debe llevar con el turno terminado (y sin teclear) antes de recibir una tarea (A2).
+const GRACIA_ENTREGA: Duration = Duration::from_secs(3);
+/// M2: tareas que un mismo remitente puede delegar por hora.
+const MAX_DELEGATIONS_PER_HOUR: usize = 20;
 /// Largo máximo de la tarea, su contexto y su resumen.
 const MAX_TASK_TEXT: usize = 4000;
 
@@ -273,6 +316,17 @@ impl Task {
     }
 }
 
+/// Segundos desde la época unix (para las marcas de tiempo de las tareas y del tope por hora).
+fn unix_ahora() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Caducidad y poda de tareas (M3): una abierta más de un día cae como fallida; las cerradas se conservan una
+/// semana y como mucho `MAX_CLOSED_TASKS` de las más recientes, para que el estado guardado no crezca sin límite.
+const CADUCIDAD_TAREA_SECS: u64 = 24 * 3600;
+const RETENCION_CERRADA_SECS: u64 = 7 * 24 * 3600;
+const MAX_CLOSED_TASKS: usize = 200;
+
 /// Texto que recibe el destinatario. Va como información de otro agente, nunca como orden del usuario.
 fn task_text(t: &Task) -> String {
     let mut s = format!(
@@ -305,6 +359,50 @@ fn archivos_cambiados(cwd: &str) -> Vec<String> {
 }
 
 impl State {
+    /// M3: caduca las tareas abiertas viejas (avisando al remitente) y poda las cerradas antiguas o sobrantes.
+    fn podar_tareas(&mut self, ahora: u64) {
+        let caducadas: Vec<usize> = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.status.abierta() && ahora.saturating_sub(t.created_unix) > CADUCIDAD_TAREA_SECS)
+            .map(|(i, _)| i)
+            .collect();
+        for i in caducadas {
+            let (from, to, id) = (self.tasks[i].from, self.tasks[i].to, self.tasks[i].id);
+            self.tasks[i].status = TaskStatus::Fallida;
+            self.tasks[i].summary = Some("caducó: pasó más de un día sin cerrarse".into());
+            self.push(from, to, "failed", format!("tarea #{id}: caducó sin cerrarse"));
+        }
+        self.tasks.retain(|t| t.status.abierta() || ahora.saturating_sub(t.created_unix) <= RETENCION_CERRADA_SECS);
+        let cerradas = self.tasks.iter().filter(|t| !t.status.abierta()).count();
+        if cerradas > MAX_CLOSED_TASKS {
+            let mut quitar = cerradas - MAX_CLOSED_TASKS;
+            // Las más antiguas primero (la lista va en orden de creación).
+            self.tasks.retain(|t| {
+                if !t.status.abierta() && quitar > 0 {
+                    quitar -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.touch();
+    }
+
+    /// M3: tras reiniciar el daemon, ninguna tarea abierta llega a su destinatario (todos los paneles son fantasmas).
+    /// Cada una falla y el remitente se entera, en lugar de bloquear el cupo para siempre.
+    fn fallar_tareas_sin_destino(&mut self) {
+        let abiertas: Vec<usize> = self.tasks.iter().enumerate().filter(|(_, t)| t.status.abierta()).map(|(i, _)| i).collect();
+        for i in abiertas {
+            let (from, to, id) = (self.tasks[i].from, self.tasks[i].to, self.tasks[i].id);
+            self.tasks[i].status = TaskStatus::Fallida;
+            self.tasks[i].summary = Some("el daemon se reinició antes de que terminara".into());
+            self.push(from, to, "failed", format!("tarea #{id}: el daemon se reinició y el agente ya no está; la tarea se da por fallida"));
+        }
+    }
+
     /// Marca un cambio persistente.
     fn touch(&mut self) {
         self.version += 1;
@@ -315,29 +413,56 @@ impl State {
         if from == to {
             bail!("un agente no se delega una tarea a sí mismo");
         }
-        // Un agente que trabaja en una tarea delega a un nivel más profundo; desde fuera, la cadena empieza en 1.
-        let profundidad = self.tasks.iter().filter(|t| t.status.abierta() && t.to == from).map(|t| t.depth + 1).max().unwrap_or(1);
+        // M2: la profundidad es la de la última tarea que recibió el remitente, y no se reinicia al cerrarla: un
+        // agente que trabaja en una tarea de profundidad d delega a d+1. Un manager (sin tareas recibidas) delega a 1.
+        let profundidad = self.panes.get(&from).map_or(1, |p| p.profundidad_recibida + 1);
         if profundidad > MAX_DELEGATION_DEPTH {
             bail!("profundidad máxima de delegación ({MAX_DELEGATION_DEPTH}) alcanzada");
+        }
+        // M2: tope por hora por remitente: cerrar y reabrir tareas no es gratis, aunque el par y el workspace estén a salvo.
+        let ahora = unix_ahora();
+        let en_la_hora = self.delegaciones.iter().filter(|(f, at)| *f == from && ahora.saturating_sub(*at) < 3600).count();
+        if en_la_hora >= MAX_DELEGATIONS_PER_HOUR {
+            bail!("el panel ya delegó {en_la_hora} tareas en la última hora (máximo {MAX_DELEGATIONS_PER_HOUR})");
         }
         let par = self.tasks.iter().filter(|t| t.status.abierta() && t.from == from && t.to == to).count();
         if par >= MAX_OPEN_PER_PAIR {
             bail!("ya hay {par} tareas abiertas entre esos dos agentes: espera a que terminen");
         }
-        if let Some(ws) = workspace {
-            let en_ws = self.tasks.iter().filter(|t| t.status.abierta() && t.workspace.as_deref() == Some(ws)).count();
-            if en_ws >= MAX_OPEN_PER_WORKSPACE {
-                bail!("el workspace ya tiene {en_ws} tareas abiertas (máximo {MAX_OPEN_PER_WORKSPACE})");
-            }
+        // M2: los paneles sin workspace comparten un cupo propio, en lugar de no tener límite.
+        let clave = workspace.unwrap_or("");
+        let en_ws = self.tasks.iter().filter(|t| t.status.abierta() && t.workspace.as_deref().unwrap_or("") == clave).count();
+        if en_ws >= MAX_OPEN_PER_WORKSPACE {
+            bail!("el workspace ya tiene {en_ws} tareas abiertas (máximo {MAX_OPEN_PER_WORKSPACE})");
         }
         Ok(profundidad)
+    }
+
+    /// Entrega con las comprobaciones del panel real: antes de entregar, se mira si el agente sigue en primer plano (A1).
+    fn entregar(&mut self, pane: u32) {
+        let fuera = self.panes.get(&pane).is_some_and(|p| p.hooked && !p.agente_en_primer_plano());
+        if fuera {
+            // Ya no es el agente (salió, o hay un shell delante): no se le entrega nada, y hasta su próximo hook no es agente.
+            if let Some(p) = self.panes.get_mut(&pane) {
+                p.hooked = false;
+            }
+        }
+        self.deliver(pane);
     }
 
     /// Entrega al destinatario su tarea pendiente más antigua, si está libre: con hooks, sin trabajar, sin estar bloqueado
     /// ni en un diálogo. Va pegada (bracketed paste) y enviada; nunca si no ha emitido ningún hook.
     fn deliver(&mut self, pane: u32) {
+        let ahora = Instant::now();
         let libre = self.panes.get(&pane).is_some_and(|p| {
-            p.hooked && !p.ghost && !p.exited && matches!(p.status, Status::Idle | Status::Done | Status::Failed)
+            p.hooked
+                && !p.ghost
+                && !p.exited
+                && matches!(p.status, Status::Idle | Status::Done | Status::Failed)
+                // A2: solo tras el fin de un turno, con un rato de gracia, sin teclear hace poco y con el cursor en un prompt vacío.
+                && p.listo_desde.is_some_and(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
+                && p.ultima_entrada.is_none_or(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
+                && p.linea_de_prompt_libre()
         });
         if !libre {
             return;
@@ -354,6 +479,7 @@ impl State {
         p.status = Status::Working;
         p.reported = false;
         p.touched_since_report = true;
+        p.profundidad_recibida = self.tasks[idx].depth;
         self.tasks[idx].status = TaskStatus::Entregada;
         self.touch();
     }
@@ -370,7 +496,7 @@ impl State {
                 };
             }
         }
-        self.deliver(pane);
+        self.entregar(pane);
     }
 
     /// El destinatario terminó su proceso: sus tareas abiertas fallan y el delegador lo sabe.
@@ -388,6 +514,11 @@ impl State {
     fn next_msg_id(&mut self) -> u64 {
         self.next_msg += 1;
         (self.epoch << 32) | (self.next_msg & 0xFFFF_FFFF)
+    }
+
+    /// El panel vivo cuyo líder de sesión es `sid` (su shell): el remitente de una llamada de ese proceso.
+    fn pane_de_sesion(&self, sid: i32) -> Option<u32> {
+        self.panes.values().find(|p| !p.ghost && !p.exited && p.pid == Some(sid as u32)).map(|p| p.id)
     }
 
     fn resolve(&self, r: &str) -> Result<u32> {
@@ -573,6 +704,26 @@ fn formato_invisible(c: char) -> bool {
         c,
         '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
     )
+}
+
+/// M4: caracteres que no se ven pero el modelo lee: etiquetas Unicode, uso privado y el resto de formato invisible
+/// (bidi, ancho cero, marcas de dirección). Un texto que los trae puede llevar instrucciones que el humano no ve.
+fn invisible_para_el_modelo(c: char) -> bool {
+    formato_invisible(c)
+        || matches!(
+            c,
+            '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}' | '\u{08E2}' | '\u{110BD}' | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E007F}'
+                | '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}'
+        )
+}
+
+/// Texto de una tarea, su contexto o su resumen: además de los controles, nada invisible para el modelo (M4).
+fn check_texto_de_tarea(what: &str, text: &str, max: usize) -> Result<()> {
+    if text.chars().any(invisible_para_el_modelo) {
+        bail!("{what} trae caracteres invisibles (formato, uso privado o etiquetas Unicode)");
+    }
+    check_text(what, text, max)
 }
 
 fn check_text(what: &str, text: &str, max: usize) -> Result<()> {
@@ -797,6 +948,11 @@ fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(Pa
 /// Deduce el workspace de un directorio dentro de un repo git: "<repo>/<rama>". Sin git, o con el
 /// HEAD desligado, devuelve `None` o solo el nombre del repo. Nunca falla: git ausente no es un error.
 /// Comando de un agente conocido (por nombre de ejecutable).
+/// Una ruta de ejecutable es la de un agente conocido (`…/claude/versions/2.0.50`, `…/bin/codex`).
+fn es_agente_ruta(ruta: &str) -> bool {
+    ruta.split('/').any(|c| c == "claude" || c == "codex")
+}
+
 fn is_agent_cmd(cmd: &[String]) -> bool {
     cmd.first()
         .and_then(|c| std::path::Path::new(c).file_name())
@@ -1058,6 +1214,9 @@ impl Daemon {
             title: None,
             last_blocked: None,
             hooked: false,
+            profundidad_recibida: 0,
+            listo_desde: None,
+            ultima_entrada: None,
             changed: Arc::clone(&changed),
             orphans: Vec::new(),
             waiting_on: None,
@@ -1303,7 +1462,9 @@ impl Daemon {
     }
 
     /// Atiende una solicitud. `wait` devuelve además el mensaje a confirmar tras responder.
-    async fn dispatch(self: &Arc<Self>, req: Request) -> (Result<Value>, Option<(u32, u64)>) {
+    async fn dispatch(self: &Arc<Self>, req: Request, peer: Option<i32>) -> (Result<Value>, Option<(u32, u64)>) {
+        // Remitente: el panel cuya sesión es la del proceso que llamó (None si la llamada no viene de un panel).
+        let sender = peer.and_then(peer::sesion_de).and_then(|sid| self.state.lock().unwrap().pane_de_sesion(sid));
         // Solo lo que puede cambiar el inbox o la lista de paneles avisa al guardado. Un `Send` no cambia
         // nada persistente (el texto no se guarda), y las lecturas tampoco: no se escribe nada por ellos.
         let mutating = matches!(
@@ -1316,7 +1477,7 @@ impl Daemon {
             Request::Wait { waiter, target, timeout_secs, .. } => {
                 self.wait_for(waiter, target, timeout_secs).await
             }
-            other => (self.handle(other).await, None),
+            other => (self.handle(sender, other).await, None),
         };
         if mutating {
             self.mark_dirty();
@@ -1353,7 +1514,7 @@ impl Daemon {
         }
     }
 
-    async fn handle(self: &Arc<Self>, req: Request) -> Result<Value> {
+    async fn handle(self: &Arc<Self>, sender: Option<u32>, req: Request) -> Result<Value> {
         match req {
             Request::Spawn { name, cmd, cwd, manager, inject, rows, cols, workspace, worktree } => {
                 let rama = worktree.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
@@ -1407,6 +1568,7 @@ impl Daemon {
                     return Err(no_proceso(&p.name));
                 }
                 p.input.try_send(chunk).map_err(input_error)?;
+                p.ultima_entrada = Some(Instant::now());
                 p.touched_since_report = true;
                 if enter {
                     // Una tarea nueva: el turno vuelve a estar abierto y el estado final se reinicia.
@@ -1542,6 +1704,10 @@ impl Daemon {
                 let target = {
                     let mut st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
+                    // Un panel no puede hablar por otro: si la llamada viene de un panel, el hook es de ese panel.
+                    if sender.is_some_and(|s| s != id) {
+                        bail!("el hook no es del panel {pane}");
+                    }
                     // Un hook de agente marca el panel como agente real (lo muestra la GUI).
                     st.panes.get_mut(&id).unwrap().hooked = true;
                     let (manager, reported) = {
@@ -1554,21 +1720,26 @@ impl Daemon {
                             p.reported = false;
                             p.last_blocked = None;
                             p.status = Status::Working;
+                            p.listo_desde = None;
                         }
                         HookEvent::Working => {
                             // Una herramienta que termina no cambia un resultado ya entregado.
                             let p = st.panes.get_mut(&id).unwrap();
+                            p.listo_desde = None;
                             if !matches!(p.status, Status::Done | Status::Failed) {
                                 p.status = Status::Working;
                             }
                         }
                         HookEvent::Idle => {
-                            if !reported {
-                                st.panes.get_mut(&id).unwrap().status = Status::Idle;
+                            // A2: un aviso de espera no saca de Blocked: puede ser el diálogo de un permiso.
+                            let p = st.panes.get_mut(&id).unwrap();
+                            if !reported && p.status != Status::Blocked {
+                                p.status = Status::Idle;
                             }
                         }
                         HookEvent::Blocked => {
                             let p = st.panes.get_mut(&id).unwrap();
+                            p.listo_desde = None;
                             let prev = std::mem::replace(&mut p.status, Status::Blocked);
                             let new_reason = summary.is_some() && summary != p.last_blocked;
                             p.last_blocked = summary.clone();
@@ -1581,6 +1752,8 @@ impl Daemon {
                             }
                         }
                         HookEvent::TurnEnded | HookEvent::Failed => {
+                            // A2: el turno terminó: solo ahora (y tras un rato) se le puede entregar una tarea.
+                            st.panes.get_mut(&id).unwrap().listo_desde = Some(Instant::now());
                             // Si ya hubo un `galgo done` explícito en este turno, no se duplica.
                             if !reported {
                                 let failed = event == HookEvent::Failed;
@@ -1642,14 +1815,14 @@ impl Daemon {
                 st.panes.get_mut(&id).unwrap().title = (!title.is_empty()).then_some(title);
                 Ok(json!({}))
             }
-            Request::Delegate { from, to, task, context } => {
-                check_text("la tarea", &task, MAX_TASK_TEXT)?;
+            Request::Delegate { to, task, context } => {
+                check_texto_de_tarea("la tarea", &task, MAX_TASK_TEXT)?;
                 if let Some(c) = &context {
-                    check_text("el contexto", c, MAX_TASK_TEXT)?;
+                    check_texto_de_tarea("el contexto", c, MAX_TASK_TEXT)?;
                 }
                 let info = {
                     let mut st = self.state.lock().unwrap();
-                    let from_id = st.resolve(&from)?;
+                    let from_id = sender.ok_or_else(|| anyhow!("solo un panel de galgo puede delegar: esta llamada no viene de ninguno"))?;
                     let to_id = st.resolve(&to)?;
                     let (from_name, workspace) = {
                         let p = &st.panes[&from_id];
@@ -1657,6 +1830,10 @@ impl Daemon {
                     };
                     let to_name = {
                         let p = &st.panes[&to_id];
+                        // M1: solo se delega dentro del propio workspace.
+                        if p.workspace != workspace {
+                            bail!("{} está en otro workspace: solo se delega dentro del propio", p.name);
+                        }
                         if p.exited && !p.ghost {
                             bail!("el destinatario {} ya terminó", p.name);
                         }
@@ -1682,18 +1859,22 @@ impl Daemon {
                         created_unix,
                     });
                     st.touch();
-                    st.deliver(to_id);
+                    let ahora = unix_ahora();
+                    st.delegaciones.retain(|(_, at)| ahora.saturating_sub(*at) < 3600);
+                    st.delegaciones.push((from_id, ahora));
+                    st.podar_tareas(ahora);
+                    st.entregar(to_id);
                     st.tasks.iter().find(|t| t.id == id).map(Task::info)
                 };
                 self.notify.notify_waiters();
                 Ok(serde_json::to_value(info)?)
             }
-            Request::TaskDone { from, id, summary, ok } => {
-                check_text("el resumen", &summary, MAX_TASK_TEXT)?;
+            Request::TaskDone { id, summary, ok } => {
+                check_texto_de_tarea("el resumen", &summary, MAX_TASK_TEXT)?;
                 // Solo el destinatario de la tarea la cierra. El remitente sale de su panel, nunca de los argumentos.
                 let (cwd, from_id) = {
                     let st = self.state.lock().unwrap();
-                    let from_id = st.resolve(&from)?;
+                    let from_id = sender.ok_or_else(|| anyhow!("solo un panel de galgo puede cerrar una tarea: esta llamada no viene de ninguno"))?;
                     let t = st.tasks.iter().find(|t| t.id == id).ok_or_else(|| anyhow!("tarea {id} no encontrada"))?;
                     if t.to != from_id {
                         bail!("solo el agente al que se delegó la tarea {id} puede cerrarla");
@@ -1732,10 +1913,17 @@ impl Daemon {
                     Some(p) => Some(st.resolve(&p)?),
                     None => None,
                 };
+                // M1: un agente solo ve las tareas de su workspace (sin workspace: solo las suyas).
+                let alcance = sender.map(|s| (st.panes.get(&s).and_then(|p| p.workspace.clone()), s));
                 let v: Vec<TaskInfo> = st
                     .tasks
                     .iter()
                     .filter(|t| filtro.is_none_or(|f| t.from == f || t.to == f))
+                    .filter(|t| match &alcance {
+                        None => true,
+                        Some((Some(ws), _)) => t.workspace.as_deref() == Some(ws.as_str()),
+                        Some((None, s)) => t.from == *s || t.to == *s,
+                    })
                     .map(Task::info)
                     .collect();
                 Ok(serde_json::to_value(v)?)
@@ -1898,6 +2086,18 @@ impl Daemon {
         for id in ids {
             self.try_inject(id);
         }
+        // A1 y B2: se revisa qué agentes siguen en primer plano y se reintenta entregar lo pendiente (un panel que
+        // queda libre por otra vía, sin hook, también recibe su tarea).
+        let mut st = self.state.lock().unwrap();
+        let antes = st.version;
+        let ids: Vec<u32> = st.panes.keys().copied().collect();
+        for id in ids {
+            st.entregar(id);
+        }
+        if st.version != antes {
+            drop(st);
+            self.mark_dirty();
+        }
     }
 }
 
@@ -1981,6 +2181,9 @@ impl Daemon {
 }
 
 async fn serve(d: Arc<Daemon>, stream: UnixStream) {
+    use std::os::unix::io::AsRawFd;
+    // El proceso que conectó: de él sale el remitente de las llamadas de agente (ver peer.rs).
+    let peer = peer::pid_del_par(stream.as_raw_fd());
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     // Líneas que llegan mientras se atiende una espera; se procesan en orden.
@@ -2002,7 +2205,7 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
             }
             Ok(req) if matches!(req, Request::Wait { .. }) => {
                 client_ack = matches!(req, Request::Wait { client_ack: true, .. });
-                let mut fut = std::pin::pin!(d.dispatch(req));
+                let mut fut = std::pin::pin!(d.dispatch(req, peer));
                 let mut read_open = true;
                 let (res, ack) = loop {
                     tokio::select! {
@@ -2019,7 +2222,7 @@ async fn serve(d: Arc<Daemon>, stream: UnixStream) {
             }
             Ok(req) => {
                 // Cualquier otra solicitud se ejecuta siempre, aunque el cliente cierre su escritura.
-                let (res, ack) = d.dispatch(req).await;
+                let (res, ack) = d.dispatch(req, peer).await;
                 (to_response(res), ack)
             }
             Err(e) => (Response::err(format!("solicitud inválida: {e}")), None),
@@ -2446,7 +2649,7 @@ mod tests_fantasmas {
         let d = daemon_con(st);
         let antes = d.state.lock().unwrap().version;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(d.handle(Request::Ack { pane: "1".into(), msg: 10 })).unwrap();
+        rt.block_on(d.handle(None, Request::Ack { pane: "1".into(), msg: 10 })).unwrap();
         assert!(d.state.lock().unwrap().version > antes);
     }
 
@@ -2465,7 +2668,7 @@ mod tests_fantasmas {
         st.panes.insert(2, w);
         let d = daemon_con_en(st, path.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(d.handle(Request::Done { pane: "w".into(), summary: "resultadoB".into(), failed: false })).unwrap();
+        rt.block_on(d.handle(None, Request::Done { pane: "w".into(), summary: "resultadoB".into(), failed: false })).unwrap();
         // Sin esperar al hilo de guardado: el archivo ya lo tiene.
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("resultadoB"), "{text}");
@@ -2589,19 +2792,19 @@ mod tests_fantasmas {
         st.panes.insert(1, p);
         let d = daemon_con(st);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(d.handle(Request::SetTitle { pane: "claude".into(), title: "  bug de ventas  ".into() })).unwrap();
+        rt.block_on(d.handle(None, Request::SetTitle { pane: "claude".into(), title: "  bug de ventas  ".into() })).unwrap();
         let v = {
             let st = d.state.lock().unwrap();
             st.info(&st.panes[&1], 30)
         };
         assert_eq!(v.title.as_deref(), Some("bug de ventas"));
-        rt.block_on(d.handle(Request::SetTitle { pane: "1".into(), title: "  ".into() })).unwrap();
+        rt.block_on(d.handle(None, Request::SetTitle { pane: "1".into(), title: "  ".into() })).unwrap();
         let v = {
             let st = d.state.lock().unwrap();
             st.info(&st.panes[&1], 30)
         };
         assert!(v.title.is_none(), "un título vacío lo borra");
-        assert!(rt.block_on(d.handle(Request::SetTitle { pane: "1".into(), title: "x\u{1b}[31m".into() })).is_err());
+        assert!(rt.block_on(d.handle(None, Request::SetTitle { pane: "1".into(), title: "x\u{1b}[31m".into() })).is_err());
     }
 }
 
@@ -2825,6 +3028,8 @@ mod orquestador_tests {
         p.exited = false;
         p.hooked = hooked;
         p.status = status;
+        // Un agente con hooks ya terminó su turno (A2): puede recibir tareas sin esperar la gracia.
+        p.listo_desde = hooked.then(|| Instant::now() - Duration::from_secs(60));
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
         p.input = tx;
         st.panes.insert(id, p);
@@ -2844,7 +3049,7 @@ mod orquestador_tests {
         let codex_rx = vivo(&mut st, 2, "codex", false, Status::Idle);
         let d = daemon_con(st);
         let r = rt();
-        let info = r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "crea x.txt".into(), context: None })).unwrap();
+        let info = r.block_on(d.handle(Some(1), Request::Delegate { to: "2".into(), task: "crea x.txt".into(), context: None })).unwrap();
         assert_eq!(info["status"], "pendiente", "sin hooks no se entrega");
         assert!(codex_rx.try_recv().is_err());
         for (hooked, estado) in [(true, Status::Working), (true, Status::Blocked)] {
@@ -2857,6 +3062,8 @@ mod orquestador_tests {
         {
             let mut st = d.state.lock().unwrap();
             st.panes.get_mut(&2).unwrap().status = Status::Idle;
+            // Un agente con hooks que terminó su turno (A2) y lleva un rato sin teclear.
+            st.panes.get_mut(&2).unwrap().listo_desde = Some(Instant::now() - Duration::from_secs(60));
             st.deliver(2);
             assert_eq!(st.tasks[0].status, TaskStatus::Entregada);
         }
@@ -2866,6 +3073,180 @@ mod orquestador_tests {
         assert!(texto.contains("no es una orden del usuario"));
         assert!(texto.ends_with("\x1b[201~\r"), "un solo Enter, al final, tras el pegado");
         assert_eq!(texto.matches('\r').count(), 1);
+    }
+
+    /// A1: solo son agentes los procesos de ruta de claude o codex, o el propio proceso de un panel lanzado como agente.
+    #[test]
+    fn el_agente_se_reconoce_por_su_ruta() {
+        assert!(es_agente_ruta("/Users/x/.local/share/claude/versions/2.0.50"));
+        assert!(es_agente_ruta("/opt/homebrew/bin/codex"));
+        assert!(!es_agente_ruta("/bin/zsh"));
+        assert!(!es_agente_ruta("/Users/x/claude-notes/zsh"), "un componente que solo empieza por claude no cuenta");
+    }
+
+    /// A2: un aviso de espera (idle_prompt) no saca a un agente de Blocked; el diálogo pendiente sigue siendo suyo.
+    #[test]
+    fn idle_no_saca_de_blocked() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _x = vivo(&mut st, 1, "x", true, Status::Blocked);
+        let d = daemon_con(st);
+        let r = rt();
+        r.block_on(d.handle(None, Request::Hook { pane: "1".into(), event: HookEvent::Idle, summary: None, source: None })).unwrap();
+        assert_eq!(d.state.lock().unwrap().panes[&1].status, Status::Blocked);
+    }
+
+    /// A2: no se entrega justo al terminar el turno (gracia), ni con texto a medias en el prompt.
+    #[test]
+    fn la_entrega_espera_la_gracia_y_el_prompt_vacio() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _jefe = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let rx = vivo(&mut st, 2, "codex", true, Status::Idle);
+        st.tasks.push(Task {
+            id: 1, from: 1, to: 2, from_name: "jefe".into(), to_name: "codex".into(), workspace: None, text: "t".into(), context: None,
+            status: TaskStatus::Pendiente, summary: None, files: Vec::new(), depth: 1, created_unix: 0,
+        });
+        st.panes.get_mut(&2).unwrap().listo_desde = Some(Instant::now());
+        st.deliver(2);
+        assert_eq!(st.tasks[0].status, TaskStatus::Pendiente, "gracia: acaba de terminar");
+        st.panes.get_mut(&2).unwrap().listo_desde = Some(Instant::now() - Duration::from_secs(60));
+        st.panes.get_mut(&2).unwrap().ultima_entrada = Some(Instant::now());
+        st.deliver(2);
+        assert_eq!(st.tasks[0].status, TaskStatus::Pendiente, "tecleó hace poco");
+        st.panes.get_mut(&2).unwrap().ultima_entrada = None;
+        st.panes.get_mut(&2).unwrap().screen.lock().unwrap().process(b"\x1b[1;1Hborrador a medias");
+        st.deliver(2);
+        assert_eq!(st.tasks[0].status, TaskStatus::Pendiente, "hay texto a medias en el prompt");
+        assert!(rx.try_recv().is_err());
+        st.panes.get_mut(&2).unwrap().screen.lock().unwrap().process(b"\x1b[2K\x1b[1;1H> ");
+        st.deliver(2);
+        assert_eq!(st.tasks[0].status, TaskStatus::Entregada);
+    }
+
+    fn tarea_abierta(id: u64, from: u32, to: u32, ws: Option<&str>, created_unix: u64) -> Task {
+        Task {
+            id, from, to, from_name: format!("p{from}"), to_name: format!("p{to}"), workspace: ws.map(String::from), text: "t".into(),
+            context: None, status: TaskStatus::Entregada, summary: None, files: Vec::new(), depth: 1, created_unix,
+        }
+    }
+
+    /// M2: la profundidad es la de la última tarea recibida; cerrarla no la reinicia, y a profundidad 3 no se delega más.
+    #[test]
+    fn la_profundidad_no_se_reinicia_al_cerrar() {
+        let mut st = State { epoch: 3, ..State::default() };
+        for id in 1..=4 {
+            let _ = vivo(&mut st, id, &format!("p{id}"), true, Status::Idle);
+        }
+        assert_eq!(st.check_delegation(1, 2, None).unwrap(), 1, "un manager delega a 1");
+        st.panes.get_mut(&2).unwrap().profundidad_recibida = 1;
+        assert_eq!(st.check_delegation(2, 3, None).unwrap(), 2);
+        st.tasks.push(Task { status: TaskStatus::Lista, ..tarea_abierta(1, 2, 3, None, 0) });
+        assert_eq!(st.check_delegation(2, 3, None).unwrap(), 2, "cerrar la tarea no baja la profundidad");
+        st.panes.get_mut(&3).unwrap().profundidad_recibida = 3;
+        assert!(st.check_delegation(3, 4, None).is_err(), "a profundidad 3 no se delega más");
+    }
+
+    /// M2: los paneles sin workspace comparten un cupo de tareas abiertas en lugar de no tener límite.
+    #[test]
+    fn sin_workspace_tambien_hay_cupo() {
+        let mut st = State { epoch: 3, ..State::default() };
+        for id in 1..=12 {
+            let _ = vivo(&mut st, id, &format!("p{id}"), true, Status::Idle);
+        }
+        for i in 0..MAX_OPEN_PER_WORKSPACE as u64 {
+            let from = (i % 4) as u32 + 1;
+            st.tasks.push(tarea_abierta(i + 1, from, 10, None, 0));
+        }
+        assert!(st.check_delegation(5, 11, None).is_err(), "el cupo de los paneles sin workspace se llena");
+    }
+
+    /// M2: tope por hora por remitente, aunque cada par y cada workspace estén dentro de sus cupos.
+    #[test]
+    fn tope_de_delegaciones_por_hora() {
+        let mut st = State { epoch: 3, ..State::default() };
+        for id in 1..=2 {
+            let _ = vivo(&mut st, id, &format!("p{id}"), true, Status::Idle);
+        }
+        let ahora = unix_ahora();
+        st.delegaciones = (0..MAX_DELEGATIONS_PER_HOUR).map(|_| (1, ahora)).collect();
+        assert!(st.check_delegation(1, 2, None).is_err(), "ya delegó el máximo esta hora");
+        st.delegaciones = (0..MAX_DELEGATIONS_PER_HOUR).map(|_| (1, ahora - 7200)).collect();
+        assert!(st.check_delegation(1, 2, None).is_ok(), "las de hace más de una hora no cuentan");
+    }
+
+    /// M3: tras reiniciar, una tarea abierta no tiene destino vivo: falla, y el remitente recibe el aviso.
+    #[test]
+    fn tras_reiniciar_las_tareas_abiertas_fallan_y_avisan() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _j = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _w = vivo(&mut st, 2, "worker", true, Status::Idle);
+        st.tasks.push(tarea_abierta(1, 1, 2, None, unix_ahora()));
+        st.fallar_tareas_sin_destino();
+        assert_eq!(st.tasks[0].status, TaskStatus::Fallida);
+        assert!(st.panes[&1].inbox.iter().any(|m| m.kind == "failed"), "el remitente lo sabe");
+    }
+
+    /// M3: las abiertas de más de un día caducan, y las cerradas antiguas se podan.
+    #[test]
+    fn caducidad_y_poda_de_tareas() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _j = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _w = vivo(&mut st, 2, "worker", true, Status::Idle);
+        let ahora = unix_ahora();
+        st.tasks.push(tarea_abierta(1, 1, 2, None, ahora - 2 * CADUCIDAD_TAREA_SECS));
+        st.tasks.push(Task { status: TaskStatus::Lista, ..tarea_abierta(2, 1, 2, None, ahora - 30 * 24 * 3600) });
+        st.tasks.push(Task { status: TaskStatus::Lista, ..tarea_abierta(3, 1, 2, None, ahora) });
+        st.podar_tareas(ahora);
+        assert_eq!(st.tasks.iter().find(|t| t.id == 1).unwrap().status, TaskStatus::Fallida, "caducada");
+        assert!(st.tasks.iter().all(|t| t.id != 2), "la cerrada de hace un mes se poda");
+        assert!(st.tasks.iter().any(|t| t.id == 3), "la reciente se conserva");
+    }
+
+    /// M4: etiquetas Unicode, uso privado y formato invisible no entran en tareas, contexto ni resumen.
+    #[test]
+    fn texto_invisible_se_rechaza() {
+        assert!(check_texto_de_tarea("la tarea", "crea ñandú.txt", MAX_TASK_TEXT).is_ok());
+        for c in ['\u{E0001}', '\u{E0041}', '\u{E000}', '\u{202E}', '\u{200B}', '\u{0605}'] {
+            assert!(check_texto_de_tarea("la tarea", &format!("ok{c}"), MAX_TASK_TEXT).is_err(), "U+{:04X}", c as u32);
+        }
+    }
+
+    /// Un shell normal no vuelve como fantasma tras un reinicio: el guardado lo lleva (sigue vivo), pero la restauración
+    /// solo crea fantasmas de paneles con trabajo pendiente. Su manager, si lo tiene, recibe el aviso.
+    #[test]
+    fn el_shell_sin_trabajo_no_reaparece_tras_reiniciar() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _shell = vivo(&mut st, 1, "shell", false, Status::Idle);
+        let _j = vivo(&mut st, 2, "jefe", true, Status::Idle);
+        st.tasks.push(tarea_abierta(1, 2, 3, None, unix_ahora()));
+        let guardado = crate::persist::snapshot(&st);
+        let mut nuevo = State { epoch: 4, ..State::default() };
+        crate::persist::restore(&mut nuevo, guardado);
+        let nombres: Vec<&str> = nuevo.panes.values().map(|p| p.name.as_str()).collect();
+        assert!(!nombres.contains(&"shell"), "un shell sin trabajo no reaparece: {nombres:?}");
+        assert!(nombres.contains(&"jefe"), "quien tiene una tarea abierta sí vuelve: {nombres:?}");
+    }
+
+    /// A3: el remitente lo pone el socket, no la solicitud. Sin panel no se delega ni se cierra nada; a otro
+    /// workspace no se delega; y un panel no emite hooks por otro.
+    #[test]
+    fn el_remitente_sale_del_socket_y_se_acota_al_workspace() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _a = vivo(&mut st, 1, "a", true, Status::Idle);
+        let _b = vivo(&mut st, 2, "b", true, Status::Idle);
+        let _c = vivo(&mut st, 3, "c", true, Status::Idle);
+        st.panes.get_mut(&1).unwrap().workspace = Some("uno".into());
+        st.panes.get_mut(&2).unwrap().workspace = Some("uno".into());
+        st.panes.get_mut(&3).unwrap().workspace = Some("otro".into());
+        let d = daemon_con(st);
+        let r = rt();
+        let sin_panel = r.block_on(d.handle(None, Request::Delegate { to: "2".into(), task: "t".into(), context: None }));
+        assert!(sin_panel.is_err(), "una llamada que no viene de un panel no delega");
+        assert!(r.block_on(d.handle(Some(1), Request::Delegate { to: "3".into(), task: "t".into(), context: None })).is_err(), "otro workspace");
+        assert!(r.block_on(d.handle(Some(1), Request::Delegate { to: "2".into(), task: "t".into(), context: None })).is_ok());
+        assert!(r.block_on(d.handle(Some(3), Request::Tasks { pane: None })).unwrap().as_array().unwrap().is_empty(), "el workspace otro no ve las tareas de uno");
+        assert_eq!(r.block_on(d.handle(Some(2), Request::Tasks { pane: None })).unwrap().as_array().unwrap().len(), 1);
+        let hook = Request::Hook { pane: "2".into(), event: HookEvent::Working, summary: None, source: None };
+        assert!(r.block_on(d.handle(Some(1), hook)).is_err(), "un panel no emite hooks por otro");
     }
 
     /// Frenos: como mucho 3 tareas abiertas por par, profundidad máxima 3, y 8 abiertas por workspace.
@@ -2881,15 +3262,15 @@ mod orquestador_tests {
         let r = rt();
         let mut ok = 0;
         for _ in 0..4 {
-            if r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "t".into(), context: None })).is_ok() {
+            if r.block_on(d.handle(Some(1), Request::Delegate { to: "2".into(), task: "t".into(), context: None })).is_ok() {
                 ok += 1;
             }
         }
         assert_eq!(ok, 3, "el cuarto par entre los mismos dos agentes se rechaza");
         // Cadena 1→2→3→4 (profundidad 3) y el siguiente salto, 4→5, pasa de la profundidad máxima.
-        assert!(r.block_on(d.handle(Request::Delegate { from: "2".into(), to: "3".into(), task: "t".into(), context: None })).is_ok());
-        assert!(r.block_on(d.handle(Request::Delegate { from: "3".into(), to: "4".into(), task: "t".into(), context: None })).is_ok());
-        let err = r.block_on(d.handle(Request::Delegate { from: "4".into(), to: "5".into(), task: "t".into(), context: None })).unwrap_err();
+        assert!(r.block_on(d.handle(Some(2), Request::Delegate { to: "3".into(), task: "t".into(), context: None })).is_ok());
+        assert!(r.block_on(d.handle(Some(3), Request::Delegate { to: "4".into(), task: "t".into(), context: None })).is_ok());
+        let err = r.block_on(d.handle(Some(4), Request::Delegate { to: "5".into(), task: "t".into(), context: None })).unwrap_err();
         assert!(err.to_string().contains("profundidad máxima"), "{err}");
         // Workspace: 8 tareas abiertas y ya no entra ninguna más.
         let mut st = d.state.lock().unwrap();
@@ -2910,10 +3291,10 @@ mod orquestador_tests {
         let _codex = vivo(&mut st, 2, "codex", true, Status::Idle);
         let d = daemon_con(st);
         let r = rt();
-        let info = r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "crea x.txt".into(), context: None })).unwrap();
+        let info = r.block_on(d.handle(Some(1), Request::Delegate { to: "2".into(), task: "crea x.txt".into(), context: None })).unwrap();
         let id = info["id"].as_u64().unwrap();
-        assert!(r.block_on(d.handle(Request::TaskDone { from: "1".into(), id, summary: "no soy yo".into(), ok: true })).is_err(), "el remitente no cierra la tarea");
-        r.block_on(d.handle(Request::TaskDone { from: "2".into(), id, summary: "creado".into(), ok: true })).unwrap();
+        assert!(r.block_on(d.handle(Some(1), Request::TaskDone { id, summary: "no soy yo".into(), ok: true })).is_err(), "el remitente no cierra la tarea");
+        r.block_on(d.handle(Some(2), Request::TaskDone { id, summary: "creado".into(), ok: true })).unwrap();
         let st = d.state.lock().unwrap();
         assert_eq!(st.tasks[0].status, TaskStatus::Lista);
         let buzon = &st.panes[&1].inbox;
@@ -2928,7 +3309,7 @@ mod orquestador_tests {
         let _codex = vivo(&mut st, 2, "codex", true, Status::Idle);
         let d = daemon_con(st);
         let r = rt();
-        r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "t".into(), context: None })).unwrap();
+        r.block_on(d.handle(Some(1), Request::Delegate { to: "2".into(), task: "t".into(), context: None })).unwrap();
         let mut st = d.state.lock().unwrap();
         st.fail_tasks_of(2);
         assert_eq!(st.tasks[0].status, TaskStatus::Fallida);
@@ -2943,13 +3324,14 @@ mod orquestador_tests {
         let _codex = vivo(&mut st, 2, "codex", true, Status::Idle);
         let d = daemon_con(st);
         let r = rt();
-        r.block_on(d.handle(Request::Delegate { from: "1".into(), to: "2".into(), task: "crea x.txt".into(), context: Some("en la raíz".into()) })).unwrap();
+        r.block_on(d.handle(Some(1), Request::Delegate { to: "2".into(), task: "crea x.txt".into(), context: Some("en la raíz".into()) })).unwrap();
         let guardado = persist::snapshot(&d.state.lock().unwrap());
         let mut nuevo = State { epoch: 4, ..State::default() };
         persist::restore(&mut nuevo, guardado);
         assert_eq!(nuevo.tasks.len(), 1);
-        // El codex tenía hooks y estaba libre: la tarea se entregó al delegarla, y eso sobrevive al reinicio.
-        assert_eq!(nuevo.tasks[0].status, TaskStatus::Entregada);
+        // M3: tras el reinicio no hay agente vivo al que llegue la tarea abierta: falla, y el remitente se entera.
+        assert_eq!(nuevo.tasks[0].status, TaskStatus::Fallida);
+        assert!(nuevo.panes[&1].inbox.iter().any(|m| m.kind == "failed"), "el jefe recibe el aviso");
         assert_eq!(nuevo.tasks[0].context.as_deref(), Some("en la raíz"));
         assert_eq!(nuevo.next_task, 1);
     }

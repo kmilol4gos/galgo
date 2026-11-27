@@ -318,10 +318,33 @@ pub fn restore(st: &mut State, saved: Saved) {
         })
         .collect();
     let now_unix = unix_now();
+    // Un panel vivo se pierde con el daemon. Vuelve como fantasma si tiene trabajo (mensajes sin confirmar o tareas
+    // abiertas) o si es el manager de uno que vuelve (sin él, ese fantasma no tendría a quién avisar ni su nombre
+    // de manager). Un shell suelto no reaparece como pestaña muerta.
+    let mut necesario: std::collections::HashSet<u32> = saved
+        .panes
+        .iter()
+        .filter(|sp| !sp.inbox.is_empty() || st.tasks.iter().any(|t| t.status.abierta() && (t.from == sp.id || t.to == sp.id)))
+        .map(|sp| sp.id)
+        .collect();
+    loop {
+        let antes = necesario.len();
+        for sp in &saved.panes {
+            if let Some(m) = sp.manager.filter(|_| necesario.contains(&sp.id)) {
+                necesario.insert(m);
+            }
+        }
+        if necesario.len() == antes {
+            break;
+        }
+    }
     let mut lost = Vec::new();
     for sp in saved.panes {
         if sp.alive {
             lost.push((sp.id, sp.name.clone(), sp.manager));
+            if !necesario.contains(&sp.id) {
+                continue;
+            }
         }
         let mut inbox = Vec::new();
         for m in sp.inbox {
@@ -356,6 +379,9 @@ pub fn restore(st: &mut State, saved: Saved) {
     for p in st.panes.values_mut() {
         p.exited = true;
     }
+    // M3: las tareas abiertas no tienen destino vivo tras el reinicio: fallan (y el remitente lo sabe) y se podan las viejas.
+    st.fallar_tareas_sin_destino();
+    st.podar_tareas(now_unix);
 }
 
 fn static_kind(kind: &str) -> &'static str {
@@ -406,7 +432,16 @@ mod tests {
             tasks: vec![],
             next_task: 0,
             panes: vec![
-                SavedPane { id: 1, name: "mgr".into(), cmd: vec!["bash".into()], manager: None, workspace: None, cwd: None, alive: true, inbox: vec![] },
+                SavedPane {
+                    id: 1,
+                    name: "mgr".into(),
+                    cmd: vec!["bash".into()],
+                    manager: None,
+                    workspace: None,
+                    cwd: None,
+                    alive: true,
+                    inbox: vec![SavedMsg { id: (1 << 32) | 1, from: 1, from_name: "mgr".into(), kind: "done".into(), summary: "previo".into(), created_unix: unix_now() }],
+                },
                 SavedPane {
                     id: 2,
                     name: "w".into(),
@@ -518,9 +553,10 @@ mod tests {
         restore(&mut st, saved_with_inbox());
         let mgr = &st.panes[&1];
         assert!(mgr.ghost && mgr._master.is_none());
+        // Su mensaje previo, más el aviso de que w ya no existe.
         let inbox = &st.panes[&1].inbox;
-        assert_eq!(inbox.len(), 1, "solo el aviso de que w ya no existe");
-        assert!(inbox[0].summary.contains("el panel w ya no existe"));
+        assert_eq!(inbox.len(), 2, "el mensaje previo y el aviso");
+        assert!(inbox.iter().any(|m| m.summary.contains("el panel w ya no existe")));
         assert_eq!(st.panes[&2].inbox[0].summary, "hecho");
         assert_eq!(st.panes[&2].inbox[0].id, (2 << 32) | 4);
         assert_eq!(st.next_pane, 5);

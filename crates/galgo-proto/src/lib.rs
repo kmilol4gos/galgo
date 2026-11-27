@@ -211,17 +211,16 @@ pub enum Request {
         #[serde(default)]
         failed: bool,
     },
-    /// Delegar una tarea de un agente a otro. `from` es el remitente (siempre `GALGO_PANE` en la CLI y el MCP).
+    /// Delegar una tarea de un agente a otro. El remitente no viaja en la solicitud: el daemon lo deduce del socket
+    /// (el proceso que llama debe estar en el pty de un panel).
     Delegate {
-        from: String,
         to: String,
         task: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<String>,
     },
-    /// El destinatario de la tarea `id` la termina: `ok` o fallida, con su resumen. `from` debe ser el destinatario.
+    /// El destinatario de la tarea `id` la termina: `ok` o fallida, con su resumen. Quien llama debe ser el destinatario.
     TaskDone {
-        from: String,
         id: u64,
         summary: String,
         #[serde(default)]

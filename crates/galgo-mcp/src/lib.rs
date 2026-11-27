@@ -24,6 +24,8 @@ const INVALID_PARAMS: i64 = -32602;
 pub struct Env {
     pub pane: Option<String>,
     pub cwd: Option<String>,
+    /// Servidor de un agente en modo orquestador (`--orquestador`): solo expone las herramientas de la delegación.
+    pub orquestador: bool,
 }
 
 impl Env {
@@ -31,8 +33,18 @@ impl Env {
         Self {
             pane: std::env::var("GALGO_PANE").ok().filter(|s| !s.is_empty()),
             cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+            orquestador: std::env::args().any(|a| a == "--orquestador"),
         }
     }
+}
+
+/// Herramientas de la delegación: lo único que un agente orquestado necesita (A4). El resto de galgo (`spawn`,
+/// `send`, `read`…) saltaría los frenos del modo orquestador, así que no se sirve a esos agentes.
+pub const HERRAMIENTAS_ORQUESTADOR: [&str; 4] = ["galgo_delegate", "galgo_tasks", "galgo_task_done", "galgo_inbox"];
+
+/// Herramientas que este servidor ofrece con este entorno.
+pub fn herramientas(env: &Env) -> Vec<Value> {
+    tool_definitions().into_iter().filter(|t| !env.orquestador || HERRAMIENTAS_ORQUESTADOR.contains(&t["name"].as_str().unwrap_or(""))).collect()
 }
 
 /// Procesa una línea de entrada con el entorno del proceso.
@@ -68,7 +80,7 @@ pub fn handle_line_in(
     let outcome = match method {
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => Ok(json!({ "tools": herramientas(env) })),
         "tools/call" => call_tool_rpc(&params, daemon, env),
         other => Err(RpcError::new(METHOD_NOT_FOUND, format!("método desconocido: {other}"))),
     };
@@ -121,7 +133,7 @@ fn call_tool_rpc(params: &Value, daemon: &dyn Fn(Request) -> Result<Response>, e
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new(INVALID_PARAMS, "tools/call requiere 'name'"))?;
-    if !tool_definitions().iter().any(|t| t["name"] == name) {
+    if !herramientas(env).iter().any(|t| t["name"] == name) {
         return Err(RpcError::new(INVALID_PARAMS, format!("herramienta desconocida: {name}")));
     }
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
@@ -187,18 +199,23 @@ fn build_request(name: &str, args: &Value, env: &Env) -> Result<Request, String>
         "galgo_inbox" => Ok(Request::Inbox { pane: own_pane(env)? }),
         "galgo_ack" => Ok(Request::Ack { pane: own_pane(env)?, msg: u64_arg(args, "msg")? }),
         // El remitente es siempre este panel (GALGO_PANE), nunca un argumento: no se puede suplantar a otro agente.
-        "galgo_delegate" => Ok(Request::Delegate {
-            from: own_pane(env)?,
-            to: str_arg(args, "to")?,
-            task: str_arg(args, "task")?,
-            context: opt_str(args, "context"),
-        }),
-        "galgo_task_done" => Ok(Request::TaskDone {
-            from: own_pane(env)?,
-            id: u64_arg(args, "id")?,
-            summary: str_arg(args, "summary")?,
-            ok: opt_bool(args, "ok").unwrap_or(true),
-        }),
+        // El remitente lo deduce el daemon del proceso que llama (la sesión del panel): no es un argumento.
+        "galgo_delegate" => {
+            own_pane(env)?;
+            Ok(Request::Delegate {
+                to: str_arg(args, "to")?,
+                task: str_arg(args, "task")?,
+                context: opt_str(args, "context"),
+            })
+        }
+        "galgo_task_done" => {
+            own_pane(env)?;
+            Ok(Request::TaskDone {
+                id: u64_arg(args, "id")?,
+                summary: str_arg(args, "summary")?,
+                ok: opt_bool(args, "ok").unwrap_or(true),
+            })
+        }
         "galgo_tasks" => Ok(Request::Tasks { pane: opt_str(args, "pane").or_else(|| env.pane.clone()) }),
         other => Err(format!("herramienta desconocida: {other}")),
     }
@@ -362,7 +379,7 @@ mod tests {
     }
 
     fn env(pane: Option<&str>) -> Env {
-        Env { pane: pane.map(String::from), cwd: Some("/proyecto".into()) }
+        Env { pane: pane.map(String::from), cwd: Some("/proyecto".into()), orquestador: false }
     }
 
     /// Llama a `handle_line_in` y parsea la respuesta, que debe existir.
@@ -406,16 +423,15 @@ mod tests {
     /// Modo orquestador: el remitente de una delegación es este panel (GALGO_PANE), aunque los argumentos digan otra cosa.
     #[test]
     fn delegate_toma_el_remitente_del_entorno() {
-        let env = Env { pane: Some("jefe".into()), cwd: None };
+        let env = Env { pane: Some("jefe".into()), cwd: None, orquestador: false };
         let args = json!({ "to": "codex", "task": "crea x.txt", "from": "otro-agente" });
         match build_request("galgo_delegate", &args, &env).unwrap() {
-            Request::Delegate { from, to, task, .. } => {
-                assert_eq!(from, "jefe", "el argumento from no cuenta");
+            Request::Delegate { to, task, .. } => {
                 assert_eq!((to.as_str(), task.as_str()), ("codex", "crea x.txt"));
             }
             other => panic!("{other:?}"),
         }
-        let sin_panel = Env { pane: None, cwd: None };
+        let sin_panel = Env { pane: None, cwd: None, orquestador: false };
         assert!(build_request("galgo_delegate", &args, &sin_panel).is_err(), "sin GALGO_PANE no se delega");
         assert!(build_request("galgo_task_done", &json!({ "id": 3, "summary": "hecho" }), &sin_panel).is_err());
     }
@@ -423,13 +439,30 @@ mod tests {
     /// Cerrar una tarea: el id y el resumen llegan tal cual, `ok` por defecto es verdadero.
     #[test]
     fn task_done_lleva_id_resumen_y_ok() {
-        let env = Env { pane: Some("codex".into()), cwd: None };
+        let env = Env { pane: Some("codex".into()), cwd: None, orquestador: false };
         match build_request("galgo_task_done", &json!({ "id": 7, "summary": "listo" }), &env).unwrap() {
-            Request::TaskDone { from, id, summary, ok } => {
-                assert_eq!((from.as_str(), id, summary.as_str(), ok), ("codex", 7, "listo", true));
+            Request::TaskDone { id, summary, ok } => {
+                assert_eq!((id, summary.as_str(), ok), (7, "listo", true));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A4: en modo orquestador solo están las herramientas de la delegación; `spawn`, `send` y `read` no.
+    #[test]
+    fn modo_orquestador_solo_expone_la_delegacion() {
+        let env = Env { pane: Some("jefe".into()), cwd: None, orquestador: true };
+        let nombres: Vec<String> = herramientas(&env).iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        let mut esperado: Vec<&str> = HERRAMIENTAS_ORQUESTADOR.to_vec();
+        esperado.sort();
+        let mut visto: Vec<&str> = nombres.iter().map(String::as_str).collect();
+        visto.sort();
+        assert_eq!(visto, esperado);
+        let llamada = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "galgo_spawn", "arguments": { "name": "w", "cmd": ["bash"] } } });
+        let r = handle_line_in(&llamada.to_string(), &|_| panic!("no debe llegar al daemon"), &env).unwrap();
+        assert!(r.contains("herramienta desconocida") || r.contains("\"error\""), "{r}");
+        let normal = Env { pane: Some("jefe".into()), cwd: None, orquestador: false };
+        assert!(herramientas(&normal).len() > 4, "sin el modo, siguen todas");
     }
 
     #[test]

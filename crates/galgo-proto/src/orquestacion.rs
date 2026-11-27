@@ -52,7 +52,7 @@ pub fn argv(cmd: &[String], nombre: &str, rol: &str, mcp: &str, sock: &str) -> R
     match base.as_str() {
         "claude" => {
             let cfg = json!({
-                "mcpServers": { "galgo": { "command": mcp, "args": [], "env": { "GALGO_PANE": nombre, "GALGO_SOCKET": sock } } }
+                "mcpServers": { "galgo": { "command": mcp, "args": ["--orquestador"], "env": { "GALGO_PANE": nombre, "GALGO_SOCKET": sock } } }
             })
             .to_string();
             // Sin `--strict-mcp-config`: el usuario conserva sus otros servidores MCP; el de galgo se añade al lado.
@@ -63,7 +63,7 @@ pub fn argv(cmd: &[String], nombre: &str, rol: &str, mcp: &str, sock: &str) -> R
                 "-c".into(),
                 format!("mcp_servers.galgo.command={}", toml_str(mcp)),
                 "-c".into(),
-                "mcp_servers.galgo.args=[]".into(),
+                "mcp_servers.galgo.args=[\"--orquestador\"]".into(),
                 "-c".into(),
                 format!("mcp_servers.galgo.env={{GALGO_PANE={}, GALGO_SOCKET={}}}", toml_str(nombre), toml_str(sock)),
                 "-c".into(),

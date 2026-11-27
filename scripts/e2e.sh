@@ -768,6 +768,8 @@ out=$(printf '%s\n' '{"type":"agent_start"}' | GALGO_PANE=w97 GALGO_SOCKET="$TMP
 [ "$rc" = 0 ] && [ -z "$out" ] && [ ! -S "$TMP/no-pi.sock" ]; check "hook PI silencioso con daemon ausente" $?
 galgo status blocked --pane m97
 if command -v pi >/dev/null 2>&1; then
+# El panel llega libre: el paso anterior lo dejó bloqueado por un permiso, y un Idle ya no lo saca de Blocked (A2).
+galgo status --pane m97 idle >/dev/null
 GALGO_PANE=m97 PI_CODING_AGENT_DIR="$TMP/pi-config97" pi --mode rpc --no-session --offline --no-extensions -e "$HOME97/.pi/agent/extensions/galgo.ts" </dev/null >"$TMP/pi97.out" 2>"$TMP/pi97.err"
 [ $? = 0 ] && [ ! -s "$TMP/pi97.out" ] && [ ! -s "$TMP/pi97.err" ] && galgo ls | grep m97 | grep -q idle; check "PI real carga extensión y reporta session_start" $?
 else check "PI real carga extensión y reporta session_start" 77; fi
@@ -1117,8 +1119,9 @@ galgo usage --by quien >/dev/null 2>&1; [ $? -ne 0 ]; check "--by solo acepta wo
 galgo stop >/dev/null 2>&1; sleep 0.5
 galgo ls >/dev/null
 galgo --json ls | python3 -c 'import json,sys
-p=[x for x in json.load(sys.stdin) if x["name"]=="t126"][0]
-assert p["usage"] is None'
+ps=[x for x in json.load(sys.stdin) if x["name"]=="t126"]
+# Un panel sin trabajo no vuelve tras reiniciar; si volviera, no traería el uso del disco.
+assert not ps or ps[0]["usage"] is None'
 check "tras reiniciar el daemon, el uso no vuelve del disco" $?
 galgo stop >/dev/null 2>&1
 export GALGO_SOCKET="$TMP/galgo.sock"
@@ -1209,8 +1212,9 @@ galgo spawn m135 -- bash --norc >/dev/null
 galgo spawn w135 --manager m135 -- bash --norc >/dev/null
 galgo stop >/dev/null 2>&1; sleep 0.5
 galgo ls >/dev/null
-galgo spawn w135b --manager m135 -- bash --norc >/dev/null 2>&1
+# Sin trabajo pendiente, w135 no vuelve tras el reinicio: se recrea con su manager (nombre reutilizado).
 galgo spawn m135 -- bash --norc >/dev/null 2>&1; check "el manager se recrea con su nombre" $?
+galgo spawn w135 --manager m135 -- bash --norc >/dev/null 2>&1
 galgo done --pane w135 --summary "resultado135" >/dev/null 2>"$TMP/c135/done"; [ $? -eq 0 ]; check "el done del worker se acepta" $?
 galgo inbox --pane m135 | grep -q "resultado135"; check "el resultado llega al manager recreado" $?
 galgo stop >/dev/null 2>&1; sleep 0.3
@@ -1425,73 +1429,67 @@ PYEOF
 check "un cambio llega como aviso y el cierre también" $?
 galgo stop >/dev/null 2>&1
 export GALGO_SOCKET="$TMP/galgo.sock"
-echo "145. modo orquestador (daemon): una tarea solo se entrega a un agente con hooks y libre; el resultado vuelve al remitente"
-export GALGO_SOCKET="$TMP/c145/g.sock"; mkdir -p "$TMP/c145" && chmod 700 "$TMP/c145"
-galgo spawn jefe145 -- /bin/cat >/dev/null; galgo spawn codex145 -- /bin/cat >/dev/null; galgo spawn sinhooks145 -- /bin/cat >/dev/null
-check "paneles de prueba" $?
-python3 - "$GALGO_SOCKET" <<'PYEOF'
-import json, socket, subprocess, sys, time
-ruta = sys.argv[1]
-def pedir(req):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(5)
-    s.connect(ruta)
-    s.sendall((json.dumps(req) + "\n").encode())
-    s.shutdown(socket.SHUT_WR)
-    return json.loads(s.makefile("r").readline())
-def pantalla(p):
-    return subprocess.run(["galgo", "read", p], capture_output=True, text=True).stdout
-# Sin hooks: la tarea queda pendiente y no llega al panel.
-r = pedir({"op": "delegate", "from": "jefe145", "to": "sinhooks145", "task": "esto no debe llegar"})
-assert r["ok"] and r["data"]["status"] == "pendiente", r
-time.sleep(0.4)
-assert "tarea #" not in pantalla("sinhooks145"), "sin hooks no se entrega"
-# Con hook de idle: el destinatario está libre y la tarea se entrega, pegada y con Enter.
-assert pedir({"op": "hook", "pane": "codex145", "event": "idle", "summary": None})["ok"]
-r = pedir({"op": "delegate", "from": "jefe145", "to": "codex145", "task": "crea x.txt", "context": "en la raíz"})
-assert r["ok"] and r["data"]["status"] == "entregada", r
-tid = r["data"]["id"]
-time.sleep(0.6)
-assert "tarea #%d" % tid in pantalla("codex145"), pantalla("codex145")
-# Solo el destinatario cierra la tarea; el resultado llega al remitente.
-assert not pedir({"op": "task_done", "from": "jefe145", "id": tid, "summary": "no", "ok": True})["ok"]
-assert pedir({"op": "task_done", "from": "codex145", "id": tid, "summary": "x.txt creado", "ok": True})["ok"]
-inbox = subprocess.run(["galgo", "inbox", "--pane", "jefe145"], capture_output=True, text=True).stdout
-assert "x.txt creado" in inbox, inbox
-tareas = pedir({"op": "tasks", "pane": "jefe145"})["data"]
-assert any(t["id"] == tid and t["status"] == "lista" for t in tareas), tareas
-PYEOF
-check "la tarea se entrega solo con hooks y el resultado vuelve al remitente" $?
-echo "146. modo orquestador (CLI): galgo delegate y galgo task done desde el panel propio (GALGO_PANE)"
-export GALGO_SOCKET="$TMP/c146/g.sock"; mkdir -p "$TMP/c146" && chmod 700 "$TMP/c146"
-galgo spawn jefe146 -- /bin/cat >/dev/null; galgo spawn codex146 -- /bin/cat >/dev/null
-check "paneles de prueba" $?
-python3 -c 'import json,socket,sys
-s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
-s.sendall((json.dumps({"op":"hook","pane":"codex146","event":"idle","summary":None})+"\n").encode()); s.shutdown(socket.SHUT_WR); s.makefile("r").readline()' "$GALGO_SOCKET"
-out=$(GALGO_PANE=jefe146 galgo delegate codex146 crea x.txt --context "en la raíz"); echo "$out" | grep -q "tarea #.*entregada"; check "galgo delegate entrega a un agente libre" $?
-TID=$(echo "$out" | sed -n 's/^tarea #\([0-9]*\).*/\1/p')
-sleep 0.6; galgo read codex146 | grep -q "tarea #$TID"; check "el destinatario recibe el texto" $?
-GALGO_PANE=jefe146 galgo task done "$TID" "soy jefe" >/dev/null 2>&1; [ $? -ne 0 ]; check "el remitente no cierra la tarea" $?
-GALGO_PANE=codex146 galgo task done "$TID" x.txt creado >/dev/null; check "el destinatario cierra la tarea" $?
-galgo inbox --pane jefe146 | grep -q "x.txt creado"; check "el resultado llega al remitente" $?
-galgo tasks --pane jefe146 | grep -q "lista"; check "galgo tasks muestra la tarea cerrada" $?
-env -u GALGO_PANE galgo delegate codex146 algo >/dev/null 2>&1; [ $? -ne 0 ]; check "sin GALGO_PANE no se delega" $?
-echo "147. modo orquestador (lanzamiento): claude y codex arrancan con el MCP de galgo y su rol; una tarea delegada se responde de punta a punta (agentes falsos con hooks)"
-export GALGO_SOCKET="$TMP/c147/g.sock"; mkdir -p "$TMP/c147" "$TMP/fakebin" && chmod 700 "$TMP/c147"
-cat > "$TMP/fakebin/claude" <<'FAKE_EOF'
+echo "145. modo orquestador: el remitente sale del panel real; sin hooks, con un shell o con hooks viejos no hay entrega (A1, A2)"
+export GALGO_SOCKET="$TMP/c145/g.sock"; mkdir -p "$TMP/c145" "$TMP/fakebin" && chmod 700 "$TMP/c145"
+# Agente falso compartido: está dentro de su panel, avisa que está libre con Stop, cierra las tareas que le llegan y,
+# si le escriben DELEGAR:<destino>, delega a ese panel. Su hook sale del panel (la sesión del pty).
+cat > "$TMP/fakebin/agente-falso.sh" <<'FAKE_EOF'
 #!/bin/sh
-# Agente falso de prueba: registra sus argumentos, avisa que está libre por hook y responde las tareas que le llegan.
-printf '%s\n' "$@" > "$TMP_ARGS_DIR/$GALGO_PANE_NAME.args"
-echo '{"hook_event_name":"Notification","notification_type":"idle_prompt"}' | galgo hook claude
+emite() { echo "{\"hook_event_name\":\"$1\"}" | galgo hook claude >/dev/null 2>&1; }
+printf '%s\n' "$@" > "$TMP_ARGS_DIR/$GALGO_PANE_NAME.args" 2>/dev/null
+emite Stop
 while IFS= read -r linea; do
   case "$linea" in
+    *DELEGAR*)
+      to=$(echo "$linea" | sed -n 's/.*DELEGAR:\([A-Za-z0-9_-]*\).*/\1/p'); [ -n "$to" ] || to="$DESTINO"
+      galgo delegate "$to" crea x.txt --context "en la raíz" >"$TMP_ARGS_DIR/$GALGO_PANE_NAME.delegate.$to" 2>&1; emite Stop ;;
     *"tarea #"*)
       id=$(echo "$linea" | sed -n 's/.*tarea #\([0-9][0-9]*\).*/\1/p')
-      galgo task done "$id" "hecho por $GALGO_PANE_NAME" >/dev/null 2>&1
-      echo '{"hook_event_name":"Notification","notification_type":"idle_prompt"}' | galgo hook claude ;;
+      galgo task done "$id" "hecho por $GALGO_PANE_NAME" >/dev/null 2>&1; emite Stop ;;
   esac
 done
+FAKE_EOF
+cat > "$TMP/fakebin/claude" <<'FAKE_EOF'
+#!/bin/sh
+exec sh "$TMP_FAKE_DIR/agente-falso.sh" "$@"
+FAKE_EOF
+chmod +x "$TMP/fakebin/agente-falso.sh" "$TMP/fakebin/claude"
+export TMP_FAKE_DIR="$TMP/fakebin" TMP_ARGS_DIR="$TMP/c145" DESTINO=codex145; ANTES_PATH="$PATH"; export PATH="$TMP/fakebin:$PATH"
+galgo spawn jefe145 -- claude >/dev/null; galgo spawn codex145 -- claude >/dev/null
+galgo spawn sinhooks145 -- cat >/dev/null; galgo spawn shell145 -- bash --norc >/dev/null
+check "paneles de prueba" $?
+for i in $(seq 1 50); do python3 -c 'import json,subprocess,sys
+ps=json.loads(subprocess.run(["galgo","--json","ls"],capture_output=True,text=True).stdout)
+sys.exit(0 if all(p.get("hooked") for p in ps if p["name"] in ("jefe145","codex145")) else 1)' && break; sleep 0.2; done
+# Un shell con hooks viejos (turn_ended) no es un agente: su primer plano es bash y no recibe nada.
+python3 - "$GALGO_SOCKET" <<'PYEOF'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sys.argv[1])
+s.sendall((json.dumps({"op": "hook", "pane": "shell145", "event": "turn_ended", "summary": None}) + "\n").encode()); s.shutdown(socket.SHUT_WR)
+s.makefile("r").readline()
+PYEOF
+galgo send jefe145 "DELEGAR:sinhooks145" >/dev/null
+for i in $(seq 1 40); do galgo tasks --all 2>/dev/null | grep -q "jefe145 → sinhooks145" && break; sleep 0.2; done
+galgo tasks --all | grep "jefe145 → sinhooks145" | grep -q "pendiente"; check "sin hooks la tarea queda pendiente" $?
+galgo send jefe145 "DELEGAR:shell145" >/dev/null
+for i in $(seq 1 40); do galgo tasks --all 2>/dev/null | grep -q "jefe145 → shell145" && break; sleep 0.2; done
+galgo tasks --all | grep "jefe145 → shell145" | grep -q "pendiente"; check "un shell con hooks viejos no recibe la tarea (A1)" $?
+python3 -c 'import json,subprocess,sys
+ps=json.loads(subprocess.run(["galgo","--json","ls"],capture_output=True,text=True).stdout)
+sys.exit(0 if not next(p for p in ps if p["name"]=="shell145").get("hooked") else 1)'; check "el shell deja de contar como agente" $?
+galgo send jefe145 "DELEGAR:codex145" >/dev/null
+ok=0; for i in $(seq 1 60); do galgo inbox --pane jefe145 2>/dev/null | grep -q "hecho por codex145" && { ok=1; break; }; sleep 0.25; done
+[ $ok = 1 ]; check "el worker libre recibe la tarea, la cierra y el resultado vuelve al manager" $?
+galgo tasks --pane jefe145 | grep -q "lista"; check "la tarea queda lista en el registro" $?
+env -u GALGO_PANE galgo delegate codex145 algo >/dev/null 2>&1; [ $? -ne 0 ]; check "un proceso fuera de los paneles no delega" $?
+TID=$(galgo --json tasks --all | python3 -c 'import json,sys; print(next(t["id"] for t in json.load(sys.stdin) if t["from"]=="jefe145"))')
+env -u GALGO_PANE galgo task done "$TID" "ajeno" >/dev/null 2>&1; [ $? -ne 0 ]; check "un proceso fuera de los paneles no cierra tareas" $?
+export PATH="$ANTES_PATH"; unset TMP_FAKE_DIR TMP_ARGS_DIR DESTINO
+echo "147. modo orquestador (lanzamiento): claude y codex arrancan con el MCP de galgo y su rol; una tarea delegada se responde de punta a punta (agentes falsos con hooks)"
+export GALGO_SOCKET="$TMP/c147/g.sock"; mkdir -p "$TMP/c147" && chmod 700 "$TMP/c147"
+cat > "$TMP/fakebin/claude" <<'FAKE_EOF'
+#!/bin/sh
+exec sh "$TMP_FAKE_DIR/agente-falso.sh" "$@"
 FAKE_EOF
 cat > "$TMP/fakebin/codex" <<'FAKE_EOF'
 #!/bin/sh
@@ -1499,18 +1497,22 @@ printf '%s\n' "$@" > "$TMP_ARGS_DIR/$GALGO_PANE_NAME.args"
 sleep 30
 FAKE_EOF
 chmod +x "$TMP/fakebin/claude" "$TMP/fakebin/codex"
-export TMP_ARGS_DIR="$TMP/c147"; ANTES_PATH="$PATH"; export PATH="$TMP/fakebin:$PATH"
+export TMP_FAKE_DIR="$TMP/fakebin" TMP_ARGS_DIR="$TMP/c147" DESTINO=w147; ANTES_PATH="$PATH"; export PATH="$TMP/fakebin:$PATH"
 galgo spawn jefe147 --orquestador --rol manager -- claude >/dev/null; galgo spawn w147 --orquestador --rol worker -- claude >/dev/null; galgo spawn cx147 --orquestador --rol reviewer -- codex >/dev/null
 check "lanzados con --orquestador" $?
 for i in $(seq 1 50); do [ -f "$TMP/c147/w147.args" ] && [ -f "$TMP/c147/cx147.args" ] && break; sleep 0.2; done
 grep -q -- "--mcp-config" "$TMP/c147/jefe147.args" && grep -q 'GALGO_PANE' "$TMP/c147/jefe147.args" && grep -q 'jefe147' "$TMP/c147/jefe147.args" && ! grep -q -- "--strict-mcp-config" "$TMP/c147/jefe147.args"; check "claude recibe el MCP de galgo en línea y conserva sus MCP (sin --strict-mcp-config)" $?
+grep -q '"--orquestador"' "$TMP/c147/jefe147.args"; check "el MCP de galgo se sirve en modo orquestador (A4)" $?
 grep -q "Coordinas" "$TMP/c147/jefe147.args"; check "claude recibe las instrucciones de su rol" $?
 grep -q "mcp_servers.galgo.command=" "$TMP/c147/cx147.args" && grep -q "developer_instructions=" "$TMP/c147/cx147.args"; check "codex recibe overrides -c para el MCP y las instrucciones" $?
-GALGO_PANE=jefe147 galgo delegate w147 crea x.txt --context "en la raíz" >/dev/null; check "el manager delega (aunque el worker aún no avisó)" $?
+for i in $(seq 1 50); do python3 -c 'import json,subprocess,sys
+ps=json.loads(subprocess.run(["galgo","--json","ls"],capture_output=True,text=True).stdout)
+sys.exit(0 if all(p.get("hooked") for p in ps if p["name"] in ("jefe147","w147")) else 1)' && break; sleep 0.2; done
+galgo send jefe147 DELEGAR >/dev/null
 ok=0; for i in $(seq 1 60); do galgo inbox --pane jefe147 2>/dev/null | grep -q "hecho por w147" && { ok=1; break; }; sleep 0.25; done
-[ $ok = 1 ]; check "el worker recibe la tarea, responde y el resultado vuelve al manager" $?
+[ $ok = 1 ]; check "el manager delega, el worker recibe la tarea, responde y el resultado vuelve al manager" $?
 galgo tasks --pane jefe147 | grep -q "lista"; check "la tarea queda lista en el registro" $?
 galgo read w147 | grep -q "tarea #"; check "el texto llegó al worker pegado en su terminal" $?
-export PATH="$ANTES_PATH"; unset TMP_ARGS_DIR
+export PATH="$ANTES_PATH"; unset TMP_ARGS_DIR TMP_FAKE_DIR DESTINO
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]
