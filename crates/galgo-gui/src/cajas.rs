@@ -100,12 +100,13 @@ fn discontinua(c: u32, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
     Some(v)
 }
 
-/// Líneas dobles (U+2550–U+256C), puras o mezcladas con simples. Cada brazo es uno o dos trazos (dos si es doble) y se
-/// engancha en la barra perpendicular del mismo modo en todos los casos:
-/// - un brazo horizontal arranca en `x0`: en la línea interior de la barra vertical si esa barra es doble en los dos
-///   lados; en la exterior si solo lo es en un lado; en el centro si no hay barra doble. Lo mismo, en vertical, con `y0`.
-/// - los dobles van a `±d` del centro; los simples llegan al centro o al borde de la barra que cruzan.
-/// Así las esquinas (╔ ╗ ╚ ╝), las uniones (╠ ╣ ╦ ╩) y las cruces (╬ ╪ ╫) cierran sin huecos.
+/// Líneas dobles (U+2550–U+256C), puras o mezcladas con simples. Cada línea doble es una pareja de trazos a ±d del
+/// centro, y cada trazo termina donde se engancha con la línea de la barra perpendicular que le corresponde:
+/// - en una esquina o una unión, la línea exterior con la exterior y la interior con la interior, así que anidan
+///   (╔: el trazo exterior arranca en x = cx − dx y el interior en x = cx + dx, sin sobresalir);
+/// - si la barra es doble solo en un lado, la exterior de ese lado es la del lado opuesto al brazo;
+/// - si la barra es doble en los dos lados, cada trazo llega a la línea interior de la barra;
+/// - si las dos mitades de una línea se solapan (la barra no se corta en ese trazo), se dibuja entera.
 fn mezcla(c: u32, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
     // (izquierda, derecha, arriba, abajo): 0 = no hay, 1 = simple, 2 = doble.
     let (l, r, u, d) = match c {
@@ -127,55 +128,101 @@ fn mezcla(c: u32, w: f32, h: f32, ligero: f32) -> Option<Vec<Prim>> {
     let h_una = (l == 2) != (r == 2);
     let v_ambos = u == 2 && d == 2;
     let v_una = (u == 2) != (d == 2);
-    let trazo = |a: (f32, f32), b: (f32, f32)| Prim::Linea { a, b, grosor: ligero };
-    let mut v = Vec::new();
-    // Dos simples opuestos que cruzan sin cortarse en la barra se dibujan como una sola línea (no solapados).
+    // Lado del único brazo doble de cada eje (si lo hay): la línea exterior de la barra es la del lado contrario.
+    let sx_una = if l == 2 { -1.0f32 } else { 1.0 };
+    let sy_una = if u == 2 { -1.0f32 } else { 1.0 };
+    // Simples opuestos que cruzan la barra sin cortarse: una sola línea entera (no solapada).
     let h_entera = l == 1 && r == 1 && !v_ambos;
     let v_entera = u == 1 && d == 1 && !h_ambos;
+    let trazo = |a: (f32, f32), b: (f32, f32)| Prim::Linea { a, b, grosor: ligero };
+    // Final, junto al centro, del trazo horizontal de desplazamiento `o` (−1 arriba, +1 abajo) del lado `sx`.
+    let fin_x = |sx: f32, o: f32| -> f32 {
+        if v_ambos {
+            cx + sx * dx
+        } else if v_una {
+            if o == -sy_una { cx - sx * dx } else { cx + sx * dx }
+        } else {
+            cx
+        }
+    };
+    // Final, junto al centro, del trazo vertical de desplazamiento `p` (−1 izquierda, +1 derecha) del lado `sy`.
+    let fin_y = |sy: f32, p: f32| -> f32 {
+        if h_ambos {
+            cy + sy * dy
+        } else if h_una {
+            if p == -sx_una { cy - sy * dy } else { cy + sy * dy }
+        } else {
+            cy
+        }
+    };
+    let mut v = Vec::new();
     if h_entera {
         v.push(trazo((0.0, cy), (w, cy)));
     }
     if v_entera {
         v.push(trazo((cx, 0.0), (cx, h)));
     }
-    for (p, sx) in [(l, -1.0f32), (r, 1.0)] {
-        if p == 0 || h_entera {
-            continue;
-        }
-        let x0 = if v_ambos {
-            cx + sx * dx
-        } else if v_una {
-            cx - sx * dx
-        } else {
-            cx
-        };
-        let (a, b) = if sx < 0.0 { (0.0, x0) } else { (x0, w) };
-        if p == 2 {
-            for o in [-dy, dy] {
-                v.push(trazo((a, cy + o), (b, cy + o)));
+    // Líneas dobles horizontales: el lado izquierdo y el derecho de cada una; se funden si se solapan.
+    if l == 2 || r == 2 {
+        for o in [-1.0f32, 1.0] {
+            let y = cy + o * dy;
+            let izq = (l == 2).then(|| fin_x(-1.0, o));
+            let der = (r == 2).then(|| fin_x(1.0, o));
+            match (izq, der) {
+                (Some(a), Some(b)) if a > b => v.push(trazo((0.0, y), (w, y))),
+                _ => {
+                    if let Some(a) = izq {
+                        v.push(trazo((0.0, y), (a, y)));
+                    }
+                    if let Some(b) = der {
+                        v.push(trazo((b, y), (w, y)));
+                    }
+                }
             }
-        } else {
-            v.push(trazo((a, cy), (b, cy)));
+        }
+    }
+    // Líneas dobles verticales.
+    if u == 2 || d == 2 {
+        for p in [-1.0f32, 1.0] {
+            let x = cx + p * dx;
+            let arr = (u == 2).then(|| fin_y(-1.0, p));
+            let aba = (d == 2).then(|| fin_y(1.0, p));
+            match (arr, aba) {
+                (Some(a), Some(b)) if a > b => v.push(trazo((x, 0.0), (x, h))),
+                _ => {
+                    if let Some(a) = arr {
+                        v.push(trazo((x, 0.0), (x, a)));
+                    }
+                    if let Some(b) = aba {
+                        v.push(trazo((x, b), (x, h)));
+                    }
+                }
+            }
+        }
+    }
+    // Brazos simples: llegan al centro, o a la línea de la barra doble que cruzan.
+    for (p, sx) in [(l, -1.0f32), (r, 1.0)] {
+        if p == 1 && !h_entera {
+            let x0 = if v_ambos {
+                cx + sx * dx
+            } else if v_una {
+                cx - sx * dx
+            } else {
+                cx
+            };
+            v.push(if sx < 0.0 { trazo((0.0, cy), (x0, cy)) } else { trazo((x0, cy), (w, cy)) });
         }
     }
     for (p, sy) in [(u, -1.0f32), (d, 1.0)] {
-        if p == 0 || v_entera {
-            continue;
-        }
-        let y0 = if h_ambos {
-            cy + sy * dy
-        } else if h_una {
-            cy - sy * dy
-        } else {
-            cy
-        };
-        let (a, b) = if sy < 0.0 { (0.0, y0) } else { (y0, h) };
-        if p == 2 {
-            for o in [-dx, dx] {
-                v.push(trazo((cx + o, a), (cx + o, b)));
-            }
-        } else {
-            v.push(trazo((cx, a), (cx, b)));
+        if p == 1 && !v_entera {
+            let y0 = if h_ambos {
+                cy + sy * dy
+            } else if h_una {
+                cy - sy * dy
+            } else {
+                cy
+            };
+            v.push(if sy < 0.0 { trazo((cx, 0.0), (cx, y0)) } else { trazo((cx, y0), (cx, h)) });
         }
     }
     Some(v)
@@ -372,6 +419,57 @@ mod tests_dobles {
         assert_eq!(v.len(), 4, "dos trazos horizontales y dos verticales");
         assert!(v.contains(&Prim::Linea { a: (2.5, 5.0), b: (10.0, 5.0), grosor: 1.0 }), "{v:?}");
         assert!(v.contains(&Prim::Linea { a: (2.5, 5.0), b: (2.5, 20.0), grosor: 1.0 }), "{v:?}");
+    }
+
+    /// La esquina ╔ anida: el trazo interior arranca en la línea interior de cada eje (x = 7.5, y = 15), sin cruzar
+    /// el exterior ni sobresalir de él.
+    #[test]
+    fn la_esquina_doble_anida_sin_sobresalir() {
+        let v = primitivas('╔', 10.0, 20.0, 1.0).unwrap();
+        let mut esperado = vec![
+            Prim::Linea { a: (2.5, 5.0), b: (10.0, 5.0), grosor: 1.0 },
+            Prim::Linea { a: (7.5, 15.0), b: (10.0, 15.0), grosor: 1.0 },
+            Prim::Linea { a: (2.5, 5.0), b: (2.5, 20.0), grosor: 1.0 },
+            Prim::Linea { a: (7.5, 15.0), b: (7.5, 20.0), grosor: 1.0 },
+        ];
+        let mut obtenido = v.clone();
+        let clave = |p: &Prim| format!("{p:?}");
+        obtenido.sort_by_key(clave);
+        esperado.sort_by_key(clave);
+        assert_eq!(obtenido, esperado);
+    }
+
+    /// Ningún par de trazos paralelos se solapa, en ningún carácter de líneas dobles (si no, se verían más gruesos).
+    #[test]
+    fn ningun_trazo_doble_se_solapa_ni_sale_de_la_celda() {
+        let (w, h) = (10.0f32, 20.0f32);
+        for c in 0x2550u32..=0x256C {
+            let ch = char::from_u32(c).unwrap();
+            let v = primitivas(ch, w, h, 1.0).unwrap();
+            for p in &v {
+                let Prim::Linea { a, b, .. } = p else { continue };
+                for q in [a, b] {
+                    assert!((0.0..=w).contains(&q.0) && (0.0..=h).contains(&q.1), "{ch}: {p:?} sale de la celda");
+                }
+            }
+            for (i, p) in v.iter().enumerate() {
+                for q in &v[i + 1..] {
+                    let (Prim::Linea { a: a1, b: b1, .. }, Prim::Linea { a: a2, b: b2, .. }) = (p, q) else { continue };
+                    let horizontal = |a: &(f32, f32), b: &(f32, f32)| (a.1 - b.1).abs() < 1e-3;
+                    let vertical = |a: &(f32, f32), b: &(f32, f32)| (a.0 - b.0).abs() < 1e-3;
+                    if horizontal(a1, b1) && horizontal(a2, b2) && (a1.1 - a2.1).abs() < 1e-3 {
+                        let (x1, x2) = (a1.0.min(b1.0), a1.0.max(b1.0));
+                        let (y1, y2) = (a2.0.min(b2.0), a2.0.max(b2.0));
+                        assert!(x2 <= y1 + 1e-3 || y2 <= x1 + 1e-3, "{ch}: {p:?} y {q:?} se solapan");
+                    }
+                    if vertical(a1, b1) && vertical(a2, b2) && (a1.0 - a2.0).abs() < 1e-3 {
+                        let (y1, y2) = (a1.1.min(b1.1), a1.1.max(b1.1));
+                        let (z1, z2) = (a2.1.min(b2.1), a2.1.max(b2.1));
+                        assert!(y2 <= z1 + 1e-3 || z2 <= y1 + 1e-3, "{ch}: {p:?} y {q:?} se solapan");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
