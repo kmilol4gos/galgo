@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 libc = "0.2"
 iced = { version = "0.13", features = ["tokio", "lazy", "canvas"] }
+iced_graphics = "0.13"
 galgo-proto = { path = "../galgo-proto" }
 galgo-usage = { path = "../galgo-usage" }
 serde = { version = "1", features = ["derive"] }

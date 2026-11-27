@@ -37,8 +37,9 @@ pub fn connect() -> Result<UnixStream> {
     let mut child = cmd
         .spawn()
         .with_context(|| format!("no pude iniciar {}", galgod.display()))?;
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(100));
+    // El daemon responde en pocos ms: se sondea cada 5 ms (antes, 100 ms fijos), con el mismo límite de 5 s.
+    for _ in 0..1000 {
+        std::thread::sleep(Duration::from_millis(5));
         if let Ok(s) = UnixStream::connect(&path) {
             return Ok(s);
         }

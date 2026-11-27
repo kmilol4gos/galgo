@@ -917,6 +917,7 @@ fn names(app: &App) -> Vec<&str> {
 /// Abre una terminal en `path`. Con `agrupar` (Cmd+Shift+N) el workspace se llama como la carpeta, numerado si ya
 /// existe, y se agrupa en la barra. Sin carpeta que elegir: la terminal hereda el cwd del panel enfocado.
 fn open_terminal(app: &mut App, path: String, agrupar: bool) -> Task<Message> {
+    traza("shell: petición de spawn");
     let (rows, cols) = grid_for(app.window);
     let grupo = agrupar.then(|| {
         let base = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "workspace".into());
@@ -976,10 +977,21 @@ fn request(req: Request) -> Result<serde_json::Value, String> {
     if response.ok { Ok(response.data) } else { Err(response.error.unwrap_or_else(|| "Error del daemon".into())) }
 }
 
+/// Lista de paneles pedida al daemon en un hilo al arrancar, en paralelo con la ventana (la toma la primera `load_panes`).
+/// Lista de paneles pedida al daemon en un hilo al arrancar, en paralelo con la ventana (la toma la primera `load_panes`).
+static LISTA_PREVIA: std::sync::Mutex<Option<Result<Vec<PaneInfo>, String>>> = std::sync::Mutex::new(None);
+
 fn load_panes() -> Task<Message> {
+    if let Some(lista) = LISTA_PREVIA.lock().unwrap().take() {
+        traza("daemon: lista previa (ya pedida al arrancar)");
+        return Task::done(Message::Panes(lista));
+    }
     Task::perform(async {
-        tokio::task::spawn_blocking(|| serde_json::from_value(request(Request::List)?).map_err(|e| e.to_string()))
-            .await.map_err(|e| e.to_string())?
+        traza("daemon: petición de lista enviada");
+        let r = tokio::task::spawn_blocking(|| serde_json::from_value(request(Request::List)?).map_err(|e| e.to_string()))
+            .await.map_err(|e| e.to_string())?;
+        traza("daemon: lista respondida");
+        r
     }, Message::Panes)
 }
 
@@ -2461,6 +2473,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::batch(ids.into_iter().map(|id| send_request(Request::Kill { pane: id.to_string() }, |_| Message::Echo)))
         }
         Message::WorkspaceOpened(_, Ok(data)) => {
+            traza("shell: spawn respondido");
             app.error = None;
             match serde_json::from_value::<PaneInfo>(data) {
                 Ok(p) => {
@@ -2497,6 +2510,9 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Panes(result) => {
+            if result.is_ok() {
+                traza_una_vez(1, "daemon: lista de paneles recibida");
+            }
             app.listing = false;
             let mut arranque = None;
             let mut envios = Task::none();
@@ -2587,6 +2603,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                         app.snap_gen = if same_view { Some(gen) } else { None };
                     }
                     Ok(ScreenReply::Full(snap)) => {
+                        traza_una_vez(2, "primer snapshot recibido");
                         app.error = None;
                         // El daemon puede haber recortado el desplazamiento al historial disponible.
                         app.scroll = app.scroll.min(snap.scrollback_max);
@@ -3102,6 +3119,10 @@ fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle, resa
 }
 
 fn view(app: &App) -> Element<'_, Message> {
+    traza_una_vez(0, "primera vista (la ventana dibuja)");
+    if app.snap.is_some() {
+        traza_una_vez(3, "primer pintado con contenido del panel");
+    }
     let main: Element<'_, Message> = if app.panes.is_empty() && app.ws_pendiente.is_none() {
         chrome::welcome_view(app)
     } else {
@@ -3133,7 +3154,44 @@ fn view(app: &App) -> Element<'_, Message> {
     }
 }
 
+/// Traza de arranque (`GALGO_TRACE_STARTUP=1`): tiempo desde el inicio de `main` en cada fase, a stderr. Sin la variable
+/// no cuesta nada más que una comprobación.
+static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static TRAZA_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Hitos que solo se imprimen una vez: bit 0 primera vista, 1 lista de paneles, 2 primer snapshot, 3 primer pintado con texto.
+static HITOS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn traza(fase: &str) {
+    if !*TRAZA_ON.get_or_init(|| std::env::var_os("GALGO_TRACE_STARTUP").is_some()) {
+        return;
+    }
+    let t0 = *T0.get_or_init(std::time::Instant::now);
+    eprintln!("ARRANQUE {:>9.1} ms  {fase}", t0.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// Imprime `fase` la primera vez que se pide el hito `bit`.
+fn traza_una_vez(bit: u8, fase: &str) {
+    if HITOS.fetch_or(1 << bit, std::sync::atomic::Ordering::Relaxed) & (1 << bit) == 0 {
+        traza(fase);
+    }
+}
+
 fn main() -> iced::Result {
+    T0.get_or_init(std::time::Instant::now);
+    traza("main");
+    // Mientras iced crea la ventana (lo más caro del arranque), el daemon se conecta, se arranca si hace falta, y se
+    // pide la lista de paneles. Así, cuando la app la pide, ya está.
+    // Indexar las fuentes del sistema (lo hace iced al primer texto, dentro de la ventana) en paralelo con ella.
+    std::thread::spawn(|| {
+        traza("fuentes del sistema: indexado iniciado");
+        let _ = iced_graphics::text::font_system();
+        traza("fuentes del sistema: indexado listo");
+    });
+    std::thread::spawn(|| {
+        let lista = request(Request::List).and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()));
+        traza("hilo previo: lista del daemon");
+        *LISTA_PREVIA.lock().unwrap() = Some(lista);
+    });
     iced::application(app_title, update, view)
         .theme(|_| theme::app())
         // Rex: fuente monoespaciada en toda la interfaz, no solo en el terminal.
@@ -3197,6 +3255,7 @@ fn main() -> iced::Result {
                 prefs_path: Some(prefs),
                 ..Default::default()
             };
+            traza("app creada (fuentes detectadas)");
             sync_chrome(&app);
             // Símbolos Nerd Font empaquetados: se cargan en el sistema de fuentes antes de usarse.
             let simbolos = iced::font::load(std::borrow::Cow::Borrowed(SYMBOLS_FONT)).map(|_| Message::Echo);
