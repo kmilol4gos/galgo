@@ -278,51 +278,65 @@ fn group_pill<'a>(app: &'a App, key: String, pestanas: Vec<Element<'a, Message>>
     container(fila).padding([0, 8]).height(Length::Fixed(TABS_H - 8.0)).center_y(Length::Fixed(TABS_H - 8.0)).style(theme::group).into()
 }
 
+/// Botón de una pestaña del workspace `key` (en la posición `i`); `active` si es la visible con el foco.
+fn boton_pestana<'a>(app: &'a App, key: &str, i: usize, tab: &layout::Tab, active: bool) -> Element<'a, Message> {
+    let pane = app.panes.iter().find(|p| p.id == tab.focus);
+    let name = pane.map_or("?".to_string(), titulo_pestana);
+    let n = tab.root.ids().len();
+    // Un shell normal es solo su nombre. Un agente real (lanzado por galgo o con hooks) suma su estado y, si
+    // espera algo de ti, un contador de pendientes.
+    let mut label = row![text(name.clone()).size(theme::BODY_SIZE)].spacing(7).align_y(Alignment::Center);
+    if let Some(p) = pane.filter(|p| p.agent) {
+        label = label.push(dot(theme::status_color(p.status), 6.0));
+        let pendientes = p.unacked + usize::from(p.status == Status::Blocked);
+        if pendientes > 0 {
+            label = label.push(text(pendientes.to_string()).size(10).color(theme::BLOCKED));
+        }
+    }
+    if n > 1 {
+        let zoomed = active && maximized(app).is_some();
+        label = label.push(text(if zoomed { format!("1/{n}") } else { format!("{n}") }).size(10).color(if zoomed { theme::ACCENT } else { theme::DIM }));
+    }
+    if active {
+        // Cerrar el panel enfocado de la pestaña (con confirmación en la barra de estado si sigue vivo).
+        label = label.push(theme::btn(text("×").size(13).color(theme::DIM)).padding([0, 4]).on_press(Message::AskClose));
+    }
+    // Icono de terminal (>_) delante del título: el proceso y el cwd se leen de un vistazo.
+    let label = row![text(">_").size(theme::SMALL_SIZE).color(theme::DIM), label].spacing(6).align_y(Alignment::Center);
+    let b = theme::btn(container(label).padding([0, 14]).center_y(Length::Fixed(TABS_H - 6.0)))
+        .padding(0)
+        .on_press(Message::SelectTabIn(key.to_string(), i))
+        .style(theme::tab(active));
+    b.into()
+}
+
 pub fn tabs_bar(app: &App) -> Element<'_, Message> {
-    let focus = focus_key(app);
     // Una sola fila (terminal primero): sin miga; el hueco de los semáforos de macOS arrastra la ventana.
     let mut bar = row![mouse_area(Space::with_width(78.0)).on_press(Message::DragWindow)].spacing(4).align_y(Alignment::Center).height(TABS_H - 1.0);
     // P0: salen TODAS las pestañas de todos los workspaces. Solo se agrupan (píldora) los workspaces que el usuario
     // creó con nombre; los deducidos por git (nexo/main…) son pestañas sueltas en la misma fila.
-    for (key, ws) in &app.layouts.by_key {
-        let mut pestanas: Vec<Element<'_, Message>> = Vec::new();
-        for (i, tab) in ws.tabs.iter().enumerate() {
-            let pane = app.panes.iter().find(|p| p.id == tab.focus);
-            let name = pane.map_or("?".to_string(), titulo_pestana);
-            let active = focus.as_deref() == Some(key.as_str()) && i == ws.active;
-            let n = tab.root.ids().len();
-            // Un shell normal es solo su nombre. Un agente real (lanzado por galgo o con hooks) suma su estado y, si
-            // espera algo de ti, un contador de pendientes.
-            let mut label = row![text(name.clone()).size(theme::BODY_SIZE)].spacing(7).align_y(Alignment::Center);
-            if let Some(p) = pane.filter(|p| p.agent) {
-                label = label.push(dot(theme::status_color(p.status), 6.0));
-                let pendientes = p.unacked + usize::from(p.status == Status::Blocked);
-                if pendientes > 0 {
-                    label = label.push(text(pendientes.to_string()).size(10).color(theme::BLOCKED));
-                }
-            }
-            if n > 1 {
-                let zoomed = active && maximized(app).is_some();
-                label = label.push(text(if zoomed { format!("1/{n}") } else { format!("{n}") }).size(10).color(if zoomed { theme::ACCENT } else { theme::DIM }));
-            }
-            if active {
-                // Cerrar el panel enfocado de la pestaña (con confirmación en la barra de estado si sigue vivo).
-                label = label.push(theme::btn(text("×").size(13).color(theme::DIM)).padding([0, 4]).on_press(Message::AskClose));
-            }
-            // Icono de terminal (>_) delante del título: el proceso y el cwd se leen de un vistazo.
-            let label = row![text(">_").size(theme::SMALL_SIZE).color(theme::DIM), label].spacing(6).align_y(Alignment::Center);
-            let b = theme::btn(container(label).padding([0, 14]).center_y(Length::Fixed(TABS_H - 6.0)))
-                .padding(0)
-                .on_press(Message::SelectTabIn(key.clone(), i))
-                .style(theme::tab(active));
-            pestanas.push(b.into());
-        }
+    // Todas las pestañas, en el orden en que se crearon, sin importar el workspace. Un workspace con nombre se agrupa
+    // en su píldora (en la posición de su primera pestaña); el resto son pestañas sueltas.
+    let focus = focus_key(app);
+    let mut agrupados: Vec<&str> = Vec::new();
+    for (key, i) in app.layouts.en_orden() {
+        let tab = &app.layouts.by_key[key].tabs[i];
+        let active = focus.as_deref() == Some(key.as_str()) && i == app.layouts.by_key[key].active;
         if app.explicit.contains_key(key) {
+            if agrupados.contains(&key.as_str()) {
+                continue;
+            }
+            agrupados.push(key.as_str());
+            let ws = &app.layouts.by_key[key];
+            let pestanas: Vec<Element<'_, Message>> = ws
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(j, t)| boton_pestana(app, key, j, t, focus.as_deref() == Some(key.as_str()) && j == ws.active))
+                .collect();
             bar = bar.push(group_pill(app, key.clone(), pestanas));
         } else {
-            for p in pestanas {
-                bar = bar.push(p);
-            }
+            bar = bar.push(boton_pestana(app, key, i, tab, active));
         }
     }
     // Con un solo panel no hay cabecera en el marco: sus acciones de split van aquí, en la barra superior.

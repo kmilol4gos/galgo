@@ -93,7 +93,7 @@ pub fn snapshot(
         for tab in &ws.tabs {
             let Some(tree) = tree_to_json(&tab.root, nombre) else { continue };
             let focus = nombre(tab.focus).or_else(|| tab.root.ids().first().and_then(|id| nombre(*id)));
-            tabs.push(json!({ "focus": focus, "tree": tree }));
+            tabs.push(json!({ "focus": focus, "tree": tree, "orden": tab.orden }));
         }
         if tabs.is_empty() {
             continue;
@@ -134,13 +134,17 @@ pub fn restore(v: &Value, id_de: &dyn Fn(&str) -> Option<u32>) -> Restored {
     let Some(list) = v.get("workspaces").and_then(Value::as_array) else { return out };
     // review-15 B4: un panel está en una sola hoja de todo lo restaurado (si no, se pintaría dos veces).
     let mut vistos = std::collections::HashSet::new();
+    // Sin «orden» (guardados antiguos): se numeran en el orden en que vienen.
+    let mut sin_orden = 0u64;
     for ws in list.iter().take(MAX_WORKSPACES) {
         let Some(key) = ws.get("key").and_then(Value::as_str).filter(|k| !k.is_empty() && k.len() <= 200) else { continue };
         let mut tabs = Vec::new();
         for t in ws.get("tabs").and_then(Value::as_array).into_iter().flatten().take(MAX_TABS) {
             let Some(root) = t.get("tree").and_then(|tree| json_to_tree(tree, id_de)).and_then(|r| sin_repetidos(r, &mut vistos)) else { continue };
             let focus = t.get("focus").and_then(Value::as_str).and_then(id_de).filter(|f| root.ids().contains(f)).unwrap_or(root.ids()[0]);
-            tabs.push(Tab { root, focus });
+            let orden = t.get("orden").and_then(Value::as_u64).unwrap_or(sin_orden);
+            sin_orden += 1;
+            tabs.push(Tab { root, focus, orden });
         }
         if tabs.is_empty() {
             continue;
@@ -211,8 +215,8 @@ mod tests {
             "nexo".to_string(),
             WsTabs {
                 tabs: vec![
-                    Tab { root: Node::Leaf(1), focus: 1 },
-                    Tab { root: Node::Split { vertical: true, ratio: 0.5, a: Box::new(Node::Leaf(2)), b: Box::new(Node::Leaf(3)) }, focus: 3 },
+                    Tab { root: Node::Leaf(1), focus: 1, orden: 0 },
+                    Tab { root: Node::Split { vertical: true, ratio: 0.5, a: Box::new(Node::Leaf(2)), b: Box::new(Node::Leaf(3)) }, focus: 3, orden: 1 },
                 ],
                 active: 1,
             },

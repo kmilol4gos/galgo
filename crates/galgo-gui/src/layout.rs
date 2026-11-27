@@ -212,6 +212,9 @@ pub fn neighbor(rects: &[(u32, Rect)], from: u32, dir: Dir) -> Option<u32> {
 pub struct Tab {
     pub root: Node,
     pub focus: u32,
+    /// Orden de creación en toda la fila: las pestañas de todos los workspaces se muestran por este número, así que
+    /// sobrevive a `galgo stop` (se guarda) y no depende de la clave del workspace.
+    pub orden: u64,
 }
 
 /// Las pestañas de un workspace y cuál está visible.
@@ -225,6 +228,8 @@ pub struct WsTabs {
 #[derive(Debug, Clone, Default)]
 pub struct Layouts {
     pub by_key: BTreeMap<String, WsTabs>,
+    /// Siguiente número de orden para una pestaña nueva.
+    pub siguiente: u64,
 }
 
 impl Layouts {
@@ -235,7 +240,7 @@ impl Layouts {
             // Cada pestaña se reconstruye sin los paneles que ya no existen; si no le queda ninguno, se va.
             let old = std::mem::take(&mut ws.tabs);
             for tab in old {
-                let focus = tab.focus;
+                let (focus, orden) = (tab.focus, tab.orden);
                 let mut root = Some(tab.root.clone());
                 for id in tab.root.ids() {
                     if !panes.iter().any(|(p, _)| *p == id) {
@@ -243,7 +248,7 @@ impl Layouts {
                     }
                 }
                 if let Some(root) = root {
-                    ws.tabs.push(Tab { root, focus });
+                    ws.tabs.push(Tab { root, focus, orden });
                 }
             }
             ws.active = ws.active.min(ws.tabs.len().saturating_sub(1));
@@ -268,11 +273,30 @@ impl Layouts {
     /// Pestaña nueva con el panel `id`. G1: solo se activa si el workspace no tenía pestañas; un panel que llega de
     /// fuera no cambia lo que se ve. Quien crea el panel y quiere verlo llama a `focus`.
     pub fn new_tab(&mut self, key: &str, id: u32) {
+        let vacio = self.by_key.get(key).map_or(true, |ws| ws.tabs.is_empty());
+        self.push_tab(key, Node::Leaf(id), id);
+        if vacio {
+            if let Some(ws) = self.by_key.get_mut(key) {
+                ws.active = 0;
+            }
+        }
+    }
+
+    /// Añade una pestaña al final del workspace `key` con el siguiente número de orden. Devuelve su índice.
+    pub fn push_tab(&mut self, key: &str, root: Node, focus: u32) -> usize {
+        let orden = self.siguiente;
+        self.siguiente += 1;
         let ws = self.by_key.entry(key.to_string()).or_default();
-        let was_empty = ws.tabs.is_empty();
-        ws.tabs.push(Tab { root: Node::Leaf(id), focus: id });
-        if was_empty {
-            ws.active = 0;
+        ws.tabs.push(Tab { root, focus, orden });
+        ws.tabs.len() - 1
+    }
+
+    /// Carga pestañas restauradas (con su orden guardado) y deja el contador por encima de todas.
+    pub fn cargar(&mut self, restauradas: BTreeMap<String, WsTabs>) {
+        for (key, ws) in restauradas {
+            let mas_alto = ws.tabs.iter().map(|t| t.orden + 1).max().unwrap_or(0);
+            self.siguiente = self.siguiente.max(mas_alto);
+            self.by_key.insert(key, ws);
         }
     }
 
@@ -323,6 +347,17 @@ impl Layouts {
         }
     }
 
+    /// Pestañas de todos los workspaces en el orden de la fila: (clave, índice dentro de su workspace).
+    pub fn en_orden(&self) -> Vec<(&String, usize)> {
+        let mut v: Vec<(u64, &String, usize)> = self
+            .by_key
+            .iter()
+            .flat_map(|(k, ws)| ws.tabs.iter().enumerate().map(move |(i, t)| (t.orden, k, i)))
+            .collect();
+        v.sort_by_key(|t| t.0);
+        v.into_iter().map(|(_, k, i)| (k, i)).collect()
+    }
+
     /// Clave del workspace que contiene `id`.
     pub fn key_of(&self, id: u32) -> Option<String> {
         self.by_key.iter().find(|(_, ws)| ws.tabs.iter().any(|t| t.root.ids().contains(&id))).map(|(k, _)| k.clone())
@@ -332,6 +367,33 @@ impl Layouts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La fila sigue el orden de creación aunque los workspaces tengan claves distintas (no el orden alfabético).
+    #[test]
+    fn la_fila_sigue_el_orden_de_creacion_entre_workspaces() {
+        let mut l = Layouts::default();
+        l.new_tab("zeta", 1);
+        l.new_tab("alfa", 2);
+        l.new_tab("zeta", 3);
+        let orden: Vec<(String, usize)> = l.en_orden().into_iter().map(|(k, i)| (k.clone(), i)).collect();
+        assert_eq!(orden, vec![("zeta".to_string(), 0), ("alfa".to_string(), 0), ("zeta".to_string(), 1)]);
+    }
+
+    /// Tras restaurar, el orden guardado manda y las pestañas nuevas van detrás de todas.
+    #[test]
+    fn el_orden_restaurado_se_conserva_y_lo_nuevo_va_al_final() {
+        let tab = |id: u32, orden: u64| Tab { root: Node::Leaf(id), focus: id, orden };
+        let mut por_clave = BTreeMap::new();
+        por_clave.insert("alfa".to_string(), WsTabs { tabs: vec![tab(2, 1)], active: 0 });
+        por_clave.insert("zeta".to_string(), WsTabs { tabs: vec![tab(1, 0), tab(3, 2)], active: 1 });
+        let mut l = Layouts::default();
+        l.cargar(por_clave);
+        let orden: Vec<(String, usize)> = l.en_orden().into_iter().map(|(k, i)| (k.clone(), i)).collect();
+        assert_eq!(orden, vec![("zeta".to_string(), 0), ("alfa".to_string(), 0), ("zeta".to_string(), 1)]);
+        assert_eq!(l.by_key["zeta"].active, 1, "la activa se mantiene");
+        l.new_tab("alfa", 9);
+        assert_eq!(l.en_orden().last().map(|(k, i)| (k.as_str(), *i)), Some(("alfa", 1)));
+    }
 
     fn area() -> Rect {
         Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 }

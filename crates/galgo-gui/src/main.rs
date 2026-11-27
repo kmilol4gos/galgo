@@ -1616,9 +1616,7 @@ fn intentar_restaurar(app: &mut App) -> Task<Message> {
     let ids: std::collections::HashMap<String, u32> = app.panes.iter().map(|p| (p.name.clone(), p.id)).collect();
     let r = workspace::restore(&v, &|n| ids.get(n).copied());
     app.explicit = r.explicit;
-    for (k, ws) in r.by_key {
-        app.layouts.by_key.insert(k, ws);
-    }
+    app.layouts.cargar(r.by_key);
     app.ws_pendiente = None;
     app.ws_restored = true;
     Task::batch(tareas)
@@ -2199,9 +2197,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             // Layout automático: el manager a la izquierda y los workers apilados a la derecha, en una pestaña nueva.
             let foco = manager_id.or(trabajadores.first().copied());
             if let (Some(root), Some(foco)) = (team_tree(manager_id, &trabajadores), foco) {
-                let ws = app.layouts.by_key.entry(key).or_default();
-                ws.tabs.push(layout::Tab { root, focus: foco });
-                ws.active = ws.tabs.len() - 1;
+                let i = app.layouts.push_tab(&key, root, foco);
+                if let Some(ws) = app.layouts.by_key.get_mut(&key) {
+                    ws.active = i;
+                }
                 return Task::batch([load_panes(), select(app, foco)]);
             }
             load_panes()
@@ -4440,6 +4439,7 @@ mod render {
                         b: Box::new(layout::Node::Split { vertical: false, ratio: 0.5, a: Box::new(layout::Node::Leaf(2)), b: Box::new(layout::Node::Leaf(3)) }),
                     },
                     focus: 1,
+                    orden: 0,
                 }],
                 active: 0,
             },
