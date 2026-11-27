@@ -184,6 +184,8 @@ struct App {
     error: Option<String>,
     loading: bool,
     listing: bool,
+    /// Ya llegó la primera lista de paneles (el arranque solo decide una vez si abre un shell).
+    started: bool,
     window: (f32, f32),
     /// Último tamaño (filas, columnas) enviado o confirmado por panel (M3: cada panel del layout tiene el suyo).
     sizes: std::collections::HashMap<u32, (u16, u16)>,
@@ -1466,10 +1468,19 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Panes(result) => {
             app.listing = false;
+            let mut arranque = None;
             match result {
                 Ok(panes) => {
                     app.error = None;
                     app.panes = panes;
+                    // Abrir la app ya es un terminal: si el daemon no tiene paneles, un shell en ~ (la bienvenida queda
+                    // solo para cuando no se puede crear el panel).
+                    if !app.started {
+                        app.started = true;
+                        if app.panes.is_empty() {
+                            arranque = Some(open_folder(app, home_dir()));
+                        }
+                    }
                     app.layouts.sync(&pane_keys(app));
                     app.others.retain(|id, _| app.panes.iter().any(|p| p.id == *id));
                     app.others_gen.retain(|id, _| app.panes.iter().any(|p| p.id == *id));
@@ -1501,7 +1512,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.snap_gen = None;
                 }
             }
-            Task::none()
+            arranque.unwrap_or_else(Task::none)
         }
         Message::Screen(id, offset, sent_since, result) => {
             app.loading = false;
@@ -2377,6 +2388,16 @@ mod tests {
         let _ = update(&mut app, Message::Limits(Err("sin daemon".into())));
         assert_eq!(app.limits.len(), 1, "las últimas cuotas se conservan");
         assert_eq!(app.limits_error.as_deref(), Some("sin daemon"));
+    }
+
+    /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la
+    /// bienvenida no aparece en el flujo normal.
+    #[test]
+    fn primer_arranque_sin_paneles_marca_el_inicio() {
+        let mut app = App::default();
+        let _ = update(&mut app, Message::Panes(Ok(vec![])));
+        assert!(app.started);
+        assert!(app.panes.is_empty());
     }
 
     /// A: el cuerpo muestra la bienvenida sin paneles; «Nuevo workspace» tiene prioridad sobre el resto.
