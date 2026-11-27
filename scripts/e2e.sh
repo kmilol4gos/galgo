@@ -856,8 +856,9 @@ CODEX98_EOF
 # Codex se lanza DENTRO del panel z98: sus hooks salen de su propio panel (revisión 17, A2).
 out98=$(EP_TIMEOUT=6000 en_panel z98 "HOME98='$HOME98' python3 -I $TMP/codex98.py '$GALGO_SOCKET'; echo RC=\$?")
 rc98=$(echo "$out98" | sed -n 's/^RC=//p' | tail -1)
-[ "${rc98:-1}" = 0 ] && galgo inbox --pane m98 | grep -q 'respuesta real Codex' || rc98=1
-[ "${rc98:-1}" = 0 ] || echo "$out98" | tail -15
+# 77 = falta el programa (CI): debe llegar a check como «omitido», no convertirse en fallo.
+if [ "${rc98:-1}" = 0 ]; then galgo inbox --pane m98 | grep -q 'respuesta real Codex' || rc98=1; fi
+[ "${rc98:-1}" = 0 ] || [ "$rc98" = 77 ] || echo "$out98" | tail -15
 check "Codex real carga hooks y entrega Stop con servidor simulado" "${rc98:-1}"
 env -u CODEX_HOME HOME="$HOME98" galgo hooks uninstall codex --yes >/dev/null
 python3 -I - "$HOME98/.codex/hooks.json" "$TMP/original98.json" <<'PY98CHECK'
