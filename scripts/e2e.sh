@@ -1421,5 +1421,7 @@ while ev["event"] == "changed" and time.time() - t0 < 3:
 assert ev["event"] == "closed", ev
 PYEOF
 check "un cambio llega como aviso y el cierre también" $?
+galgo stop >/dev/null 2>&1
+export GALGO_SOCKET="$TMP/galgo.sock"
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]
