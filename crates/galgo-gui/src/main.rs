@@ -656,6 +656,37 @@ struct TeamPending {
     root: String,
     team: team::Team,
     fp: String,
+    /// Un integrado: se confirma igual que uno de repo, pero no se guarda confianza (no hay repo que recordar).
+    preset: bool,
+}
+
+/// Si `root` es un repositorio git (los worktrees de los workers lo necesitan).
+fn es_repo(root: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["-C", root, "rev-parse", "--show-toplevel"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Nombre de rama libre en el repo de `root`, a partir de `base`: `base`, `base-2`, `base-3`… (una rama existente no se
+/// reutiliza: el daemon la rechazaría).
+fn rama_libre(root: &str, base: &str) -> String {
+    let existe = |rama: &str| {
+        std::process::Command::new("git")
+            .args(["-C", root, "show-ref", "--verify", "--quiet", &format!("refs/heads/{rama}")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !existe(base) {
+        return base.to_string();
+    }
+    (2u32..)
+        .map(|n| format!("{base}-{n}"))
+        .take(50)
+        .find(|c| !existe(c))
+        .unwrap_or_else(|| format!("{base}-libre"))
 }
 
 /// De dónde sale un equipo a levantar: el `team.toml` del repo, o uno de los integrados.
@@ -719,6 +750,11 @@ fn launch_team(app: &mut App, key: Option<String>, root: String, team: team::Tea
         }
     };
     let (rows, cols) = grid_for(app.window);
+    // Fuera de un repo git no hay worktrees: los workers se lanzan en la carpeta, y se avisa (review-15 M5).
+    let en_repo = es_repo(&root);
+    if !en_repo && team.agents.iter().any(|a| a.isolation == launch::Isolation::Worktree) {
+        app.error = Some(format!("{root} no es un repo git: los agentes con worktree se lanzan en esa carpeta"));
+    }
     let mut reservados: Vec<String> = Vec::new();
     let mut manager_name: Option<String> = None;
     let mut trabajos = Vec::new();
@@ -732,7 +768,8 @@ fn launch_team(app: &mut App, key: Option<String>, root: String, team: team::Tea
             manager_name = Some(nombre.clone());
         }
         let cmd = a.provider.command_with(&login_shell(), a.model.as_deref());
-        let worktree = (a.isolation == launch::Isolation::Worktree).then(|| nombre.clone());
+        // Worktree: la rama es libre en el repo (`nombre`, `nombre-2`…), no una que ya existe.
+        let worktree = (a.isolation == launch::Isolation::Worktree && en_repo).then(|| rama_libre(&root, &nombre));
         let req = launch::agent_request(&nombre, cmd, &root, Some(key.clone()), manager, worktree, rows, cols);
         app.roles.insert(nombre.clone(), a.role.label().to_string());
         reservados.push(nombre.clone());
@@ -2039,7 +2076,11 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 let Some((_, team)) = team::presets().into_iter().nth(i) else { return Task::none() };
                 let cwd = focus_context(app).1.unwrap_or_else(home_dir);
                 let key = focus_key(app);
-                launch_team(app, key, repo_root(&cwd), team)
+                // review-15 M5: también un integrado se confirma antes de lanzar nada (crea agentes y ramas).
+                let root = repo_root(&cwd);
+                let fp = format!("preset:{i}");
+                app.team_pending = Some(TeamPending { key, root, team, fp, preset: true });
+                Task::none()
             }
             TeamSource::Repo => {
                 let key = focus_key(app);
@@ -2056,7 +2097,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                             launch_team(app, key, root, team)
                         } else {
                             // La primera vez (o si cambió): el equipo se muestra y no se lanza nada hasta confirmar.
-                            app.team_pending = Some(TeamPending { key, root, team, fp });
+                            app.team_pending = Some(TeamPending { key, root, team, fp, preset: false });
                             Task::none()
                         }
                     }
@@ -2065,13 +2106,15 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         },
         Message::TeamConfirm => {
             let Some(p) = app.team_pending.take() else { return Task::none() };
-            if !app.team_trust.is_object() {
-                app.team_trust = serde_json::json!({});
-            }
-            app.team_trust[p.root.as_str()] = serde_json::json!(p.fp);
-            if let Some(path) = &app.prefs_path {
-                if let Err(e) = prefs::set(path, "team_trust", app.team_trust.clone()) {
-                    eprintln!("galgo-gui: no pude guardar la confianza del equipo: {e}");
+            if !p.preset {
+                if !app.team_trust.is_object() {
+                    app.team_trust = serde_json::json!({});
+                }
+                app.team_trust[p.root.as_str()] = serde_json::json!(p.fp);
+                if let Some(path) = &app.prefs_path {
+                    if let Err(e) = prefs::set(path, "team_trust", app.team_trust.clone()) {
+                        eprintln!("galgo-gui: no pude guardar la confianza del equipo: {e}");
+                    }
                 }
             }
             launch_team(app, p.key, p.root, p.team)
@@ -3580,6 +3623,51 @@ mod tests {
         assert!(app.error.is_none(), "un nombre normal sí");
     }
 
+    /// review-15 M5: un integrado pide confirmación (y no guarda confianza); la rama de un worktree salta las que ya
+    /// existen en el repo; fuera de un repo no hay worktree y se avisa.
+    #[test]
+    fn integrados_confirman_y_ramas_libres() {
+        let dir = std::env::temp_dir().join(format!("galgo-m5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+        git(&["init", "-q"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["branch", "codex"]);
+        assert_eq!(rama_libre(&root, "codex"), "codex-2", "la rama existente se salta");
+        assert_eq!(rama_libre(&root, "pi"), "pi", "una libre se usa tal cual");
+        assert!(es_repo(&root) && !es_repo("/no/existe"));
+
+        let mut app = App::default();
+        let mut p = pane_info(1, "shell", Status::Idle);
+        p.cwd = Some(root.clone());
+        app.panes = vec![p];
+        app.layouts.sync(&pane_keys(&app));
+        app.selected = Some(1);
+        let _ = update(&mut app, Message::TeamRequested(TeamSource::Preset(0)));
+        assert!(app.team_pending.as_ref().is_some_and(|t| t.preset), "un integrado pide confirmación");
+        assert!(app.explicit.is_empty(), "sin confirmar, no lanza nada");
+        let _ = update(&mut app, Message::TeamConfirm);
+        assert!(app.team_trust.get(&root).is_none(), "un integrado no guarda confianza de repo");
+        assert_eq!(app.explicit.len(), 1, "al confirmar, el equipo tiene su workspace con nombre");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fuera de un repo, un equipo con workers en worktree avisa que se lanzan en la carpeta.
+    #[test]
+    fn equipo_fuera_de_repo_avisa() {
+        let dir = std::env::temp_dir().join(format!("galgo-m5b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let mut app = App::default();
+        let team = team::parse("[[agent]]\nname=\"w\"\nprovider=\"codex\"\nrole=\"worker\"\nisolation=\"worktree\"").unwrap();
+        let _ = launch_team(&mut app, None, root.clone(), team);
+        assert!(app.error.as_deref().is_some_and(|e| e.contains("no es un repo git")), "{:?}", app.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la
     /// bienvenida no aparece en el flujo normal.
     #[test]
@@ -4345,6 +4433,7 @@ mod render {
             root: "/Users/camilolagos/Development/cotiza".into(),
             team: team::parse("name = \"cotiza\"\n[[agent]]\nname=\"jefe\"\nprovider=\"claude\"\nrole=\"manager\"\nprompt=\"Coordina.\"\n[[agent]]\nname=\"codex-1\"\nprovider=\"codex\"\nmodel=\"gpt-5.5\"\nrole=\"worker\"\nisolation=\"worktree\"\n").unwrap(),
             fp: "0".into(),
+            preset: false,
         });
         render(&confirm, size, &dir.join("grupo-confirmar-equipo.png"));
         let mut form = base();
