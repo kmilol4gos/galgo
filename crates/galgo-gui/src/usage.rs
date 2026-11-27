@@ -294,6 +294,7 @@ mod tests {
             waiting_secs: None,
             workspace: None,
             cwd: None,
+            programa: None, titulo_osc: None,
             usage: None,
             title: None,
             agent: false, hooked: false,

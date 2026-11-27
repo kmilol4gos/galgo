@@ -79,7 +79,10 @@ const LEAF_PAD: f32 = PANEL_GUTTER + PANEL_PAD;
 /// Cabecera de cada panel (icono, proceso, cwd y acciones). Va dentro del padding superior: el texto empieza debajo.
 const HEADER_H: f32 = 26.0;
 /// Desde el borde del hueco hasta el primer renglón del terminal.
-const LEAF_TOP: f32 = LEAF_PAD + HEADER_H;
+/// Margen superior de un panel: la cabecera solo ocupa su fila cuando hay splits o el panel está maximizado.
+fn leaf_top() -> f32 {
+    LEAF_PAD + if marco().cabecera { HEADER_H } else { 0.0 }
+}
 /// Origen de la cuadrícula de un panel único (referencia de las pruebas); un split usa el de su rectángulo.
 /// Geometría del marco según lo visible. La fija `sync_chrome` tras cada actualización; el resto la lee con estas
 /// funciones. Por defecto (terminal primero): sin barra lateral, sin barra de estado y una sola fila superior.
@@ -87,11 +90,13 @@ const LEAF_TOP: f32 = LEAF_PAD + HEADER_H;
 struct Marco {
     sidebar: bool,
     status: bool,
+    /// La cabecera del panel se ve (hay splits en la pestaña visible, o un panel maximizado).
+    cabecera: bool,
 }
 // Por hilo: la app entera (update y view) corre en el hilo principal, y cada prueba tiene el suyo, así que las
 // pruebas en paralelo no se pisan la geometría.
 thread_local! {
-    static MARCO: std::cell::Cell<Marco> = const { std::cell::Cell::new(Marco { sidebar: false, status: false }) };
+    static MARCO: std::cell::Cell<Marco> = const { std::cell::Cell::new(Marco { sidebar: false, status: false, cabecera: false }) };
 }
 
 fn marco() -> Marco {
@@ -113,12 +118,13 @@ const LINE_H: f32 = 18.0;
 const CELL_W: f32 = 8.43; // Menlo: 0,602 em
 
 fn term_origin() -> (f32, f32) {
-    (sidebar_w() + LEAF_PAD, top_h() + LEAF_TOP)
+    (sidebar_w() + LEAF_PAD, top_h() + leaf_top())
 }
 
 /// Geometría del marco que corresponde al estado de la app (función pura, para probarla).
 fn marco_para(app: &App) -> Marco {
-    Marco { sidebar: app.sidebar, status: app.status }
+    let dividida = focus_key(app).and_then(|k| app.layouts.active_tab(&k)).is_some_and(|t| matches!(t.root, layout::Node::Split { .. }));
+    Marco { sidebar: app.sidebar, status: app.status, cabecera: dividida || maximized(app).is_some() }
 }
 
 /// Fija la geometría del marco según el estado de la app.
@@ -1111,7 +1117,7 @@ const COLS_MARGIN: u16 = 2;
 
 fn grid_in(rect: layout::Rect) -> (u16, u16) {
     let cols = ((rect.w - 2.0 * LEAF_PAD) / cell_w()).floor().max(20.0) as u16;
-    (((rect.h - LEAF_PAD - LEAF_TOP) / line_h()).floor().max(5.0) as u16, cols.saturating_sub(COLS_MARGIN).max(20))
+    (((rect.h - leaf_top() - LEAF_PAD) / line_h()).floor().max(5.0) as u16, cols.saturating_sub(COLS_MARGIN).max(20))
 }
 
 /// Cuadrícula de la ventana entera (un panel nuevo sin split).
@@ -1150,7 +1156,7 @@ fn pane_rect(app: &App, id: u32) -> Option<layout::Rect> {
 
 /// Origen de la cuadrícula de un rectángulo de panel (su margen de 10 px).
 fn origin_in(rect: layout::Rect) -> (f32, f32) {
-    (rect.x + LEAF_PAD, rect.y + LEAF_TOP)
+    (rect.x + LEAF_PAD, rect.y + leaf_top())
 }
 
 /// Origen de la cuadrícula del panel enfocado; sin rectángulo conocido, el de referencia.
@@ -1383,20 +1389,36 @@ fn accion_para(ruta: &std::path::Path, meta: &std::fs::Metadata) -> Result<Accio
     Ok(if DOCUMENTOS.contains(&ext.as_str()) { AccionRuta::Abrir } else { AccionRuta::Revelar })
 }
 
-/// Título de una pestaña: el que declaró la tarea (`galgo title`), o proceso y cwd («zsh ~/.config/rex»).
+/// Shells: si el proceso en primer plano es uno de ellos, su título OSC (la ruta del prompt) no se muestra.
+const SHELLS: [&str; 5] = ["zsh", "bash", "sh", "fish", "dash"];
+
+/// Carpeta corta para la píldora: el nombre de la carpeta, o `~` si es la de casa.
+fn carpeta_corta(cwd: &str) -> String {
+    if cwd == home_dir() {
+        return "~".into();
+    }
+    std::path::Path::new(cwd).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| cwd.to_string())
+}
+
+/// Texto de la pestaña y de la cabecera: el título de la tarea; si no, el proceso en primer plano (o el título que
+/// anunció por OSC, si no es un shell), y la carpeta corta: `vim · nexo`, `claude · nexo`, `zsh · ~`.
 fn titulo_pestana(p: &PaneInfo) -> String {
     if let Some(t) = p.title.as_deref().filter(|t| !t.is_empty()) {
         return t.to_string();
     }
     let proceso = p
-        .cmd
-        .first()
-        .and_then(|c| std::path::Path::new(c).file_name())
-        .map(|n| n.to_string_lossy().into_owned())
+        .programa
+        .clone()
+        .or_else(|| p.cmd.first().and_then(|c| std::path::Path::new(c).file_name()).map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| p.name.clone());
-    match p.cwd.as_deref() {
-        Some(cwd) => format!("{proceso} {}", chrome::tilde(cwd)),
+    let base = match p.titulo_osc.as_deref().map(str::trim).filter(|t| !t.is_empty() && !SHELLS.contains(&proceso.as_str())) {
+        Some(t) if t.chars().count() > 32 => format!("{}…", t.chars().take(31).collect::<String>()),
+        Some(t) => t.to_string(),
         None => proceso,
+    };
+    match p.cwd.as_deref() {
+        Some(cwd) => format!("{base} · {}", carpeta_corta(cwd)),
+        None => base,
     }
 }
 
@@ -3029,6 +3051,7 @@ mod tests {
             waiting_secs: None,
             workspace: None,
             cwd: None,
+            programa: None, titulo_osc: None,
             usage: None,
             title: None,
             agent: false, hooked: false,
@@ -3137,9 +3160,42 @@ mod tests {
         let mut p = pane_info(1, "shell", Status::Idle);
         p.cmd = vec!["/bin/zsh".into(), "-l".into()];
         p.cwd = Some(format!("{}/Development/nexo", home_dir()));
-        assert_eq!(titulo_pestana(&p), "zsh ~/Development/nexo");
+        // Sin programa en primer plano, el comando lanzado; la carpeta, corta.
+        assert_eq!(titulo_pestana(&p), "zsh · nexo");
         p.title = Some("bug de ventas".into());
         assert_eq!(titulo_pestana(&p), "bug de ventas", "el título de la tarea manda");
+    }
+
+    /// P1.5: la píldora dice el programa en primer plano y la carpeta corta, no siempre el shell.
+    #[test]
+    fn titulo_de_pestana_sigue_al_programa() {
+        let mut p = pane_info(1, "shell", Status::Idle);
+        p.cmd = vec!["zsh".into()];
+        p.cwd = Some("/Users/x/Development/nexo".into());
+        p.programa = Some("vim".into());
+        assert_eq!(titulo_pestana(&p), "vim · nexo");
+        p.programa = Some("claude".into());
+        assert_eq!(titulo_pestana(&p), "claude · nexo");
+        p.cwd = Some(home_dir());
+        assert_eq!(titulo_pestana(&p), "claude · ~", "la carpeta de casa se dice ~");
+    }
+
+    /// P1.5: el título que el programa anuncia por OSC 0/2 sustituye al nombre del proceso, pero no el de un shell
+    /// (el prompt de un shell pone la ruta ahí), y un título largo se recorta.
+    #[test]
+    fn titulo_osc_del_programa_y_no_del_shell() {
+        let mut p = pane_info(1, "shell", Status::Idle);
+        p.cmd = vec!["zsh".into()];
+        p.cwd = Some("/Users/x/nexo".into());
+        p.programa = Some("zsh".into());
+        p.titulo_osc = Some("user@mac: ~/nexo".into());
+        assert_eq!(titulo_pestana(&p), "zsh · nexo", "un shell no muestra su título OSC");
+        p.programa = Some("vim".into());
+        p.titulo_osc = Some("main.rs - VIM".into());
+        assert_eq!(titulo_pestana(&p), "main.rs - VIM · nexo");
+        p.titulo_osc = Some("x".repeat(60));
+        let t = titulo_pestana(&p);
+        assert!(t.starts_with(&"x".repeat(31)) && t.contains('…') && t.ends_with("· nexo"), "{t}");
     }
 
     /// review-15 M2: Cmd+clic no ejecuta bundles ni ejecutables; un documento se abre y lo demás se revela en el Finder.
@@ -4019,7 +4075,7 @@ mod render {
     use iced_runtime::user_interface::{Cache, UserInterface};
 
     fn pane_info(id: u32, name: &str, status: Status) -> PaneInfo {
-        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false, hooked: false }
+        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, programa: None, titulo_osc: None, usage: None, title: None, agent: false, hooked: false }
     }
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
@@ -4369,6 +4425,7 @@ mod lanzador_tests {
             waiting_secs: None,
             workspace: None,
             cwd: None,
+            programa: None, titulo_osc: None,
             usage: None,
             title: None,
             agent: false, hooked: false,
@@ -4432,7 +4489,7 @@ mod atencion_tests {
     /// M1 (review-14): un resultado sin leer se distingue en la fila del agente; un Done ya visto no.
     #[test]
     fn r14_fila_muestra_la_insignia_de_sin_leer() {
-        let mut working = PaneInfo { id: 1, name: "codex".into(), status: Status::Working, manager: None, cmd: vec!["codex".into()], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false, hooked: false };
+        let mut working = PaneInfo { id: 1, name: "codex".into(), status: Status::Working, manager: None, cmd: vec!["codex".into()], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, programa: None, titulo_osc: None, usage: None, title: None, agent: false, hooked: false };
         let mut app = App::default();
         app.attention.observe(&[working.clone()], None);
         working.status = Status::Done;
@@ -4476,7 +4533,7 @@ mod arrastre_tests {
     /// M3 (review-14): arrastrar la barra no cambia el panel, la vista ni las capas.
     #[test]
     fn r14_arrastrar_la_barra_no_toca_el_estado() {
-        let p = PaneInfo { id: 1, name: "p".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false, hooked: false };
+        let p = PaneInfo { id: 1, name: "p".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, programa: None, titulo_osc: None, usage: None, title: None, agent: false, hooked: false };
         let mut app = App { window: (1100.0, 700.0), panes: vec![p], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::DragWindow);
         assert_eq!(app.selected, Some(1));
@@ -4503,7 +4560,7 @@ mod capas_tests {
     /// no maximiza el panel de detrás.
     #[test]
     fn r14_atajos_no_actuan_bajo_las_capas() {
-        let mut uno = PaneInfo { id: 1, name: "a".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some("w".into()), cwd: None, usage: None, title: None, agent: false, hooked: false };
+        let mut uno = PaneInfo { id: 1, name: "a".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some("w".into()), cwd: None, programa: None, titulo_osc: None, usage: None, title: None, agent: false, hooked: false };
         let dos = PaneInfo { id: 2, name: "b".into(), ..uno.clone() };
         uno.id = 1;
         let mut app = App { panes: vec![uno, dos], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
@@ -4526,7 +4583,7 @@ mod r14_b_tests {
     use super::*;
 
     fn pane(id: u32, ws: &str) -> PaneInfo {
-        PaneInfo { id, name: format!("p{id}"), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some(ws.into()), cwd: None, usage: None, title: None, agent: false, hooked: false }
+        PaneInfo { id, name: format!("p{id}"), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some(ws.into()), cwd: None, programa: None, titulo_osc: None, usage: None, title: None, agent: false, hooked: false }
     }
 
     /// B4 (review-14): elegir un workspace por clave lleva a su panel aunque cambie el orden de la lista.

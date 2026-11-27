@@ -20,6 +20,16 @@ pub fn dot<'a>(color: Color, size: f32) -> Element<'a, Message> {
         .into()
 }
 
+/// Icono de maximizar: una ventana con la franja de su barra de título marcada (no depende de la fuente).
+fn maximize_icon<'a>() -> Element<'a, Message> {
+    let barra = container(Space::new(Length::Fill, Length::Fixed(2.0))).style(theme::surface(MUTED));
+    container(column![barra, Space::with_height(Length::Fill)])
+        .width(Length::Fixed(15.0))
+        .height(Length::Fixed(12.0))
+        .style(|_| container::Style { border: Border { color: MUTED, width: 1.0, radius: 2.0.into() }, ..Default::default() })
+        .into()
+}
+
 /// Icono de split dibujado con cajas: un rectángulo con su divisor vertical (`vertical`) u horizontal.
 fn split_icon<'a>(vertical: bool) -> Element<'a, Message> {
     let line = container(Space::new(
@@ -315,6 +325,13 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
             }
         }
     }
+    // Con un solo panel no hay cabecera en el marco: sus acciones de split van aquí, en la barra superior.
+    let un_panel = key.as_ref().and_then(|k| app.layouts.active_tab(k)).is_some_and(|t| matches!(t.root, layout::Node::Leaf(_)));
+    if un_panel {
+        bar = bar
+            .push(icon_button(split_icon(true), "Dividir a la derecha  ⌘D", Message::SplitFocused(true)))
+            .push(icon_button(split_icon(false), "Dividir hacia abajo  ⌘⇧D", Message::SplitFocused(false)));
+    }
     bar = bar
         .push(icon_button(text("+").size(16).color(MUTED).into(), "Nueva pestaña  ⌘T", Message::NewTab))
         .push(mouse_area(Space::with_width(Length::Fill)).on_press(Message::DragWindow))
@@ -422,36 +439,33 @@ fn leaf_view(app: &App, id: u32, split: bool) -> Element<'_, Message> {
     };
     // Cabecera del panel: icono, proceso y cwd tenues; a la derecha, las acciones (solo en el panel enfocado).
     let pane = app.panes.iter().find(|p| p.id == id);
-    let nombre = pane.map_or(String::new(), |p| p.name.clone());
-    let cwd = pane.and_then(|p| p.cwd.as_deref()).map(tilde).unwrap_or_default();
-    let mut titulo = row![
+    // Cabecera solo con splits o maximizado: un panel suelto no repite en su marco lo que ya dice la barra superior.
+    let cabecera = split || maximized(app).is_some();
+    let texto = pane.map(titulo_pestana).unwrap_or_default();
+    let titulo = row![
         text(">_").size(theme::SMALL_SIZE).color(theme::DIM),
-        text(nombre).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT).wrapping(iced::widget::text::Wrapping::None),
+        text(texto).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT).wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
-    if !cwd.is_empty() {
-        titulo = titulo.push(text(cwd).size(theme::SMALL_SIZE).color(theme::DIM).font(theme::MONO).wrapping(iced::widget::text::Wrapping::None));
-    }
     let mut acciones = row![].spacing(2).align_y(Alignment::Center);
     if focused {
         acciones = acciones
             .push(icon_button(split_icon(true), "Dividir a la derecha  ⌘D", Message::SplitFocused(true)))
             .push(icon_button(split_icon(false), "Dividir hacia abajo  ⌘⇧D", Message::SplitFocused(false)))
-            .push(icon_button(text("⤢").size(13).color(theme::DIM).into(), "Maximizar el panel", Message::ToggleMaximize))
+            .push(icon_button(maximize_icon(), "Maximizar el panel  ⌘⇧Enter", Message::ToggleMaximize))
             .push(icon_button(text("×").size(15).color(theme::DIM).into(), "Cerrar el panel", Message::AskClose));
     }
-    let header = container(
-        row![container(titulo).width(Length::Fill).clip(true), acciones].align_y(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(HEADER_H));
+    let contenido = container(inner).width(Length::Fill).height(Length::Fill);
     // Panel redondeado con borde sutil y padding generoso: el texto no pega con el marco.
-    let body = container(column![header, container(inner).width(Length::Fill).height(Length::Fill)])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(PANEL_PAD)
-        .clip(true);
+    let body = if cabecera {
+        let header = container(row![container(titulo).width(Length::Fill).clip(true), acciones].align_y(Alignment::Center))
+            .width(Length::Fill)
+            .height(Length::Fixed(HEADER_H));
+        container(column![header, contenido]).width(Length::Fill).height(Length::Fill).padding(PANEL_PAD).clip(true)
+    } else {
+        container(contenido).width(Length::Fill).height(Length::Fill).padding(PANEL_PAD).clip(true)
+    };
     let panel = container(body).width(Length::Fill).height(Length::Fill).clip(true).style(move |_| container::Style {
         background: Some(theme::TERM_BG.into()),
         border: Border {
