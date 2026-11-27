@@ -1046,7 +1046,7 @@ pub fn team_confirm_panel(app: &App) -> Element<'_, Message> {
                         let (chars, lineas) = team::prompt_stats(p);
                         Element::from(column![
                             text(format!("prompt · {chars} caracteres · {lineas} líneas")).size(theme::SMALL_SIZE).color(theme::DIM),
-                            container(scrollable(text(p.to_string()).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT)).height(Length::Shrink))
+                            container(scrollable(text(p.to_string()).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT).width(Length::Fill)).height(Length::Shrink))
                                 .max_height(160.0)
                                 .padding([6, 8])
                                 .style(theme::surface(theme::TERM_BG)),

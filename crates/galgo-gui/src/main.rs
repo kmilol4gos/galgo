@@ -4465,6 +4465,20 @@ mod render {
             preset: false,
         });
         render(&confirm, size, &dir.join("grupo-confirmar-equipo.png"));
+        let mut armado = base();
+        armado.ws_close_armed = Some("cotiza".into());
+        armado.ws_close_armed_at = Some(std::time::Instant::now());
+        render(&armado, size, &dir.join("grupo-cierre-armado.png"));
+        let mut largo = base();
+        let texto: String = (0..14).map(|i| format!("Línea {i}: revisa el módulo de pagos y resume los cambios que encuentres.\n")).collect();
+        largo.team_pending = Some(TeamPending {
+            key: Some("cotiza".into()),
+            root: "/Users/camilolagos/Development/cotiza".into(),
+            team: team::Team { name: "cotiza".into(), agents: vec![team::TeamAgent { name: "jefe".into(), provider: launch::Agent::Claude, model: None, role: launch::Role::Manager, isolation: launch::Isolation::Shared, prompt: Some(texto) }] },
+            fp: "0".into(),
+            preset: false,
+        });
+        render(&largo, size, &dir.join("grupo-confirmar-prompt-largo.png"));
         let mut form = base();
         form.agent_form = Some(AgentForm { agent: launch::Agent::Codex, model: "gpt-5.5".into(), role: launch::Role::Worker, isolation: launch::Isolation::Worktree, name: String::new(), error: None });
         render(&form, size, &dir.join("grupo-agente.png"));
