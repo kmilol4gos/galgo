@@ -1501,7 +1501,7 @@ export TMP_ARGS_DIR="$TMP/c147"; ANTES_PATH="$PATH"; export PATH="$TMP/fakebin:$
 galgo spawn jefe147 --orquestador --rol manager -- claude >/dev/null; galgo spawn w147 --orquestador --rol worker -- claude >/dev/null; galgo spawn cx147 --orquestador --rol reviewer -- codex >/dev/null
 check "lanzados con --orquestador" $?
 for i in $(seq 1 50); do [ -f "$TMP/c147/w147.args" ] && [ -f "$TMP/c147/cx147.args" ] && break; sleep 0.2; done
-grep -q -- "--strict-mcp-config" "$TMP/c147/jefe147.args" && grep -q 'GALGO_PANE' "$TMP/c147/jefe147.args" && grep -q 'jefe147' "$TMP/c147/jefe147.args"; check "claude recibe el MCP de galgo en línea y solo ese" $?
+grep -q -- "--mcp-config" "$TMP/c147/jefe147.args" && grep -q 'GALGO_PANE' "$TMP/c147/jefe147.args" && grep -q 'jefe147' "$TMP/c147/jefe147.args" && ! grep -q -- "--strict-mcp-config" "$TMP/c147/jefe147.args"; check "claude recibe el MCP de galgo en línea y conserva sus MCP (sin --strict-mcp-config)" $?
 grep -q "Coordinas" "$TMP/c147/jefe147.args"; check "claude recibe las instrucciones de su rol" $?
 grep -q "mcp_servers.galgo.command=" "$TMP/c147/cx147.args" && grep -q "developer_instructions=" "$TMP/c147/cx147.args"; check "codex recibe overrides -c para el MCP y las instrucciones" $?
 GALGO_PANE=jefe147 galgo delegate w147 crea x.txt --context "en la raíz" >/dev/null; check "el manager delega (aunque el worker aún no avisó)" $?

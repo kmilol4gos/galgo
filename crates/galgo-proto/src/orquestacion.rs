@@ -1,6 +1,6 @@
 //! Modo orquestador: los argumentos de arranque que hacen que un agente conocido trabaje con el MCP de galgo y con sus
 //! instrucciones de rol, **sin tocar su configuración del usuario**. Solo `claude` y `codex`, verificados con `--help`:
-//! claude admite `--mcp-config` (JSON en línea), `--strict-mcp-config` y `--append-system-prompt`; codex admite
+//! claude admite `--mcp-config` (JSON en línea) y `--append-system-prompt`; codex admite
 //! `-c clave=valor`, con el que se da `mcp_servers.galgo.*` y `developer_instructions`.
 
 use serde_json::json;
@@ -55,7 +55,8 @@ pub fn argv(cmd: &[String], nombre: &str, rol: &str, mcp: &str, sock: &str) -> R
                 "mcpServers": { "galgo": { "command": mcp, "args": [], "env": { "GALGO_PANE": nombre, "GALGO_SOCKET": sock } } }
             })
             .to_string();
-            out.extend(["--mcp-config".into(), cfg, "--strict-mcp-config".into(), "--append-system-prompt".into(), instr]);
+            // Sin `--strict-mcp-config`: el usuario conserva sus otros servidores MCP; el de galgo se añade al lado.
+            out.extend(["--mcp-config".into(), cfg, "--append-system-prompt".into(), instr]);
         }
         "codex" => {
             out.extend([
@@ -83,8 +84,8 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Claude: el MCP va en JSON en línea con el nombre del panel, `--strict-mcp-config` y las instrucciones; los
-    /// argumentos del usuario quedan detrás.
+    /// Claude: el MCP va en JSON en línea con el nombre del panel y las instrucciones; los argumentos del usuario
+    /// quedan detrás, y no se desactivan los MCP del usuario.
     #[test]
     fn claude_lleva_mcp_en_linea_y_conserva_sus_argumentos() {
         let out = argv(&cmd(&["claude", "--model", "haiku"]), "jefe", "manager", "/x/galgo-mcp", "/s/g.sock").unwrap();
@@ -93,7 +94,7 @@ mod tests {
         let cfg: serde_json::Value = serde_json::from_str(&out[i + 1]).unwrap();
         assert_eq!(cfg["mcpServers"]["galgo"]["command"], "/x/galgo-mcp");
         assert_eq!(cfg["mcpServers"]["galgo"]["env"]["GALGO_PANE"], "jefe");
-        assert!(out.contains(&"--strict-mcp-config".to_string()));
+        assert!(!out.contains(&"--strict-mcp-config".to_string()), "no se desactivan los MCP del usuario");
         assert!(out.iter().any(|a| a.contains("«jefe»") && a.contains("Coordinas")), "las instrucciones nombran el agente y su rol");
         assert_eq!(&out[out.len() - 2..], &["--model".to_string(), "haiku".to_string()], "los argumentos del usuario van al final");
     }
