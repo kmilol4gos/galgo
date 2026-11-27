@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -119,6 +119,9 @@ struct Pane {
     hooked: bool,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
     last_blocked: Option<String>,
+    /// La línea del cursor es un prompt libre. Lo mantiene el hilo lector (y el redimensionado), que ya tiene la
+    /// pantalla. El estado lo lee sin tomar el candado de la pantalla: así no hay interbloqueo (ver `ORDEN DE CANDADOS`).
+    prompt_libre: Arc<AtomicBool>,
     /// Desde cuándo el agente terminó su turno (Stop). Solo entonces se le entregan tareas (A2). Solo en memoria.
     listo_desde: Option<Instant>,
     /// Última entrada del usuario o del CLI en el pty. No se entrega tras teclear hace poco (A2). Solo en memoria.
@@ -161,16 +164,9 @@ impl Pane {
         self.pid.is_some_and(|p| p as i32 == fg) && is_agent_cmd(&self.cmd)
     }
 
-    /// La línea del cursor es un prompt vacío: el agente espera una orden y no hay texto a medias (A2). Lo que hay
-    /// tras el prompt, sin contar los bordes de caja de la TUI, tiene que ser nada.
+    /// La línea del cursor es un prompt libre (lo mantiene el hilo lector). Sin tomar el candado de la pantalla.
     fn linea_de_prompt_libre(&self) -> bool {
-        let Ok(parser) = self.screen.lock() else { return false };
-        let s = parser.screen();
-        let (fila, _) = s.cursor_position();
-        let (_, cols) = s.size();
-        let texto = s.contents_between(fila, 0, fila, cols.get());
-        let limpio = texto.trim_end().trim_end_matches(|c: char| matches!(c, '│' | '║' | '|')).trim_end();
-        limpio.is_empty() || limpio.ends_with(['>', '❯', '›', '$', '%', '#'])
+        self.prompt_libre.load(Ordering::SeqCst)
     }
 
     /// Nombre del programa en primer plano (`vim`, `claude`, o el shell si está libre).
@@ -240,6 +236,7 @@ impl Pane {
             profundidad_recibida: 0,
             listo_desde: None,
             ultima_entrada: None,
+            prompt_libre: Arc::new(AtomicBool::new(false)),
             changed: Arc::new(Notify::new()),
             orphans: Vec::new(),
             waiting_on: None,
@@ -269,6 +266,12 @@ struct State {
     /// Delegaciones recientes (remitente, momento unix) para el tope por hora (M2). Solo en memoria.
     delegaciones: Vec<(u32, u64)>,
 }
+
+// ORDEN DE CANDADOS (revisión 17, A1). Solo estos caminos toman dos a la vez, siempre en este orden:
+//   1. pantalla (`Pane::screen`) → estado (`State`), en `Resize`.
+// El estado nunca toma la pantalla: la línea del cursor llega como `Pane::prompt_libre`, un indicador atómico que
+// mantienen el hilo lector y el redimensionado, que ya tienen la pantalla. Así `tick` y `deliver` (bajo el estado)
+// no esperan a nadie que espere al estado. Un camino nuevo que tome la pantalla con el estado tomado es un error.
 
 /// Límites del modo orquestador (corte 1): profundidad de delegación, tareas abiertas por par de agentes y por workspace.
 const MAX_DELEGATION_DEPTH: u8 = 3;
@@ -948,6 +951,16 @@ fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(Pa
 /// Deduce el workspace de un directorio dentro de un repo git: "<repo>/<rama>". Sin git, o con el
 /// HEAD desligado, devuelve `None` o solo el nombre del repo. Nunca falla: git ausente no es un error.
 /// Comando de un agente conocido (por nombre de ejecutable).
+/// Si la línea del cursor de `s` es un prompt libre: el agente espera una orden y no hay texto a medias. Lo que hay
+/// tras el prompt, sin contar los bordes de caja de la TUI, tiene que ser nada.
+fn prompt_libre_de(s: &vt100::Screen) -> bool {
+    let (fila, _) = s.cursor_position();
+    let (_, cols) = s.size();
+    let texto = s.contents_between(fila, 0, fila, cols.get());
+    let limpio = texto.trim_end().trim_end_matches(|c: char| matches!(c, '│' | '║' | '|')).trim_end();
+    limpio.is_empty() || limpio.ends_with(['>', '❯', '›', '$', '%', '#'])
+}
+
 /// Una ruta de ejecutable es la de un agente conocido (`…/claude/versions/2.0.50`, `…/bin/codex`).
 fn es_agente_ruta(ruta: &str) -> bool {
     ruta.split('/').any(|c| c == "claude" || c == "codex")
@@ -1177,6 +1190,8 @@ impl Daemon {
         let osc_hilo = Arc::clone(&osc_cwd);
         let osc_titulo: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let titulo_hilo = Arc::clone(&osc_titulo);
+        let prompt = Arc::new(AtomicBool::new(false));
+        let prompt_hilo = Arc::clone(&prompt);
 
         let (input, input_rx) = sync_channel::<Vec<u8>>(INPUT_QUEUE);
         std::thread::spawn(move || {
@@ -1207,6 +1222,7 @@ impl Daemon {
             cwd: cwd_saved,
             osc_cwd,
             osc_titulo,
+            prompt_libre: prompt,
             usage: None,
             usage_report: None,
             inbox: Vec::new(),
@@ -1253,6 +1269,7 @@ impl Daemon {
                         }
                         let mut parser = screen.lock().unwrap();
                         parser.process(&buf[..n]);
+                        prompt_hilo.store(prompt_libre_de(parser.screen()), Ordering::SeqCst);
                         gen.fetch_add(1, Ordering::SeqCst);
                         // Las suscripciones se enteran sin sondear: un aviso por trozo de salida.
                         changed.notify_waiters();
@@ -1630,6 +1647,11 @@ impl Daemon {
                 // pantalla con el del estado ya tomado, así que el orden no puede bloquearse. Mientras
                 // se mantienen ambos, el PTY y la pantalla cambian de tamaño juntos.
                 let mut parser = screen.lock().unwrap();
+                // Pantalla tomada → estado: el único orden permitido (ver ORDEN DE CANDADOS).
+                let prompt = {
+                    let st = self.state.lock().unwrap();
+                    st.resolve(&pane).ok().and_then(|id| st.panes.get(&id)).map(|p| Arc::clone(&p.prompt_libre))
+                };
                 {
                     let st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
@@ -1643,6 +1665,9 @@ impl Daemon {
                 let nr = std::num::NonZeroU16::new(rows).context("rows debe ser mayor que 0")?;
                 let nc = std::num::NonZeroU16::new(cols).context("cols debe ser mayor que 0")?;
                 parser.screen_mut().set_size(nr, nc);
+                if let Some(prompt) = prompt {
+                    prompt.store(prompt_libre_de(parser.screen()), Ordering::SeqCst);
+                }
                 screen_gen.fetch_add(1, Ordering::SeqCst);
                 Ok(json!({}))
             }
@@ -3030,6 +3055,8 @@ mod orquestador_tests {
         p.status = status;
         // Un agente con hooks ya terminó su turno (A2): puede recibir tareas sin esperar la gracia.
         p.listo_desde = hooked.then(|| Instant::now() - Duration::from_secs(60));
+        // Pantalla vacía: el prompt está libre (lo mantendría el hilo lector en un panel real).
+        p.prompt_libre.store(true, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
         p.input = tx;
         st.panes.insert(id, p);
@@ -3075,6 +3102,50 @@ mod orquestador_tests {
         assert_eq!(texto.matches('\r').count(), 1);
     }
 
+    /// Revisión 17, A1: `Resize` (pantalla → estado) y `tick` (que entrega) no deben interbloquearse. Con una tarea
+    /// pendiente y un agente listo, el `tick` llega a mirar el prompt; antes tomaba la pantalla con el estado tomado.
+    #[test]
+    fn resize_y_tick_no_se_bloquean() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _a = vivo(&mut st, 1, "a", true, Status::Idle);
+        let _b = vivo(&mut st, 2, "b", true, Status::Idle);
+        st.tasks.push(tarea_abierta(1, 1, 2, None, unix_ahora()));
+        st.tasks[0].status = TaskStatus::Pendiente;
+        let d = std::sync::Arc::new(daemon_con(st));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..3 {
+            let (d, tx) = (std::sync::Arc::clone(&d), tx.clone());
+            std::thread::spawn(move || {
+                let r = rt();
+                for i in 0..5000u16 {
+                    let _ = r.block_on(d.handle(None, Request::Resize { pane: "2".into(), rows: 20 + i % 5, cols: 80 }));
+                }
+                let _ = tx.send(());
+            });
+        }
+        let (d2, tx2) = (std::sync::Arc::clone(&d), tx.clone());
+        std::thread::spawn(move || {
+            for _ in 0..5000 {
+                // Cada vuelta deja al agente libre y con una tarea nueva: así el tick llega siempre a mirar el prompt.
+                {
+                    let mut st = d2.state.lock().unwrap();
+                    let ahora = unix_ahora();
+                    if let Some(p) = st.panes.get_mut(&2) {
+                        p.status = Status::Idle;
+                        p.listo_desde = Some(Instant::now() - Duration::from_secs(60));
+                    }
+                    st.tasks.push(tarea_abierta(9, 1, 2, None, ahora));
+                    st.tasks.last_mut().unwrap().status = TaskStatus::Pendiente;
+                }
+                d2.tick();
+            }
+            let _ = tx2.send(());
+        });
+        for _ in 0..4 {
+            rx.recv_timeout(std::time::Duration::from_secs(20)).expect("un hilo se quedó esperando un candado: interbloqueo");
+        }
+    }
+
     /// A1: solo son agentes los procesos de ruta de claude o codex, o el propio proceso de un panel lanzado como agente.
     #[test]
     fn el_agente_se_reconoce_por_su_ruta() {
@@ -3114,10 +3185,12 @@ mod orquestador_tests {
         assert_eq!(st.tasks[0].status, TaskStatus::Pendiente, "tecleó hace poco");
         st.panes.get_mut(&2).unwrap().ultima_entrada = None;
         st.panes.get_mut(&2).unwrap().screen.lock().unwrap().process(b"\x1b[1;1Hborrador a medias");
+        { let p = st.panes.get(&2).unwrap(); let sc = p.screen.lock().unwrap(); p.prompt_libre.store(prompt_libre_de(sc.screen()), Ordering::SeqCst); }
         st.deliver(2);
         assert_eq!(st.tasks[0].status, TaskStatus::Pendiente, "hay texto a medias en el prompt");
         assert!(rx.try_recv().is_err());
         st.panes.get_mut(&2).unwrap().screen.lock().unwrap().process(b"\x1b[2K\x1b[1;1H> ");
+        { let p = st.panes.get(&2).unwrap(); let sc = p.screen.lock().unwrap(); p.prompt_libre.store(prompt_libre_de(sc.screen()), Ordering::SeqCst); }
         st.deliver(2);
         assert_eq!(st.tasks[0].status, TaskStatus::Entregada);
     }
