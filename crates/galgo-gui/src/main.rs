@@ -1261,16 +1261,19 @@ fn selected_cols(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
     (start <= end).then_some((start, end))
 }
 
-/// Suscripción a los cambios de un panel: el daemon escribe un aviso cada vez que su pantalla cambia. Si la conexión
-/// no se puede abrir, se avisa para sondear; si se cae, se vuelve a conectar despacio; si el panel se cierra, termina.
+/// Suscripción a los cambios de un panel: el daemon escribe un aviso cada vez que su pantalla cambia. Cualquier salida
+/// que no sea el `closed` legítimo (conexión caída, daemon antiguo, panel desconocido…) avisa para sondear, y cada
+/// reintento fallido lo vuelve a avisar (review-15 M4: antes, un `ok:false` dejaba el panel congelado).
 fn watch_stream(pane: u32) -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(16, move |mut salida| async move {
-        let mut primera = true;
         loop {
-            match watch_once(pane, &mut salida, primera).await {
+            match watch_once(pane, &mut salida).await {
                 WatchEnd::Cerrado => break,
                 WatchEnd::Cayo => {
-                    primera = false;
+                    use iced::futures::SinkExt;
+                    if salida.send(Message::WatchDown(pane)).await.is_err() {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
@@ -1279,21 +1282,40 @@ fn watch_stream(pane: u32) -> impl iced::futures::Stream<Item = Message> {
 }
 
 enum WatchEnd {
-    /// El panel terminó: no hay nada más que vigilar.
+    /// El panel terminó (o la suscripción dejó de interesar): no hay nada más que vigilar.
     Cerrado,
-    /// La conexión cayó: se reintenta.
+    /// Algo falló: se avisa para sondear y se reintenta.
     Cayo,
 }
 
+/// Lo que dice una línea del daemon en una suscripción.
+#[derive(Debug, PartialEq)]
+enum Aviso {
+    Cambio(u64),
+    Inicio,
+    Cerrado,
+    /// Un error del daemon (`ok:false`), una línea que no se entiende, o un evento desconocido.
+    Fallo,
+}
+
+fn leer_aviso(linea: &str) -> Aviso {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(linea) else { return Aviso::Fallo };
+    if v["ok"].as_bool() != Some(true) {
+        return Aviso::Fallo;
+    }
+    match v["event"].as_str() {
+        Some("changed") => Aviso::Cambio(v["gen"].as_u64().unwrap_or(0)),
+        Some("watching") => Aviso::Inicio,
+        Some("closed") => Aviso::Cerrado,
+        _ => Aviso::Fallo,
+    }
+}
+
 /// Una conexión de suscripción: pide `Watch` y reenvía cada aviso de cambio a la app.
-async fn watch_once(pane: u32, salida: &mut iced::futures::channel::mpsc::Sender<Message>, primera: bool) -> WatchEnd {
+async fn watch_once(pane: u32, salida: &mut iced::futures::channel::mpsc::Sender<Message>) -> WatchEnd {
     use iced::futures::SinkExt;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let conexion = tokio::net::UnixStream::connect(galgo_proto::socket_path()).await;
-    let Ok(stream) = conexion else {
-        if primera {
-            let _ = salida.send(Message::WatchDown(pane)).await;
-        }
+    let Ok(stream) = tokio::net::UnixStream::connect(galgo_proto::socket_path()).await else {
         return WatchEnd::Cayo;
     };
     let (r, mut w) = stream.into_split();
@@ -1302,22 +1324,22 @@ async fn watch_once(pane: u32, salida: &mut iced::futures::channel::mpsc::Sender
         return WatchEnd::Cayo;
     }
     let mut lineas = tokio::io::BufReader::new(r).lines();
-    while let Ok(Some(linea)) = lineas.next_line().await {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&linea) else { break };
-        match v["event"].as_str() {
-            Some("changed") => {
-                let gen = v["gen"].as_u64().unwrap_or(0);
+    loop {
+        let linea = match lineas.next_line().await {
+            Ok(Some(linea)) => linea,
+            _ => return WatchEnd::Cayo,
+        };
+        match leer_aviso(&linea) {
+            Aviso::Cambio(gen) => {
                 if salida.send(Message::PaneChanged(pane, gen)).await.is_err() {
                     return WatchEnd::Cerrado;
                 }
             }
-            Some("closed") => return WatchEnd::Cerrado,
-            Some("watching") => {}
-            // Un `ok: false` (panel desconocido) o cualquier otra cosa: no hay suscripción que mantener.
-            _ => return WatchEnd::Cerrado,
+            Aviso::Inicio => {}
+            Aviso::Cerrado => return WatchEnd::Cerrado,
+            Aviso::Fallo => return WatchEnd::Cayo,
         }
     }
-    WatchEnd::Cayo
 }
 
 /// Abre una URL o una ruta con el visor del sistema (`open`). Un fallo se avisa y no detiene la app.
@@ -3472,6 +3494,19 @@ mod tests {
         assert_eq!(tab.root.ids(), vec![10, 11]);
         assert_eq!(tab.focus, 10, "el foco va al manager");
         assert!(matches!(tab.root, layout::Node::Split { vertical: true, .. }));
+    }
+
+    /// review-15 M4: solo `closed` es un final legítimo; un error del daemon o una línea rara cuentan como fallo, para
+    /// que la GUI sondee en vez de quedarse con la pantalla congelada.
+    #[test]
+    fn avisos_del_daemon_se_clasifican() {
+        assert_eq!(leer_aviso(r#"{"ok":true,"event":"changed","gen":7}"#), Aviso::Cambio(7));
+        assert_eq!(leer_aviso(r#"{"ok":true,"event":"watching","pane":1}"#), Aviso::Inicio);
+        assert_eq!(leer_aviso(r#"{"ok":true,"event":"closed","pane":1}"#), Aviso::Cerrado);
+        assert_eq!(leer_aviso(r#"{"ok":false,"error":"la suscripción se atiende en su conexión"}"#), Aviso::Fallo, "un daemon antiguo no es un cierre");
+        assert_eq!(leer_aviso(r#"{"ok":false,"error":"panel no encontrado: 9"}"#), Aviso::Fallo);
+        assert_eq!(leer_aviso("basura"), Aviso::Fallo);
+        assert_eq!(leer_aviso(r#"{"ok":true,"event":"otra cosa"}"#), Aviso::Fallo);
     }
 
     /// review-15 A1: con el formulario de agente abierto, Cmd+W no pide cerrar el panel de detrás y las teclas no llegan
