@@ -439,17 +439,27 @@ fn leaf_view(app: &App, id: u32, split: bool) -> Element<'_, Message> {
         match shown(app) {
             // Con `lazy`, el árbol de la pantalla solo se reconstruye cuando cambia lo que se muestra (y en cada fase del cursor).
             Some(snap) => {
-                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen), app.focused, zoom(), blink_on());
+                let buscando = app.buscar.as_ref().map(|b| (b.pane, b.consulta.clone(), b.actual, b.resultados.len()));
+                let key = (app.selected, app.snap_gen, app.snap_offset, app.sel, app.sel_snap.as_ref().map(|s| s.gen), app.focused, zoom(), blink_on(), buscando);
                 let sel = app.sel;
-                lazy(key, move |_| screen_view(snap, sel, style)).into()
+                let resaltes = resaltes_de(app, snap);
+                lazy(key, move |_| screen_view(snap, sel, style, &resaltes)).into()
             }
             None => placeholder("Esperando salida…"),
         }
     } else {
         match app.others.get(&id) {
-            Some(snap) => screen_view(snap, None, CursorStyle::Off),
+            Some(snap) => screen_view(snap, None, CursorStyle::Off, &[]),
             None => placeholder("Esperando salida…"),
         }
+    };
+    // Con la búsqueda abierta en este panel, su barra va encima, arriba a la derecha.
+    let inner: Element<'_, Message> = match (focused, app.buscar.as_ref()) {
+        (true, Some(b)) => {
+            let barra = container(barra_busqueda(b)).width(Length::Fill).height(Length::Fill).align_y(iced::alignment::Vertical::Top).padding([8, 12]);
+            stack(vec![inner, barra.into()]).into()
+        }
+        _ => inner,
     };
     // Cabecera del panel: icono, proceso y cwd tenues; a la derecha, las acciones (solo en el panel enfocado).
     let pane = app.panes.iter().find(|p| p.id == id);

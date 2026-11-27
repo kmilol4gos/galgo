@@ -284,6 +284,50 @@ impl Pane {
     }
 }
 
+/// Coincidencias de `consulta` en `lineas`: `[línea, columna, longitud]` en caracteres. Sin mayúsculas en la consulta,
+/// no distingue mayúsculas (si la consulta tiene alguna, sí).
+pub fn buscar_en(lineas: &[String], consulta: &str) -> Vec<[usize; 3]> {
+    const MAX: usize = 10_000;
+    let mut out = Vec::new();
+    if consulta.is_empty() {
+        return out;
+    }
+    let exacta = consulta.chars().any(|c| c.is_uppercase());
+    let q = if exacta { consulta.to_string() } else { consulta.to_lowercase() };
+    let largo = q.chars().count();
+    for (linea, texto) in lineas.iter().enumerate() {
+        let hay = if exacta { texto.clone() } else { texto.to_lowercase() };
+        let mut desde = 0;
+        while let Some(pos) = hay[desde..].find(&q) {
+            let abs = desde + pos;
+            out.push([linea, hay[..abs].chars().count(), largo]);
+            if out.len() >= MAX {
+                return out;
+            }
+            desde = abs + q.len();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod buscar_tests {
+    use super::buscar_en;
+
+    fn l(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sin_mayusculas_no_distingue_y_con_mayusculas_si() {
+        let t = l(&["Error error ERROR", "nada", "err"]);
+        assert_eq!(buscar_en(&t, "error"), vec![[0, 0, 5], [0, 6, 5], [0, 12, 5]]);
+        assert_eq!(buscar_en(&t, "Error"), vec![[0, 0, 5]]);
+        assert_eq!(buscar_en(&t, ""), Vec::<[usize; 3]>::new());
+        assert_eq!(buscar_en(&t, "err"), vec![[0, 0, 3], [0, 6, 3], [0, 12, 3], [2, 0, 3]]);
+    }
+}
+
 fn no_proceso(name: &str) -> anyhow::Error {
     anyhow!("el panel {name} no tiene proceso: se restauró tras reiniciar el daemon")
 }
@@ -1737,6 +1781,39 @@ impl Daemon {
                 };
                 let text = screen.lock().unwrap().screen().contents();
                 Ok(json!({ "text": text.trim_end() }))
+            }
+            Request::Search { pane, query } => {
+                let screen = {
+                    let st = self.state.lock().unwrap();
+                    let p = &st.panes[&st.resolve(&pane)?];
+                    if p.ghost {
+                        return Err(no_proceso(&p.name));
+                    }
+                    Arc::clone(&p.screen)
+                };
+                let mut parser = screen.lock().unwrap();
+                let sc = parser.screen_mut();
+                let (h, w) = sc.size();
+                let (h, w) = (h.get() as usize, w.get());
+                let l = sc.scrollback_len();
+                // Línea i de la historia (0 = la más antigua; l… = la pantalla). Una vista con offset k muestra las
+                // líneas [l−k, l−k+h): se recorren las vistas hasta cubrirlo todo.
+                let mut lineas = vec![String::new(); l + h];
+                let mut ks: Vec<usize> = (0..=l).step_by(h).collect();
+                if ks.last() != Some(&l) {
+                    ks.push(l);
+                }
+                for k in ks {
+                    sc.set_scrollback(k);
+                    for (r, texto) in sc.rows(0, w).enumerate() {
+                        if let Some(dst) = lineas.get_mut(l - k + r) {
+                            *dst = texto;
+                        }
+                    }
+                }
+                sc.set_scrollback(0);
+                let matches = buscar_en(&lineas, &query);
+                Ok(json!({ "matches": matches, "scrollback": l }))
             }
             Request::Snapshot { pane, offset, since } => {
                 let (screen, gen) = {

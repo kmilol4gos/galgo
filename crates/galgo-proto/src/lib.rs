@@ -185,6 +185,13 @@ pub enum Request {
     Watch {
         pane: String,
     },
+    /// Busca `query` en todo el historial del panel (y la pantalla). Sin mayúsculas en la consulta, no distingue
+    /// mayúsculas. Responde `{ matches: [[línea, columna, longitud]], scrollback }`: la línea 0 es la más antigua del
+    /// historial y `scrollback` es el número de líneas de historial.
+    Search {
+        pane: String,
+        query: String,
+    },
     /// Pantalla con estilos y cursor, para clientes gráficos.
     Snapshot {
         pane: String,

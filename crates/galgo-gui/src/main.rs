@@ -285,6 +285,8 @@ struct App {
     sizes: std::collections::HashMap<u32, (u16, u16)>,
     /// Líneas hacia atrás que se piden al daemon (0 = en vivo).
     scroll: u16,
+    /// Búsqueda abierta (Cmd+F) en el panel enfocado.
+    buscar: Option<Busqueda>,
     /// Fracción de líneas de la rueda que aún no suma un paso completo.
     wheel_acc: f32,
     sel: Option<Selection>,
@@ -415,6 +417,12 @@ enum Message {
     LaunchFailed(String, String),
     /// Pestañas y splits (E): cambiar de pestaña, elegir una, dividir el panel enfocado, mover el foco por direcciones.
     NextTab(isize),
+    /// Cmd+F: abre la búsqueda en el panel enfocado.
+    OpenSearch,
+    /// Resultado de una búsqueda: (panel, consulta, coincidencias o error).
+    SearchDone(u32, String, Result<serde_json::Value, String>),
+    /// Enter / Shift+Enter: coincidencia siguiente (1) o anterior (-1).
+    SearchStep(isize),
     /// Una pestaña de cualquier workspace (la barra es plana): selecciona su grupo y esa pestaña.
     SelectTabIn(String, usize),
     SplitFocused(bool),
@@ -525,6 +533,7 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
         ("[", false) => Some(Message::NextTab(-1)),
         ("]", false) => Some(Message::NextTab(1)),
         ("d", false) => Some(Message::SplitFocused(true)),
+        ("f", false) => Some(Message::OpenSearch),
         ("b", false) => Some(Message::ToggleSidebar),
         ("/", false) => Some(Message::ToggleStatus),
         ("d", true) => Some(Message::SplitFocused(false)),
@@ -1076,6 +1085,121 @@ fn clear_selection(app: &mut App) {
 }
 
 /// Vuelve a la pantalla en vivo y descarta la selección: el contenido mostrado cambia.
+/// Búsqueda en el scrollback de un panel: la consulta, sus coincidencias (`[línea, columna, longitud]`, la línea 0 es la
+/// más antigua del historial) y la que está seleccionada. `scrollback` es el número de líneas de historial.
+#[derive(Debug, Clone, Default)]
+pub struct Busqueda {
+    pane: u32,
+    consulta: String,
+    resultados: Vec<[usize; 3]>,
+    actual: usize,
+    scrollback: usize,
+    buscando: bool,
+}
+
+/// Tarea que busca `consulta` en el panel `id` (fuera del hilo de la interfaz).
+fn buscar_task(id: u32, consulta: String) -> Task<Message> {
+    let para_respuesta = consulta.clone();
+    Task::perform(async move {
+        tokio::task::spawn_blocking(move || request(Request::Search { pane: id.to_string(), query: consulta })).await.map_err(|e| e.to_string())?
+    }, move |r| Message::SearchDone(id, para_respuesta.clone(), r))
+}
+
+/// Lleva la vista del panel a la coincidencia seleccionada: a media pantalla, para que se vea con contexto.
+fn ir_a_coincidencia(app: &mut App) -> Task<Message> {
+    let Some(b) = app.buscar.as_ref() else { return Task::none() };
+    let Some(&[linea, _, _]) = b.resultados.get(b.actual) else { return Task::none() };
+    let id = b.pane;
+    let alto = app.snap.as_ref().map_or(24, |s| s.lines.len());
+    let k = (b.scrollback + alto / 2).saturating_sub(linea).min(b.scrollback);
+    app.scroll = k as u16;
+    pedir_vista(app, id)
+}
+
+/// Pide la vista actual del panel `id` (con su desplazamiento).
+fn pedir_vista(app: &mut App, id: u32) -> Task<Message> {
+    let since = if app.snap_offset == app.scroll { app.snap_gen } else { None };
+    load_screen(id, app.scroll, since)
+}
+
+/// Resaltados de búsqueda visibles en la pantalla de `snap`: (fila, columna inicial, columna final, es la actual).
+/// La fila 0 de la vista corresponde a la línea `scrollback_max − scrollback` de la historia.
+pub fn resaltes_de(app: &App, snap: &Snapshot) -> Vec<(u16, u16, u16, bool)> {
+    let Some(b) = app.buscar.as_ref() else { return Vec::new() };
+    if app.selected != Some(b.pane) {
+        return Vec::new();
+    }
+    let arriba = (snap.scrollback_max as usize).saturating_sub(snap.scrollback as usize);
+    let alto = snap.lines.len();
+    let mut out = Vec::new();
+    for (i, &[linea, col, largo]) in b.resultados.iter().enumerate() {
+        if linea >= arriba && linea < arriba + alto && largo > 0 {
+            let fila = (linea - arriba) as u16;
+            out.push((fila, col as u16, (col + largo - 1) as u16, i == b.actual));
+        }
+    }
+    out
+}
+
+/// Barra de búsqueda (arriba a la derecha del panel): la consulta y el contador.
+fn barra_busqueda(b: &Busqueda) -> Element<'static, Message> {
+    let consulta = if b.consulta.is_empty() { iced::widget::text("Buscar").size(theme::SMALL_SIZE).color(theme::DIM) } else { iced::widget::text(b.consulta.clone()).size(theme::SMALL_SIZE) };
+    let cuenta = if b.consulta.is_empty() {
+        String::new()
+    } else if b.buscando {
+        "…".to_string()
+    } else if b.resultados.is_empty() {
+        "0 de 0".to_string()
+    } else {
+        format!("{} de {}", b.actual + 1, b.resultados.len())
+    };
+    let fila = row![consulta, iced::widget::text(cuenta).size(theme::SMALL_SIZE).color(theme::DIM)].spacing(10).align_y(iced::Alignment::Center);
+    container(fila)
+        .padding([4, 10])
+        .style(theme::group)
+        .align_x(iced::alignment::Horizontal::Right)
+        .into()
+}
+
+/// Teclado con la búsqueda abierta: nada de lo que se escribe llega al terminal.
+fn buscar_tecla(app: &mut App, key: &Key, modifiers: keyboard::Modifiers, text: Option<&str>) -> Task<Message> {
+    match key {
+        Key::Named(Named::Escape) => {
+            app.buscar = None;
+            back_to_live(app);
+            match app.selected {
+                Some(id) => pedir_vista(app, id),
+                None => Task::none(),
+            }
+        }
+        Key::Named(Named::Enter) => update(app, Message::SearchStep(if modifiers.shift() { -1 } else { 1 })),
+        Key::Named(Named::Backspace) => {
+            let Some(b) = app.buscar.as_mut() else { return Task::none() };
+            b.consulta.pop();
+            buscar_cambio(app)
+        }
+        _ => {
+            let Some(t) = text.filter(|t| !t.chars().any(char::is_control)) else { return Task::none() };
+            let Some(b) = app.buscar.as_mut() else { return Task::none() };
+            b.consulta.push_str(t);
+            buscar_cambio(app)
+        }
+    }
+}
+
+/// La consulta cambió: se vuelve a buscar en todo el historial (o se limpia si está vacía).
+fn buscar_cambio(app: &mut App) -> Task<Message> {
+    let Some(b) = app.buscar.as_mut() else { return Task::none() };
+    if b.consulta.is_empty() {
+        b.resultados.clear();
+        b.actual = 0;
+        b.buscando = false;
+        return Task::none();
+    }
+    b.buscando = true;
+    buscar_task(b.pane, b.consulta.clone())
+}
+
 fn back_to_live(app: &mut App) {
     app.scroll = 0;
     clear_selection(app);
@@ -1083,6 +1207,10 @@ fn back_to_live(app: &mut App) {
 
 /// Selecciona un panel. Mirarlo no cambia su tamaño y lo deja sin marca de "sin leer".
 fn select(app: &mut App, id: u32) -> Task<Message> {
+    // La búsqueda es de un panel: si se enfoca otro, se cierra.
+    if app.buscar.as_ref().is_some_and(|b| b.pane != id) {
+        app.buscar = None;
+    }
     // B6: la última pantalla del que pierde el foco pasa a `others`, y el que lo gana se muestra desde ahí (no hay
     // «Esperando salida…» durante un tick).
     if let (Some(prev), Some(snap)) = (app.selected, app.snap.take()) {
@@ -2434,6 +2562,41 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Select(id) => select(app, id),
+        Message::OpenSearch => {
+            let Some(id) = app.selected else { return Task::none() };
+            if app.buscar.is_none() {
+                app.buscar = Some(Busqueda { pane: id, ..Default::default() });
+            }
+            Task::none()
+        }
+        Message::SearchDone(id, consulta, resultado) => {
+            let Some(b) = app.buscar.as_mut() else { return Task::none() };
+            if b.pane != id || b.consulta != consulta {
+                return Task::none();
+            }
+            b.buscando = false;
+            match resultado {
+                Ok(v) => {
+                    b.resultados = serde_json::from_value(v["matches"].clone()).unwrap_or_default();
+                    b.scrollback = v["scrollback"].as_u64().unwrap_or(0) as usize;
+                    b.actual = b.resultados.len().saturating_sub(1);
+                    ir_a_coincidencia(app)
+                }
+                Err(e) => {
+                    app.error = Some(e);
+                    Task::none()
+                }
+            }
+        }
+        Message::SearchStep(paso) => {
+            let Some(b) = app.buscar.as_mut() else { return Task::none() };
+            let n = b.resultados.len() as isize;
+            if n == 0 {
+                return Task::none();
+            }
+            b.actual = (b.actual as isize + paso).rem_euclid(n) as usize;
+            ir_a_coincidencia(app)
+        }
         Message::Event(Event::Window(iced::window::Event::Resized(size))) => {
             app.window = (size.width, size.height);
             resize_if_needed(app);
@@ -2493,6 +2656,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.team_pending = None;
                 }
                 return Task::none();
+            }
+            // Con la búsqueda abierta, el teclado es suyo: Enter/Shift+Enter, Esc, y lo que se escribe a la consulta.
+            if app.buscar.is_some() && !modifiers.command() {
+                return buscar_tecla(app, &key, modifiers, text.as_deref());
             }
             // Cmd+Opt+flechas: el foco se mueve al split vecino.
             if modifiers.command() && modifiers.alt() {
@@ -2690,6 +2857,9 @@ enum Mark {
     /// Cursor de un panel sin foco: tenue, sin parpadeo.
     CursorIdle,
     Selected,
+    /// Coincidencia de la búsqueda, y la seleccionada.
+    Hit,
+    HitCurrent,
 }
 
 /// Cómo se dibuja el cursor de un panel: el enfocado parpadea, el de una ventana sin foco queda tenue, y los
@@ -2711,6 +2881,9 @@ pub fn blink_on() -> bool {
 
 /// Fondo de la selección: el acento translúcido sobre el fondo del terminal, con el texto en su color.
 const SELECTION_BG: Color = Color::from_rgb(0.153, 0.243, 0.420);
+/// Resaltado de las coincidencias de la búsqueda (Cmd+F): la actual, más viva.
+const HIT_BG: Color = Color::from_rgb(0.330, 0.290, 0.120);
+const HIT_CURRENT_BG: Color = Color::from_rgb(0.760, 0.560, 0.160);
 
 /// Un tramo de texto con el estilo de `r` y la marca de celda.
 /// Familia de los símbolos Nerd Font empaquetados (Symbols Nerd Font Mono, licencia OFL en `assets/`).
@@ -2745,6 +2918,10 @@ fn styled(text: String, r: &Run, mark: Mark, symbol: bool) -> Span<'static, Mess
     }
     if mark == Mark::Selected {
         bg = Some(SELECTION_BG);
+    } else if mark == Mark::Hit {
+        bg = Some(HIT_BG);
+    } else if mark == Mark::HitCurrent {
+        bg = Some(HIT_CURRENT_BG);
     }
     // Atenuado (SGR 2) y parpadeo en su mitad apagada (el tick de pantalla redibuja cada 250 ms): el color se
     // atenúa. El tachado (SGR 9) es un atributo del texto.
@@ -2797,7 +2974,7 @@ fn quitar_cajas(runs: &[Run], fila: u16, capa: &mut cajas::Capa) -> Vec<Run> {
         .collect()
 }
 
-fn spans_for_line(runs: &[Run], cursor: Option<(u16, Mark)>, sel: Option<(u16, u16)>) -> Vec<Span<'static, Message>> {
+fn spans_for_line(runs: &[Run], cursor: Option<(u16, Mark)>, sel: Option<(u16, u16)>, hits: &[(u16, u16, bool)]) -> Vec<Span<'static, Message>> {
     let mut out = Vec::new();
     let mut col: u16 = 0;
     for r in runs {
@@ -2807,6 +2984,8 @@ fn spans_for_line(runs: &[Run], cursor: Option<(u16, Mark)>, sel: Option<(u16, u
         for ch in r.t.chars() {
             let mark = if cursor.is_some_and(|(c, _)| c == col) {
                 cursor.map_or(Mark::Cursor, |(_, m)| m)
+            } else if let Some(h) = hits.iter().find(|h| (h.0..=h.1).contains(&col)) {
+                if h.2 { Mark::HitCurrent } else { Mark::Hit }
             } else if sel.is_some_and(|(a, b)| (a..=b).contains(&col)) {
                 Mark::Selected
             } else {
@@ -2831,7 +3010,7 @@ fn spans_for_line(runs: &[Run], cursor: Option<(u16, Mark)>, sel: Option<(u16, u
 }
 
 /// Pantalla de un panel. `cursor`: se dibuja el cursor (solo el panel enfocado, con la ventana activa).
-fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle) -> Element<'static, Message> {
+fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle, resaltes: &[(u16, u16, u16, bool)]) -> Element<'static, Message> {
     let mut lines = column![].spacing(0);
     // El cursor solo se dibuja en la pantalla en vivo y si el panel lo muestra.
     let live = snap.scrollback == 0 && !snap.cursor_hidden;
@@ -2847,7 +3026,8 @@ fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle) -> E
         let cursor = (visible && snap.cursor.0 as usize == r).then_some((snap.cursor.1, mark));
         let selected = sel.and_then(|s| selected_cols(s, r as u16, snap.cols));
         let sin_cajas = quitar_cajas(runs, r as u16, &mut capa);
-        let spans = spans_for_line(&sin_cajas, cursor, selected);
+        let hits: Vec<(u16, u16, bool)> = resaltes.iter().filter(|h| h.0 as usize == r).map(|h| (h.1, h.2, h.3)).collect();
+        let spans = spans_for_line(&sin_cajas, cursor, selected, &hits);
         lines = lines.push(
             rich_text(spans).size(font_size()).font(terminal_font()).line_height(iced::widget::text::LineHeight::Absolute(line_h().into())).wrapping(iced::widget::text::Wrapping::None),
         );
@@ -3045,6 +3225,38 @@ mod tests {
         // Sin el marcador de soft wrap, cada fila es una línea.
         s.wrapped = vec![false, false, false];
         assert_eq!(selection_text(&s, sel), "https://ej\nemplo.com\nabc");
+    }
+
+    /// Cmd+F: lo que se escribe va a la consulta y nunca al panel; Esc cierra y la vista vuelve en vivo.
+    #[test]
+    fn la_busqueda_no_deja_pasar_las_teclas_al_terminal() {
+        let mut app = App { window: (1100.0, 700.0), panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
+        app.snap = Some(snap(&["aaaa", "bbbb"], 4));
+        let _ = update(&mut app, Message::OpenSearch);
+        assert!(app.buscar.is_some());
+        let _ = update(&mut app, Message::Event(key_press(Key::Character("x".into()), Some("x"))));
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Backspace), None)));
+        let _ = update(&mut app, Message::Event(key_press(Key::Character("E".into()), Some("E"))));
+        assert_eq!(app.buscar.as_ref().unwrap().consulta, "E");
+        assert!(app.buscar.as_ref().unwrap().buscando, "la búsqueda sale al daemon");
+        // Enter avanza sin tocar el panel; Esc lo cierra.
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Escape), None)));
+        assert!(app.buscar.is_none());
+    }
+
+    /// Los resaltados caen en la fila y columnas de la vista (la fila 0 es la línea `scrollback_max − scrollback`).
+    #[test]
+    fn los_resaltes_se_colocan_en_la_vista() {
+        let mut app = App { window: (1100.0, 700.0), panes: vec![pane_info(1, "p", Status::Idle)], selected: Some(1), ..Default::default() };
+        let mut s = snap(&["abcd", "efgh"], 4);
+        s.scrollback_max = 10;
+        s.scrollback = 0;
+        app.buscar = Some(Busqueda { pane: 1, consulta: "gh".into(), resultados: vec![[10, 2, 2], [3, 0, 1]], actual: 0, scrollback: 10, buscando: false });
+        assert_eq!(resaltes_de(&app, &s), vec![(0, 2, 3, true)]);
+        // Con el historial hacia arriba, la línea 3 entra y la 10 sale de la vista.
+        s.scrollback = 8;
+        assert_eq!(resaltes_de(&app, &s), vec![(1, 0, 0, false)], "la línea 3 queda en la fila 1 (la vista empieza en la 2)");
     }
 
     /// M1: la selección se resalta y se copia desde la pantalla que el usuario vio al empezarla,
