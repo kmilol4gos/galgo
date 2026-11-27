@@ -1601,8 +1601,9 @@ fn intentar_restaurar(app: &mut App) -> Task<Message> {
     if app.ws_intentos == 0 {
         // Un shell nuevo para cada panel que no volvió, en su carpeta (si se conoce).
         for nombre in &faltan {
-            let Some(cwd) = app.pane_meta.get(nombre).and_then(|(c, _)| c.clone()) else { continue };
-            let req = launch::shell_request(nombre, &login_shell(), &cwd, None, 40, 140);
+            let Some((cwd, ws)) = app.pane_meta.get(nombre).and_then(|(c, w)| Some((c.clone()?, w.clone()))) else { continue };
+            // El workspace guardado: así el panel vuelve a su pestaña del grupo, no a «sin workspace».
+            let req = launch::shell_request(nombre, &login_shell(), &cwd, ws, 40, 140);
             tareas.push(Task::perform(async move { tokio::task::spawn_blocking(move || request(req)).await.ok(); }, |_| Message::Echo));
         }
     }
@@ -2318,12 +2319,24 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             app.listing = false;
             let mut arranque = None;
             let mut envios = Task::none();
+            let mut restaurar = Task::none();
             match result {
                 Ok(panes) => {
                     app.error = None;
+                    // Un daemon nuevo no tiene ninguno de los paneles que conocíamos (ids y nombres). Entonces las pestañas
+                    // guardadas en memoria no sirven: se vuelve a aplicar la disposición del disco, relanzando sus paneles.
+                    let reinicio = app.ws_restored
+                        && !app.panes.is_empty()
+                        && !app.panes.iter().any(|v| panes.iter().any(|p| p.id == v.id && p.name == v.name));
+                    if reinicio {
+                        app.ws_restored = false;
+                        app.ws_pendiente = None;
+                        app.ws_intentos = 0;
+                        app.layouts.by_key.clear();
+                    }
                     app.panes = panes;
-                    // Primer listado: se restauran los workspaces guardados (pestañas, splits y grupos explícitos).
-                    let restaurar = intentar_restaurar(app);
+                    // Primer listado (o reinicio): se restauran los workspaces guardados (pestañas, splits y grupos explícitos).
+                    restaurar = intentar_restaurar(app);
                     if !app.ws_restored {
                         if let Some(v) = app.prefs_path.as_ref().and_then(|p| prefs::get(p, "agent_roles")) {
                             app.roles = v.as_object().into_iter().flatten().filter_map(|(n, r)| Some((n.clone(), r.as_str()?.to_string()))).collect();
@@ -2336,7 +2349,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     // solo para cuando no se puede crear el panel).
                     if !app.started {
                         app.started = true;
-                        if app.panes.is_empty() {
+                        // Sin disposición pendiente: un shell en ~. Con una pendiente, sus paneles se relanzan (no se abre otro).
+                        if app.panes.is_empty() && app.ws_pendiente.is_none() && app.layouts.by_key.is_empty() {
                             arranque = Some(open_terminal(app, home_dir(), false));
                         }
                     }
@@ -2371,7 +2385,8 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.snap_gen = None;
                 }
             }
-            Task::batch([arranque.unwrap_or_else(Task::none), envios])
+            // `restaurar` lleva los relanzamientos de los paneles que faltan: debe ejecutarse (M3).
+            Task::batch([arranque.unwrap_or_else(Task::none), envios, restaurar])
         }
         Message::Screen(id, offset, sent_since, result) => {
             app.loading = false;
@@ -2835,7 +2850,7 @@ fn screen_view(snap: &Snapshot, sel: Option<Selection>, style: CursorStyle) -> E
 }
 
 fn view(app: &App) -> Element<'_, Message> {
-    let main: Element<'_, Message> = if app.panes.is_empty() {
+    let main: Element<'_, Message> = if app.panes.is_empty() && app.ws_pendiente.is_none() {
         chrome::welcome_view(app)
     } else {
         let mut col = column![container(chrome::layout_view(app)).width(Length::Fill).height(Length::Fill).style(theme::surface(theme::TERM_BG))];
@@ -3380,6 +3395,48 @@ mod tests {
         let _ = update(&mut app, Message::Panes(Ok(vec![en_nexo(1, "shell"), en_nexo(2, "claude")])));
         assert!(app.ws_restored && app.ws_pendiente.is_none());
         assert_eq!(app.layouts.by_key.get("nexo").expect("la pestaña vuelve").tabs[0].root.ids().len(), 2);
+    }
+
+    /// Daemon vacío al abrir la GUI con una disposición en disco: se espera a sus paneles, no se abre un shell en ~
+    /// y el disco no se sobrescribe.
+    #[test]
+    fn daemon_vacio_al_abrir_espera_la_disposicion() {
+        let dir = std::env::temp_dir().join(format!("galgo-vacio-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prefs_path = dir.join("gui-prefs.json");
+        let _ = std::fs::remove_file(&prefs_path);
+        let tabs: Vec<serde_json::Value> = ["s1", "t1"].iter().map(|n| serde_json::json!({ "focus": n, "tree": { "leaf": n } })).collect();
+        let v = serde_json::json!({ "workspaces": [{ "key": "nexo", "explicit": false, "folder": null, "active": 0, "tabs": tabs }], "panes": { "s1": { "cwd": "/tmp", "workspace": "nexo" }, "t1": { "cwd": "/tmp", "workspace": "nexo" } } });
+        prefs::set(&prefs_path, "workspaces", v.clone()).expect("se escribe");
+        let mut app = App { prefs_path: Some(prefs_path.clone()), ..Default::default() };
+        let _ = update(&mut app, Message::Panes(Ok(vec![])));
+        assert!(app.ws_pendiente.is_some() && !app.ws_restored, "espera la disposición");
+        let guardado = prefs::get(&prefs_path, "workspaces").expect("sigue en disco");
+        assert_eq!(guardado, v, "el disco no se sobrescribe");
+    }
+
+    /// El caso real: seis paneles ya están en el primer listado, y la disposición de seis pestañas se aplica entera.
+    #[test]
+    fn seis_pestanas_del_disco_se_aplican_en_el_primer_listado() {
+        let dir = std::env::temp_dir().join(format!("galgo-seis-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prefs_path = dir.join("gui-prefs.json");
+        let _ = std::fs::remove_file(&prefs_path);
+        let nombres = ["s1", "t1", "t2", "d1", "d2", "d3"];
+        let tabs: Vec<serde_json::Value> = nombres.iter().map(|n| serde_json::json!({ "focus": n, "tree": { "leaf": n } })).collect();
+        let v = serde_json::json!({ "workspaces": [{ "key": "nexo", "explicit": false, "folder": null, "active": 0, "tabs": tabs }], "panes": {} });
+        prefs::set(&prefs_path, "workspaces", v).expect("se escribe");
+        let mut app = App { prefs_path: Some(prefs_path), ..Default::default() };
+        let en_nexo = |id: u32, name: &str| {
+            let mut p = pane_info(id, name, Status::Idle);
+            p.workspace = Some("nexo".into());
+            p
+        };
+        let panes: Vec<PaneInfo> = nombres.iter().enumerate().map(|(i, n)| en_nexo(i as u32 + 1, n)).collect();
+        let _ = update(&mut app, Message::Panes(Ok(panes)));
+        assert!(app.ws_restored, "la disposición se aplica sin esperar");
+        let ws = app.layouts.by_key.get("nexo").expect("la clave nexo existe");
+        assert_eq!(ws.tabs.len(), 6, "las seis pestañas vuelven");
     }
 
     #[test]
