@@ -270,7 +270,15 @@ fn group_pill<'a>(app: &'a App, key: String, pestanas: Vec<Element<'a, Message>>
     .on_press(Message::CloseWorkspace(key.clone()));
     let agente = theme::btn(text("+ agente").size(theme::SMALL_SIZE).color(theme::TEXT_SOFT)).padding([0, 6]).on_press(Message::OpenAgentForm);
     let equipo = theme::btn(text("equipo").size(theme::SMALL_SIZE).color(theme::TEXT_SOFT)).padding([0, 6]).on_press(Message::TeamRequested(crate::TeamSource::Repo));
-    let mut fila = row![text(key.clone()).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT)].spacing(6).align_y(Alignment::Center);
+    // Nombre de la píldora: el alias si lo tiene; con doble clic se renombra, y mientras se escribe se ve el texto.
+    let nombre: Element<'_, Message> = match app.renombrando.as_ref().filter(|(k, _)| *k == key) {
+        Some((_, texto)) => text(format!("{texto}▏")).size(theme::SMALL_SIZE + 1.0).color(theme::ACCENT).into(),
+        None => {
+            let visible = app.alias.get(&key).cloned().unwrap_or_else(|| key.clone());
+            mouse_area(text(visible).size(theme::SMALL_SIZE + 1.0).color(theme::TEXT_SOFT)).on_press(Message::PillPress(key.clone())).into()
+        }
+    };
+    let mut fila = row![nombre].spacing(6).align_y(Alignment::Center);
     for p in pestanas {
         fila = fila.push(p);
     }

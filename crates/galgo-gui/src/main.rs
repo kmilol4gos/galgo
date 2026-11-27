@@ -287,6 +287,12 @@ struct App {
     scroll: u16,
     /// Búsqueda abierta (Cmd+F) en el panel enfocado.
     buscar: Option<Busqueda>,
+    /// Nombre que se muestra en la píldora de cada workspace (solo en la GUI; la clave del daemon no cambia).
+    alias: std::collections::BTreeMap<String, String>,
+    /// Edición del nombre de una píldora: (clave, texto escrito hasta ahora).
+    renombrando: Option<(String, String)>,
+    /// Último clic en el nombre de una píldora: para detectar el doble clic.
+    pill_click: Option<(String, std::time::Instant)>,
     /// Fracción de líneas de la rueda que aún no suma un paso completo.
     wheel_acc: f32,
     sel: Option<Selection>,
@@ -426,6 +432,8 @@ enum Message {
     SearchDone(u32, String, Result<serde_json::Value, String>),
     /// Enter / Shift+Enter: coincidencia siguiente (1) o anterior (-1).
     SearchStep(isize),
+    /// Clic en el nombre de una píldora; dos en menos de 500 ms abren el renombrado.
+    PillPress(String),
     /// Una pestaña de cualquier workspace (la barra es plana): selecciona su grupo y esa pestaña.
     SelectTabIn(String, usize),
     SplitFocused(bool),
@@ -1198,6 +1206,37 @@ fn buscar_cambio(app: &mut App) -> Task<Message> {
     }
     b.buscando = true;
     buscar_task(b.pane, b.consulta.clone())
+}
+
+/// Teclado durante el renombrado de una píldora: Enter guarda (vacío = quitar el nombre), Esc cancela.
+fn renombrar_tecla(app: &mut App, key: &Key, text: Option<&str>) -> Task<Message> {
+    match key {
+        Key::Named(Named::Escape) => app.renombrando = None,
+        Key::Named(Named::Enter) => {
+            if let Some((clave, texto)) = app.renombrando.take() {
+                let nombre = texto.trim().to_string();
+                if nombre.is_empty() || nombre == clave {
+                    app.alias.remove(&clave);
+                } else {
+                    app.alias.insert(clave, nombre);
+                }
+                if let Some(path) = app.prefs_path.clone() {
+                    let _ = prefs::set(&path, "aliases", serde_json::to_value(&app.alias).unwrap_or_default());
+                }
+            }
+        }
+        Key::Named(Named::Backspace) => {
+            if let Some((_, t)) = app.renombrando.as_mut() {
+                t.pop();
+            }
+        }
+        _ => {
+            if let (Some(t), Some((_, buf))) = (text.filter(|t| !t.chars().any(char::is_control)), app.renombrando.as_mut()) {
+                buf.push_str(t);
+            }
+        }
+    }
+    Task::none()
 }
 
 fn back_to_live(app: &mut App) {
@@ -2491,6 +2530,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     // solo para cuando no se puede crear el panel).
                     if !app.started {
                         app.started = true;
+                        // Nombres de las píldoras (lo que el usuario renombró con doble clic).
+                        if let Some(v) = app.prefs_path.as_ref().and_then(|p| prefs::get(p, "aliases")) {
+                            app.alias = serde_json::from_value(v).unwrap_or_default();
+                        }
                         // Sin disposición pendiente: un shell en ~. Con una pendiente, sus paneles se relanzan (no se abre otro).
                         if app.panes.is_empty() && app.ws_pendiente.is_none() && app.layouts.by_key.is_empty() {
                             arranque = Some(open_terminal(app, home_dir(), false));
@@ -2567,6 +2610,17 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Select(id) => select(app, id),
+        Message::PillPress(key) => {
+            let doble = app.pill_click.as_ref().is_some_and(|(k, t)| *k == key && t.elapsed() < std::time::Duration::from_millis(500));
+            if doble {
+                app.pill_click = None;
+                let texto = app.alias.get(&key).cloned().unwrap_or_else(|| key.clone());
+                app.renombrando = Some((key, texto));
+            } else {
+                app.pill_click = Some((key, std::time::Instant::now()));
+            }
+            Task::none()
+        }
         Message::OpenSearch => {
             let Some(id) = app.selected else { return Task::none() };
             if app.buscar.is_none() {
@@ -2661,6 +2715,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                     app.team_pending = None;
                 }
                 return Task::none();
+            }
+            // Renombrando una píldora, el teclado escribe el nombre (Enter guarda, Esc cancela).
+            if app.renombrando.is_some() && !modifiers.command() {
+                return renombrar_tecla(app, &key, text.as_deref());
             }
             // Con la búsqueda abierta, el teclado es suyo: Enter/Shift+Enter, Esc, y lo que se escribe a la consulta.
             if app.buscar.is_some() && !modifiers.command() {
@@ -3230,6 +3288,34 @@ mod tests {
         // Sin el marcador de soft wrap, cada fila es una línea.
         s.wrapped = vec![false, false, false];
         assert_eq!(selection_text(&s, sel), "https://ej\nemplo.com\nabc");
+    }
+
+    /// Doble clic en una píldora abre el renombrado; lo escrito es el nuevo nombre; Esc cancela; un nombre vacío lo quita.
+    #[test]
+    fn el_doble_clic_renombra_la_pildora() {
+        let mut app = App { window: (1100.0, 700.0), ..Default::default() };
+        let _ = update(&mut app, Message::PillPress("proyecto".into()));
+        assert!(app.renombrando.is_none(), "un clic no renombra");
+        let _ = update(&mut app, Message::PillPress("proyecto".into()));
+        assert_eq!(app.renombrando.as_ref().map(|(_, t)| t.as_str()), Some("proyecto"));
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Backspace), None)));
+        let _ = update(&mut app, Message::Event(key_press(Key::Character("x".into()), Some("x"))));
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
+        assert_eq!(app.alias.get("proyecto").map(String::as_str), Some("proyectx"));
+        // Esc cancela sin tocar el nombre.
+        let _ = update(&mut app, Message::PillPress("proyecto".into()));
+        let _ = update(&mut app, Message::PillPress("proyecto".into()));
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Escape), None)));
+        assert!(app.renombrando.is_none());
+        assert_eq!(app.alias.get("proyecto").map(String::as_str), Some("proyectx"));
+        // Un nombre vacío quita el alias y vuelve la clave.
+        let _ = update(&mut app, Message::PillPress("proyecto".into()));
+        let _ = update(&mut app, Message::PillPress("proyecto".into()));
+        for _ in 0..8 {
+            let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Backspace), None)));
+        }
+        let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
+        assert!(app.alias.get("proyecto").is_none());
     }
 
     /// Cmd+F: lo que se escribe va a la consulta y nunca al panel; Esc cierra y la vista vuelve en vivo.
