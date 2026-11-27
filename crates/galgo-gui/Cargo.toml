@@ -7,7 +7,6 @@ publish = false
 [workspace]
 
 [dependencies]
-regex = "=1.11.1"
 libc = "0.2"
 iced = { version = "0.13", features = ["tokio", "lazy"] }
 galgo-proto = { path = "../galgo-proto" }
@@ -19,6 +18,8 @@ rfd = "0.18.0"
 ttf-parser = "0.20"
 unicode-width = "0.2"
 toml = "0.8"
+sha2 = "=0.10.8"
+regex = "=1.11.1"
 
 [dev-dependencies]
 iced_core = "0.13"

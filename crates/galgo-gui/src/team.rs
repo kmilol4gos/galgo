@@ -144,15 +144,11 @@ pub fn parse(text: &str) -> Result<Team, String> {
     Ok(Team { name, agents })
 }
 
-/// Huella del contenido (FNV-1a de 64 bits, estable entre versiones del programa). Sirve para saber si el equipo
-/// que se confirmó es el mismo que hay ahora: si cambia, vuelve a pedir confirmación.
+/// Huella del contenido: SHA-256 en hexadecimal. Es la prueba de que el equipo confirmado es el mismo que hay ahora; un
+/// autor que controle el repo no puede fabricar otro contenido con la misma huella (review-15 M1: FNV-1a no lo impide).
 pub fn fingerprint(text: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Equipos integrados: plantillas que escribe la propia app (no vienen de ningún repo), así que no piden confianza.
@@ -290,6 +286,13 @@ role = "reviewer"
             assert!(team.agents.iter().filter(|a| a.role == Role::Manager).count() <= 1);
             assert!(!team.agents.is_empty() && team.agents.len() <= MAX_AGENTS);
         }
+    }
+
+    /// Vector conocido: la huella es SHA-256 real («abc»), de 64 caracteres hexadecimales.
+    #[test]
+    fn huella_es_sha256() {
+        assert_eq!(fingerprint("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(fingerprint(BUENO).len(), 64);
     }
 
     #[test]
