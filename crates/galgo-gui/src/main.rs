@@ -93,10 +93,14 @@ struct Marco {
     status: bool,
     filas_top: u8,
 }
-static MARCO: std::sync::RwLock<Marco> = std::sync::RwLock::new(Marco { sidebar: false, status: false, filas_top: 1 });
+// Por hilo: la app entera (update y view) corre en el hilo principal, y cada prueba tiene el suyo, así que las
+// pruebas en paralelo no se pisan la geometría.
+thread_local! {
+    static MARCO: std::cell::Cell<Marco> = const { std::cell::Cell::new(Marco { sidebar: false, status: false, filas_top: 1 }) };
+}
 
 fn marco() -> Marco {
-    *MARCO.read().unwrap()
+    MARCO.with(|m| m.get())
 }
 fn sidebar_w() -> f32 {
     if marco().sidebar { SIDEBAR_W } else { 0.0 }
@@ -120,7 +124,7 @@ fn marco_para(app: &App) -> Marco {
 
 /// Fija la geometría del marco según el estado de la app.
 fn sync_chrome(app: &App) {
-    *MARCO.write().unwrap() = marco_para(app);
+    MARCO.with(|m| m.set(marco_para(app)));
 }
 
 /// Guarda una preferencia de la GUI junto al socket (si hay dónde guardarla). Un fallo no detiene la app.
@@ -4063,6 +4067,59 @@ mod render {
             bracketed_paste: false,
             wrapped: vec![false, false],
         }
+    }
+
+    /// Render de los estados del workspace nativo y del equipo (para revisar el diseño sin teclado ni ratón).
+    #[test]
+    #[ignore]
+    fn render_grupos() {
+        let dir = std::path::PathBuf::from(std::env::var("GALGO_UX_DIR").unwrap_or_else(|_| "/tmp/galgo-ux".into()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = (1280, 800);
+        let en = |id: u32, name: &str, status: Status, agent: bool| {
+            let mut p = pane_info(id, name, status);
+            p.workspace = Some("cotiza".into());
+            p.cwd = Some("/Users/camilolagos/Development/cotiza".into());
+            p.agent = agent;
+            p
+        };
+        let base = || {
+        let mut app = App { window: (1280.0, 800.0), panes: vec![en(1, "jefe", Status::Working, true), en(2, "codex-1", Status::Idle, true), en(3, "revisor", Status::Blocked, true)], ..Default::default() };
+        app.explicit.insert("cotiza".into(), "/Users/camilolagos/Development/cotiza".into());
+        app.roles.insert("jefe".into(), "manager".into());
+        app.roles.insert("codex-1".into(), "worker".into());
+        app.roles.insert("revisor".into(), "reviewer".into());
+        app.layouts.by_key.insert(
+            "cotiza".into(),
+            layout::WsTabs {
+                tabs: vec![layout::Tab {
+                    root: layout::Node::Split {
+                        vertical: true,
+                        ratio: 0.6,
+                        a: Box::new(layout::Node::Leaf(1)),
+                        b: Box::new(layout::Node::Split { vertical: false, ratio: 0.5, a: Box::new(layout::Node::Leaf(2)), b: Box::new(layout::Node::Leaf(3)) }),
+                    },
+                    focus: 1,
+                }],
+                active: 0,
+            },
+        );
+        app.selected = Some(1);
+        app.layouts.sync(&pane_keys(&app));
+        app
+        };
+        render(&base(), size, &dir.join("grupo-equipo.png"));
+        let mut confirm = base();
+        confirm.team_pending = Some(TeamPending {
+            key: Some("cotiza".into()),
+            root: "/Users/camilolagos/Development/cotiza".into(),
+            team: team::parse("name = \"cotiza\"\n[[agent]]\nname=\"jefe\"\nprovider=\"claude\"\nrole=\"manager\"\nprompt=\"Coordina.\"\n[[agent]]\nname=\"codex-1\"\nprovider=\"codex\"\nmodel=\"gpt-5.5\"\nrole=\"worker\"\nisolation=\"worktree\"\n").unwrap(),
+            fp: "0".into(),
+        });
+        render(&confirm, size, &dir.join("grupo-confirmar-equipo.png"));
+        let mut form = base();
+        form.agent_form = Some(AgentForm { agent: launch::Agent::Codex, model: "gpt-5.5".into(), role: launch::Role::Worker, isolation: launch::Isolation::Worktree, name: String::new(), error: None });
+        render(&form, size, &dir.join("grupo-agente.png"));
     }
 
     /// Render de un snapshot real volcado por el daemon (`GALGO_SNAP`), con cada fuente de terminal.

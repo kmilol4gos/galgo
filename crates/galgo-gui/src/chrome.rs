@@ -1033,6 +1033,10 @@ pub fn team_confirm_panel(app: &App) -> Element<'_, Message> {
                 .spacing(8)
                 .align_y(Alignment::Center),
                 text(format!("{} · {}", a.role.label(), a.isolation.label())).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT),
+                // El prompt inicial se muestra entero (recortado) antes de confirmar: es texto que se enviará al agente.
+                text(a.prompt.as_deref().map(|p| format!("prompt: «{}»", sidebar::recortar(p, 90))).unwrap_or_default())
+                    .size(theme::SMALL_SIZE)
+                    .color(theme::DIM),
             ]
             .spacing(2),
         );
