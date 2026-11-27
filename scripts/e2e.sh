@@ -1475,5 +1475,40 @@ GALGO_PANE=codex146 galgo task done "$TID" x.txt creado >/dev/null; check "el de
 galgo inbox --pane jefe146 | grep -q "x.txt creado"; check "el resultado llega al remitente" $?
 galgo tasks --pane jefe146 | grep -q "lista"; check "galgo tasks muestra la tarea cerrada" $?
 env -u GALGO_PANE galgo delegate codex146 algo >/dev/null 2>&1; [ $? -ne 0 ]; check "sin GALGO_PANE no se delega" $?
+echo "147. modo orquestador (lanzamiento): claude y codex arrancan con el MCP de galgo y su rol; una tarea delegada se responde de punta a punta (agentes falsos con hooks)"
+export GALGO_SOCKET="$TMP/c147/g.sock"; mkdir -p "$TMP/c147" "$TMP/fakebin" && chmod 700 "$TMP/c147"
+cat > "$TMP/fakebin/claude" <<'FAKE_EOF'
+#!/bin/sh
+# Agente falso de prueba: registra sus argumentos, avisa que está libre por hook y responde las tareas que le llegan.
+printf '%s\n' "$@" > "$TMP_ARGS_DIR/$GALGO_PANE_NAME.args"
+echo '{"hook_event_name":"Notification","notification_type":"idle_prompt"}' | galgo hook claude
+while IFS= read -r linea; do
+  case "$linea" in
+    *"tarea #"*)
+      id=$(echo "$linea" | sed -n 's/.*tarea #\([0-9][0-9]*\).*/\1/p')
+      galgo task done "$id" "hecho por $GALGO_PANE_NAME" >/dev/null 2>&1
+      echo '{"hook_event_name":"Notification","notification_type":"idle_prompt"}' | galgo hook claude ;;
+  esac
+done
+FAKE_EOF
+cat > "$TMP/fakebin/codex" <<'FAKE_EOF'
+#!/bin/sh
+printf '%s\n' "$@" > "$TMP_ARGS_DIR/$GALGO_PANE_NAME.args"
+sleep 30
+FAKE_EOF
+chmod +x "$TMP/fakebin/claude" "$TMP/fakebin/codex"
+export TMP_ARGS_DIR="$TMP/c147"; ANTES_PATH="$PATH"; export PATH="$TMP/fakebin:$PATH"
+galgo spawn jefe147 --orquestador --rol manager -- claude >/dev/null; galgo spawn w147 --orquestador --rol worker -- claude >/dev/null; galgo spawn cx147 --orquestador --rol reviewer -- codex >/dev/null
+check "lanzados con --orquestador" $?
+for i in $(seq 1 50); do [ -f "$TMP/c147/w147.args" ] && [ -f "$TMP/c147/cx147.args" ] && break; sleep 0.2; done
+grep -q -- "--strict-mcp-config" "$TMP/c147/jefe147.args" && grep -q 'GALGO_PANE' "$TMP/c147/jefe147.args" && grep -q 'jefe147' "$TMP/c147/jefe147.args"; check "claude recibe el MCP de galgo en línea y solo ese" $?
+grep -q "Coordinas" "$TMP/c147/jefe147.args"; check "claude recibe las instrucciones de su rol" $?
+grep -q "mcp_servers.galgo.command=" "$TMP/c147/cx147.args" && grep -q "developer_instructions=" "$TMP/c147/cx147.args"; check "codex recibe overrides -c para el MCP y las instrucciones" $?
+GALGO_PANE=jefe147 galgo delegate w147 crea x.txt --context "en la raíz" >/dev/null; check "el manager delega (aunque el worker aún no avisó)" $?
+ok=0; for i in $(seq 1 60); do galgo inbox --pane jefe147 2>/dev/null | grep -q "hecho por w147" && { ok=1; break; }; sleep 0.25; done
+[ $ok = 1 ]; check "el worker recibe la tarea, responde y el resultado vuelve al manager" $?
+galgo tasks --pane jefe147 | grep -q "lista"; check "la tarea queda lista en el registro" $?
+galgo read w147 | grep -q "tarea #"; check "el texto llegó al worker pegado en su terminal" $?
+export PATH="$ANTES_PATH"; unset TMP_ARGS_DIR
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]

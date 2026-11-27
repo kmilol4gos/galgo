@@ -43,6 +43,13 @@ enum Cmd {
         /// Crea una rama nueva con su propio worktree git (en ~/.galgo/worktrees/<repo>/<rama>) y arranca el panel ahí.
         #[arg(long)]
         worktree: Option<String>,
+        /// Modo orquestador (solo claude y codex): el agente trae el MCP de galgo y sus instrucciones de rol. No toca
+        /// su configuración: los argumentos van en la línea de arranque.
+        #[arg(long)]
+        orquestador: bool,
+        /// Rol en el equipo, con --orquestador: manager, worker, reviewer o libre.
+        #[arg(long, default_value = "libre")]
+        rol: String,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -202,6 +209,14 @@ fn main() {
     }
 }
 
+/// Argumentos de arranque en modo orquestador: el `galgo-mcp` junto a este ejecutable y el socket del daemon.
+fn orquestacion_argv(cmd: &[String], name: &str, rol: &str) -> Result<Vec<String>> {
+    let exe = std::env::current_exe()?;
+    let mcp = exe.parent().map(|d| d.join("galgo-mcp")).unwrap_or_else(|| "galgo-mcp".into());
+    let sock = galgo_proto::socket_path();
+    galgo_proto::orquestacion::argv(cmd, name, rol, &mcp.to_string_lossy(), &sock.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
@@ -215,11 +230,11 @@ fn run() -> Result<()> {
         _ => {}
     }
     let req = match &cli.cmd {
-        Cmd::Spawn { name, manager, inject, cwd, workspace, worktree, cmd } => Request::Spawn {
+        Cmd::Spawn { name, manager, inject, cwd, workspace, worktree, orquestador, rol, cmd } => Request::Spawn {
             workspace: workspace.clone(),
             worktree: worktree.clone(),
             name: name.clone(),
-            cmd: cmd.clone(),
+            cmd: if *orquestador { orquestacion_argv(cmd, name, rol)? } else { cmd.clone() },
             cwd: {
                 let base = std::env::current_dir()?;
                 let path = cwd.as_ref().map_or(base.clone(), |p| base.join(p));
@@ -517,5 +532,25 @@ mod tests_orquestador {
             _ => panic!("no es task done"),
         }
         std::env::remove_var("GALGO_PANE");
+    }
+}
+
+#[cfg(test)]
+mod tests_spawn_orquestador {
+    use super::*;
+    use clap::Parser;
+
+    /// `spawn --orquestador` acepta el rol y deja el comando intacto hasta aplicar el modo.
+    #[test]
+    fn spawn_acepta_orquestador_y_rol() {
+        let cli = Cli::try_parse_from(["galgo", "spawn", "jefe", "--orquestador", "--rol", "manager", "--", "claude", "--model", "haiku"]).unwrap();
+        match cli.cmd {
+            Cmd::Spawn { orquestador, rol, cmd, .. } => {
+                assert!(orquestador);
+                assert_eq!(rol, "manager");
+                assert_eq!(cmd, vec!["claude".to_string(), "--model".to_string(), "haiku".to_string()]);
+            }
+            _ => panic!("no es spawn"),
+        }
     }
 }

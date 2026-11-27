@@ -3,6 +3,7 @@
 //! Transporte: socket Unix, un JSON por línea. Cada solicitud recibe una respuesta.
 
 pub mod client;
+pub mod orquestacion;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
