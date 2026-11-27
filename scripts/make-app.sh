@@ -53,6 +53,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleIconFile</key><string>galgo</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
@@ -63,7 +64,9 @@ set -eu
 DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
 # Finder suele aportar un PATH mínimo. No ejecutar archivos de inicio de la shell:
 # agregar solo directorios habituales; si ya corre un daemon, este conserva su entorno.
-export PATH="$DIR:$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}"
+# El PATH de un login shell (.zprofile, brew, etc.) sin cargar .zshrc: rápido y como en Terminal.app.
+LOGIN_PATH=$(/bin/zsh -l -c 'printf %s "$PATH"' 2>/dev/null || true)
+export PATH="$DIR:${LOGIN_PATH:+$LOGIN_PATH:}$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}"
 # CLI y daemon hermanos: la CLI conecta o arranca el daemon si no existe.
 if ! "$DIR/galgo" ls >/dev/null; then
     /usr/bin/osascript -e 'display alert "Galgo no pudo iniciar el daemon" message "Revisa galgod.log junto al socket de galgo y vuelve a intentarlo." as critical' || true
@@ -72,6 +75,16 @@ fi
 exec "$DIR/galgo-gui"
 LAUNCHER
 chmod 755 "$APP/Contents/MacOS/galgo-launcher"
+# Icono: se dibuja con scripts/make-icon.swift (colores del tema) y se empaqueta como .icns.
+SCRIPTS=$(cd "$(dirname "$0")" && pwd -P)
+ICONSET="$STAGE/galgo.iconset"
+mkdir -p "$ICONSET"
+swift "$SCRIPTS/make-icon.swift" "$STAGE/icon-1024.png"
+for n in 16 32 128 256 512; do
+  sips -z "$n" "$n" "$STAGE/icon-1024.png" --out "$ICONSET/icon_${n}x${n}.png" >/dev/null
+  sips -z "$((n * 2))" "$((n * 2))" "$STAGE/icon-1024.png" --out "$ICONSET/icon_${n}x${n}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/galgo.icns"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 # renamex_np(RENAME_EXCL) realiza la comprobación y el rename en una sola operación.
 # A diferencia de mv, no introduce el bundle dentro de un directorio aparecido en la carrera.
