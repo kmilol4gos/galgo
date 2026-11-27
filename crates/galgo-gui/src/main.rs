@@ -230,6 +230,9 @@ struct App {
     error: Option<String>,
     loading: bool,
     listing: bool,
+    /// Modificadores del teclado (para Cmd+clic) y el último clic (para doble y triple clic: celda, instante, n).
+    mods: keyboard::Modifiers,
+    clicks: Option<(Cell, std::time::Instant, u8)>,
     /// Barra lateral y barra de estado visibles (por defecto, ocultas: terminal primero). Se recuerdan en las preferencias.
     sidebar: bool,
     status: bool,
@@ -331,6 +334,10 @@ enum Message {
     SubmitForm,
     Spawned(Result<serde_json::Value, String>),
     AskClose,
+    /// Cmd+K: limpia la pantalla del panel enfocado (Ctrl+L al shell).
+    ClearScreen,
+    /// Un archivo arrastrado a la ventana: su ruta se pega en el panel enfocado.
+    FileDropped(std::path::PathBuf),
     /// Muestra u oculta la barra lateral (Cmd+B) y la barra de estado (Cmd+/). Se recuerda la preferencia.
     ToggleSidebar,
     ToggleStatus,
@@ -419,7 +426,7 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         let detail = format!("{} · {}", p.status.as_str(), p.workspace.as_deref().unwrap_or("sin workspace"));
         items.push(PaletteItem { label: format!("Panel · {}", p.name), detail, message: Message::Select(p.id) });
     }
-    let commands: [(&str, &str, Message); 22] = [
+    let commands: [(&str, &str, Message); 23] = [
         ("Nuevo workspace…", "Cmd+N", Message::OpenNewWorkspace),
         ("Abrir carpeta…", "Cmd+O", Message::PickFolder),
         ("Nuevo terminal en este workspace", "Cmd+T", Message::NewTab),
@@ -430,6 +437,7 @@ fn palette_items(app: &App) -> Vec<PaletteItem> {
         ("Lanzar Codex aquí", "", Message::Launch(launch::Agent::Codex)),
         ("Lanzar PI aquí", "", Message::Launch(launch::Agent::Pi)),
         ("Nuevo panel con formulario", "", Message::OpenForm),
+        ("Limpiar la pantalla", "Cmd+K", Message::ClearScreen),
         ("Mostrar u ocultar la barra lateral", "Cmd+B", Message::ToggleSidebar),
         ("Mostrar u ocultar la barra de estado", "Cmd+/", Message::ToggleStatus),
         ("Dividir a la derecha", "Cmd+D", Message::SplitFocused(true)),
@@ -462,7 +470,8 @@ fn shortcut(key: &Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     let Key::Character(c) = key else { return None };
     let lower = c.as_str().to_lowercase();
     match (lower.as_str(), modifiers.shift()) {
-        ("k", false) | ("p", true) => Some(Message::OpenPalette),
+        ("p", true) => Some(Message::OpenPalette),
+        ("k", false) => Some(Message::ClearScreen),
         (",", false) => Some(Message::OpenSettings),
         ("n", false) => Some(Message::OpenNewWorkspace),
         ("o", false) => Some(Message::PickFolder),
@@ -984,6 +993,88 @@ fn selected_cols(sel: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
     (start <= end).then_some((start, end))
 }
 
+/// Abre una URL o una ruta con el visor del sistema (`open`). Un fallo se avisa y no detiene la app.
+fn open_target(objetivo: &str) {
+    if let Err(e) = std::process::Command::new("open").arg(objetivo).spawn() {
+        eprintln!("galgo-gui: no pude abrir {objetivo}: {e}");
+    }
+}
+
+/// Título de una pestaña: el que declaró la tarea (`galgo title`), o proceso y cwd («zsh ~/.config/rex»).
+fn titulo_pestana(p: &PaneInfo) -> String {
+    if let Some(t) = p.title.as_deref().filter(|t| !t.is_empty()) {
+        return t.to_string();
+    }
+    let proceso = p
+        .cmd
+        .first()
+        .and_then(|c| std::path::Path::new(c).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.name.clone());
+    match p.cwd.as_deref() {
+        Some(cwd) => format!("{proceso} {}", chrome::tilde(cwd)),
+        None => proceso,
+    }
+}
+
+/// Ruta o texto entre comillas simples para la shell, con las comillas internas escapadas.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Caracteres de una fila de la pantalla, una entrada por columna (sin continuación de caracteres anchos).
+fn row_chars(snap: &Snapshot, row: u16) -> Vec<char> {
+    snap.lines.get(row as usize).map_or_else(Vec::new, |runs| runs.iter().flat_map(|r| r.t.chars()).collect())
+}
+
+/// Palabra que contiene la columna `col` (letras, cifras y _ - . /), como rango de columnas.
+fn palabra_en(chars: &[char], col: u16) -> Option<(u16, u16)> {
+    let es = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    let c = *chars.get(col as usize)?;
+    if !es(c) {
+        return None;
+    }
+    let mut ini = col as usize;
+    while ini > 0 && es(chars[ini - 1]) {
+        ini -= 1;
+    }
+    let mut fin = col as usize;
+    while fin + 1 < chars.len() && es(chars[fin + 1]) {
+        fin += 1;
+    }
+    Some((ini as u16, fin as u16))
+}
+
+/// URL o ruta (existente) bajo la columna `col`, para abrirla con Cmd+clic. Se recortan los signos de puntuación
+/// finales; una ruta solo vale si existe.
+fn token_en(chars: &[char], col: u16) -> Option<String> {
+    let c = *chars.get(col as usize)?;
+    if c.is_whitespace() {
+        return None;
+    }
+    let mut ini = col as usize;
+    while ini > 0 && !chars[ini - 1].is_whitespace() {
+        ini -= 1;
+    }
+    let mut fin = col as usize;
+    while fin + 1 < chars.len() && !chars[fin + 1].is_whitespace() {
+        fin += 1;
+    }
+    let texto: String = chars[ini..=fin].iter().collect();
+    let texto = texto.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '"' | '\''));
+    if texto.starts_with("http://") || texto.starts_with("https://") {
+        return Some(texto.to_string());
+    }
+    if !(texto.starts_with('/') || texto.starts_with("~/")) {
+        return None;
+    }
+    let ruta = match texto.strip_prefix("~/") {
+        Some(resto) => std::path::PathBuf::from(home_dir()).join(resto),
+        None => std::path::PathBuf::from(texto),
+    };
+    ruta.exists().then(|| texto.to_string())
+}
+
 /// Texto de la selección. Las filas que continúan en la siguiente (soft wrap) se unen sin salto de
 /// línea; el resto termina en `\n` y sin espacios de relleno al final.
 fn selection_text(snap: &Snapshot, sel: Selection) -> String {
@@ -1129,6 +1220,28 @@ fn keep_focus_visible(app: &mut App) {
 
 fn update_inner(app: &mut App, message: Message) -> Task<Message> {
     match message {
+        Message::ClearScreen => match app.selected {
+            // Ctrl+L: el shell redibuja el prompt en lo alto y limpia la pantalla.
+            Some(id) => send_request(Request::Send { pane: id.to_string(), text: "\u{c}".into(), enter: false }, |_| Message::Echo),
+            None => Task::none(),
+        },
+        Message::FileDropped(path) => {
+            if body_mode(app) != Body::Screen {
+                return Task::none();
+            }
+            match app.selected {
+                // La ruta se pega como texto, entre comillas si hace falta; sin Enter: lo decides tú.
+                Some(id) => send_request(
+                    Request::Send { pane: id.to_string(), text: shell_quote(&path.to_string_lossy()) + " ", enter: false },
+                    |_| Message::Echo,
+                ),
+                None => Task::none(),
+            }
+        }
+        Message::Event(Event::Keyboard(keyboard::Event::ModifiersChanged(m))) => {
+            app.mods = m;
+            Task::none()
+        }
         Message::ToggleSidebar => {
             app.sidebar = !app.sidebar;
             save_pref(app, "sidebar", serde_json::json!(app.sidebar));
@@ -1152,6 +1265,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
         Message::Zoom(step) => {
             let next = if step == 0 { 0 } else { (zoom() + step).clamp(ZOOM_MIN, ZOOM_MAX) };
             ZOOM.store(next, std::sync::atomic::Ordering::Relaxed);
+            save_pref(app, "zoom", serde_json::json!(next));
             // Con otra letra caben otras filas y columnas: todos los paneles visibles se redimensionan.
             app.sizes.clear();
             resize_if_needed(app);
@@ -1754,10 +1868,30 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                 return Task::none();
             }
             if let Some(cell) = app.pointer.and_then(|p| grid_cell(app, p)) {
+                // Cmd+clic en una URL o una ruta existente: se abre con el visor del sistema; no empieza selección.
+                if app.mods.command() {
+                    if let Some(objetivo) = shown(app).and_then(|snap| token_en(&row_chars(snap, cell.0), cell.1)) {
+                        open_target(&objetivo);
+                        return Task::none();
+                    }
+                }
+                // Doble clic selecciona una palabra y triple clic una línea (el siguiente clic vuelve a empezar).
+                let n = match app.clicks {
+                    Some((prev, at, n)) if prev == cell && at.elapsed() < Duration::from_millis(400) => {
+                        if n >= 3 { 1 } else { n + 1 }
+                    }
+                    _ => 1,
+                };
+                app.clicks = Some((cell, std::time::Instant::now(), n));
                 // Se congela la pantalla que el usuario ve en este momento.
                 app.sel_snap = app.snap.clone();
-                app.sel = Some(Selection { anchor: cell, head: cell });
-                app.dragging = true;
+                let seleccion = match (n, shown(app)) {
+                    (2, Some(snap)) => palabra_en(&row_chars(snap, cell.0), cell.1).map(|(a, b)| Selection { anchor: (cell.0, a), head: (cell.0, b) }),
+                    (3, Some(snap)) => Some(Selection { anchor: (cell.0, 0), head: (cell.0, snap.cols.saturating_sub(1)) }),
+                    _ => None,
+                };
+                app.dragging = seleccion.is_none();
+                app.sel = Some(seleccion.unwrap_or(Selection { anchor: cell, head: cell }));
             }
             Task::none()
         }
@@ -2091,7 +2225,8 @@ fn main() -> iced::Result {
             iced::time::every(Duration::from_millis(50)).map(|_| Message::TickScreen),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TickList),
             event::listen_with(|event, status, _id| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { .. }) => Some(Message::Event(event)),
+                Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::Keyboard(keyboard::Event::ModifiersChanged(_)) => Some(Message::Event(event)),
+                Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
                 Event::Window(iced::window::Event::Resized(_))
                 | Event::Window(iced::window::Event::Opened { .. })
                 | Event::Window(iced::window::Event::Focused)
@@ -2125,6 +2260,9 @@ fn main() -> iced::Result {
             fonts::set_current(elegida.unwrap_or_else(|| fonts::automatic(&installed)));
             // Barra lateral y barra de estado: como se dejaron (por defecto, ocultas).
             let flag = |clave: &str| prefs::get(&prefs, clave).and_then(|v| v.as_bool()).unwrap_or(false);
+            // Zoom de letra: el último que se eligió (0 = normal).
+            let zoom_guardado = prefs::get(&prefs, "zoom").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            ZOOM.store(zoom_guardado.clamp(ZOOM_MIN, ZOOM_MAX), std::sync::atomic::Ordering::Relaxed);
             let app = App {
                 window: (1100.0, 700.0),
                 focused: true,
@@ -2468,6 +2606,27 @@ mod tests {
         assert_eq!(app.limits_error.as_deref(), Some("sin daemon"));
     }
 
+    /// Título de pestaña: proceso y cwd, o el título de la tarea.
+    #[test]
+    fn titulo_de_pestana_proceso_y_cwd() {
+        let mut p = pane_info(1, "shell", Status::Idle);
+        p.cmd = vec!["/bin/zsh".into(), "-l".into()];
+        p.cwd = Some(format!("{}/Development/nexo", home_dir()));
+        assert_eq!(titulo_pestana(&p), "zsh ~/Development/nexo");
+        p.title = Some("bug de ventas".into());
+        assert_eq!(titulo_pestana(&p), "bug de ventas", "el título de la tarea manda");
+    }
+
+    /// Selección y apertura en el terminal: palabra, URL, ruta y el entrecomillado de rutas al arrastrar.
+    #[test]
+    fn palabra_url_y_comillas() {
+        let linea: Vec<char> = "ver https://x.dev/a, ok".chars().collect();
+        assert_eq!(palabra_en(&linea, 1), Some((0, 2)));
+        assert_eq!(token_en(&linea, 6).as_deref(), Some("https://x.dev/a"));
+        assert_eq!(token_en(&linea, 3), None, "el espacio no es un enlace");
+        assert_eq!(shell_quote("a b'c"), "'a b'\\''c'");
+    }
+
     /// Terminal primero: sin barra lateral ni de estado, y una sola fila superior mientras haya un workspace.
     #[test]
     fn marco_por_defecto_es_terminal_primero() {
@@ -2711,11 +2870,13 @@ mod tests {
         assert!(app.palette.is_none());
     }
 
-    /// C: Cmd+K y Cmd+Shift+P abren la paleta.
+    /// C: Cmd+Shift+P abre la paleta; Cmd+K limpia la pantalla (terminal primero).
     #[test]
     fn atajos_de_la_paleta() {
         let k = Key::Character("k".into());
-        assert!(matches!(shortcut(&k, keyboard::Modifiers::COMMAND), Some(Message::OpenPalette)));
+        assert!(matches!(shortcut(&k, keyboard::Modifiers::COMMAND), Some(Message::ClearScreen)));
+        let p = Key::Character("p".into());
+        assert!(matches!(shortcut(&p, keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenPalette)));
         let p = Key::Character("P".into());
         assert!(matches!(shortcut(&p, keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT), Some(Message::OpenPalette)));
     }

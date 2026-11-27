@@ -291,13 +291,13 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
     if let Some(ws) = key.as_ref().and_then(|k| app.layouts.by_key.get(k)) {
         for (i, tab) in ws.tabs.iter().enumerate() {
             let pane = app.panes.iter().find(|p| p.id == tab.focus);
-            let name = pane.map_or("?", |p| p.name.as_str());
+            let name = pane.map_or("?".to_string(), titulo_pestana);
             let color = pane.map_or(theme::IDLE, |p| theme::status_color(p.status));
             let active = i == ws.active;
             let n = tab.root.ids().len();
             // Un shell normal es solo su nombre. Un agente real (lanzado por galgo o con hooks) suma su estado y, si
             // espera algo de ti, un contador de pendientes.
-            let mut label = row![text(name).size(theme::BODY_SIZE)].spacing(7).align_y(Alignment::Center);
+            let mut label = row![text(name.clone()).size(theme::BODY_SIZE)].spacing(7).align_y(Alignment::Center);
             if let Some(p) = pane.filter(|p| p.agent) {
                 label = label.push(dot(theme::status_color(p.status), 6.0));
                 let pendientes = p.unacked + usize::from(p.status == Status::Blocked);
