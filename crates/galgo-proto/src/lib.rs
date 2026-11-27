@@ -345,6 +345,10 @@ pub struct PaneInfo {
     /// Título de la tarea que el agente declara (`galgo title`). Ausente si nunca lo declaró.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Hay un agente real en el panel: lo lanzó galgo, lo reconoce el comando o ha enviado eventos de hook. Un shell
+    /// normal es `false`; con `claude` a mano en un shell, pasa a `true` en cuanto su hook avisa.
+    #[serde(default)]
+    pub agent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +438,7 @@ mod tests_grupos {
             cwd: None,
             usage: None,
             title: None,
+            agent: false,
         }
     }
 

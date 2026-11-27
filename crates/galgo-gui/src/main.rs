@@ -2325,6 +2325,7 @@ mod tests {
             cwd: None,
             usage: None,
             title: None,
+            agent: false,
         }
     }
 
@@ -3049,7 +3050,7 @@ mod render {
     use iced_runtime::user_interface::{Cache, UserInterface};
 
     fn pane_info(id: u32, name: &str, status: Status) -> PaneInfo {
-        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None }
+        PaneInfo { id, name: name.into(), status, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false }
     }
 
     fn snap(lines: &[&str], cols: u16) -> Snapshot {
@@ -3338,6 +3339,7 @@ mod lanzador_tests {
             cwd: None,
             usage: None,
             title: None,
+            agent: false,
         };
         let mut app = App { panes: vec![uno], window: (1100.0, 700.0), ..Default::default() };
         let _ = update(&mut app, Message::LauncherModel("claude".into(), "opus".into()));
@@ -3398,7 +3400,7 @@ mod atencion_tests {
     /// M1 (review-14): un resultado sin leer se distingue en la fila del agente; un Done ya visto no.
     #[test]
     fn r14_fila_muestra_la_insignia_de_sin_leer() {
-        let mut working = PaneInfo { id: 1, name: "codex".into(), status: Status::Working, manager: None, cmd: vec!["codex".into()], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None };
+        let mut working = PaneInfo { id: 1, name: "codex".into(), status: Status::Working, manager: None, cmd: vec!["codex".into()], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false };
         let mut app = App::default();
         app.attention.observe(&[working.clone()], None);
         working.status = Status::Done;
@@ -3442,7 +3444,7 @@ mod arrastre_tests {
     /// M3 (review-14): arrastrar la barra no cambia el panel, la vista ni las capas.
     #[test]
     fn r14_arrastrar_la_barra_no_toca_el_estado() {
-        let p = PaneInfo { id: 1, name: "p".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None };
+        let p = PaneInfo { id: 1, name: "p".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: None, usage: None, title: None, agent: false };
         let mut app = App { window: (1100.0, 700.0), panes: vec![p], selected: Some(1), ..Default::default() };
         let _ = update(&mut app, Message::DragWindow);
         assert_eq!(app.selected, Some(1));
@@ -3469,7 +3471,7 @@ mod capas_tests {
     /// no maximiza el panel de detrás.
     #[test]
     fn r14_atajos_no_actuan_bajo_las_capas() {
-        let mut uno = PaneInfo { id: 1, name: "a".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some("w".into()), cwd: None, usage: None, title: None };
+        let mut uno = PaneInfo { id: 1, name: "a".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some("w".into()), cwd: None, usage: None, title: None, agent: false };
         let dos = PaneInfo { id: 2, name: "b".into(), ..uno.clone() };
         uno.id = 1;
         let mut app = App { panes: vec![uno, dos], selected: Some(1), window: (1100.0, 700.0), ..Default::default() };
@@ -3492,7 +3494,7 @@ mod r14_b_tests {
     use super::*;
 
     fn pane(id: u32, ws: &str) -> PaneInfo {
-        PaneInfo { id, name: format!("p{id}"), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some(ws.into()), cwd: None, usage: None, title: None }
+        PaneInfo { id, name: format!("p{id}"), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: Some(ws.into()), cwd: None, usage: None, title: None, agent: false }
     }
 
     /// B4 (review-14): elegir un workspace por clave lleva a su panel aunque cambie el orden de la lista.

@@ -104,6 +104,8 @@ struct Pane {
     last_summary: Option<String>,
     /// Título de la tarea que declara el agente (solo en memoria).
     title: Option<String>,
+    /// Ha enviado eventos de hook de agente (un agente real, aunque no lo lanzara galgo). Solo en memoria.
+    hooked: bool,
     /// Último motivo de bloqueo avisado al manager; un motivo nuevo se avisa aunque ya estuviera blocked.
     last_blocked: Option<String>,
     /// Procesos que seguían en la sesión del panel cuando el líder salió (el líder aún sin recolectar,
@@ -166,6 +168,7 @@ impl Pane {
             last_summary: None,
             title: None,
             last_blocked: None,
+            hooked: false,
             orphans: Vec::new(),
             waiting_on: None,
             reported: false,
@@ -307,6 +310,7 @@ impl State {
             cwd: p.cwd.clone(),
             usage: usage::merged(p.usage.as_ref(), p.usage_report.as_ref()),
             title: p.title.clone(),
+            agent: p.hooked || is_agent_cmd(&p.cmd) || p.usage.is_some() || p.usage_report.is_some(),
         }
     }
 }
@@ -604,6 +608,14 @@ fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(Pa
 
 /// Deduce el workspace de un directorio dentro de un repo git: "<repo>/<rama>". Sin git, o con el
 /// HEAD desligado, devuelve `None` o solo el nombre del repo. Nunca falla: git ausente no es un error.
+/// Comando de un agente conocido (por nombre de ejecutable).
+fn is_agent_cmd(cmd: &[String]) -> bool {
+    cmd.first()
+        .and_then(|c| std::path::Path::new(c).file_name())
+        .map(|n| matches!(n.to_string_lossy().as_ref(), "claude" | "codex" | "pi" | "opencode"))
+        .unwrap_or(false)
+}
+
 fn workspace_for(cwd: Option<&str>) -> Option<String> {
     let dir = cwd?;
     let top = git_out(dir, &["rev-parse", "--show-toplevel"])?;
@@ -824,6 +836,7 @@ impl Daemon {
             last_summary: None,
             title: None,
             last_blocked: None,
+            hooked: false,
             orphans: Vec::new(),
             waiting_on: None,
             reported: false,
@@ -1294,6 +1307,8 @@ impl Daemon {
                 let target = {
                     let mut st = self.state.lock().unwrap();
                     let id = st.resolve(&pane)?;
+                    // Un hook de agente marca el panel como agente real (lo muestra la GUI).
+                    st.panes.get_mut(&id).unwrap().hooked = true;
                     let (manager, reported) = {
                         let p = &st.panes[&id];
                         (p.manager, p.reported)
@@ -1880,7 +1895,7 @@ mod tests_workspace {
 mod tests_fantasmas {
     use super::*;
 
-    fn daemon_con(state: State) -> Arc<Daemon> {
+    pub(crate) fn daemon_con(state: State) -> Arc<Daemon> {
         daemon_con_en(state, std::env::temp_dir().join("galgo-no-se-usa.json"))
     }
 
@@ -1901,7 +1916,7 @@ mod tests_fantasmas {
         })
     }
 
-    fn fantasma(id: u32, name: &str, manager: Option<u32>) -> Pane {
+    pub(crate) fn fantasma(id: u32, name: &str, manager: Option<u32>) -> Pane {
         Pane::ghost(id, name.into(), vec!["bash".into()], manager, vec![], None, None)
     }
 
@@ -2295,5 +2310,30 @@ mod worktree_tests {
         assert!(worktree_accion(&d, WorktreeAction::Diff, false, false).is_err());
         assert!(worktree_accion(&d, WorktreeAction::Discard, true, false).is_err());
         let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
+#[cfg(test)]
+mod agente_tests {
+    use super::*;
+    use super::tests_fantasmas::{daemon_con, fantasma};
+
+    /// Divulgación progresiva: un comando de agente conocido o un panel con hooks es un agente real; un shell no.
+    #[test]
+    fn agente_real_por_comando_o_por_hook() {
+        assert!(is_agent_cmd(&["/usr/local/bin/claude".to_string(), "--model".into()]));
+        assert!(!is_agent_cmd(&["/bin/zsh".to_string()]));
+        assert!(!is_agent_cmd(&[]));
+        let mut st = State { epoch: 3, ..State::default() };
+        let mut p = fantasma(1, "shell", None);
+        p.ghost = false;
+        p.cmd = vec!["/bin/zsh".into()];
+        st.panes.insert(1, p);
+        let d = daemon_con(st);
+        let antes = { let st = d.state.lock().unwrap(); st.info(&st.panes[&1], 30).agent };
+        assert!(!antes, "un shell sin hooks no es agente");
+        d.state.lock().unwrap().panes.get_mut(&1).unwrap().hooked = true;
+        let despues = { let st = d.state.lock().unwrap(); st.info(&st.panes[&1], 30).agent };
+        assert!(despues, "con hooks, el panel es un agente real");
     }
 }

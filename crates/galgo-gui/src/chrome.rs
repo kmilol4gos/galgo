@@ -164,13 +164,12 @@ fn sidebar_list(app: &App) -> Element<'_, Message> {
         )
         .padding([4, 8]),
     );
-    // agents · priority: todos los agentes, por prioridad.
-    list = list.push(lower_section("agents", Some("priority")));
-    if app.panes.is_empty() {
-        list = list.push(container(text("Sin agentes. Abre una carpeta con ⌘N.").size(theme::SMALL_SIZE).color(theme::DIM)).padding([8, 8]));
-    }
-    for pane in sidebar::agents_sorted(&app.panes) {
-        list = list.push(agent_row(app, pane));
+    // agents · priority: solo los agentes reales, por prioridad. Sin ninguno, la sección no aparece.
+    if app.panes.iter().any(|p| p.agent) {
+        list = list.push(lower_section("agents", Some("priority")));
+        for pane in sidebar::agents_sorted(&app.panes).into_iter().filter(|p| p.agent) {
+            list = list.push(agent_row(app, pane));
+        }
     }
     container(list).padding([0, 6]).into()
 }
@@ -252,7 +251,7 @@ pub fn clock_hm() -> String {
 
 pub fn sidebar_view(app: &App) -> Element<'_, Message> {
     let search = theme::btn(
-        row![text("Buscar o ejecutar…").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), Space::with_width(Length::Fill), theme::keycap("Cmd+K")]
+        row![text("Buscar o ejecutar…").size(theme::SMALL_SIZE + 1.0).color(theme::DIM), Space::with_width(Length::Fill), theme::keycap("Cmd+Shift+P")]
             .align_y(Alignment::Center),
     )
     .padding([5, 8])
@@ -270,7 +269,8 @@ pub fn sidebar_view(app: &App) -> Element<'_, Message> {
     let body = column![
         container(search).padding(iced::Padding { top: 10.0, bottom: 2.0, left: 10.0, right: 10.0 }),
         scrollable(sidebar_list(app)).height(Length::Fill),
-        limits_footer(app),
+        // Cuotas: solo cuando hay un agente real que las consume (divulgación progresiva).
+        if app.panes.iter().any(|p| p.agent) { limits_footer(app) } else { Space::with_height(0).into() },
     ];
     row![
         container(body).width(Length::Fixed(SIDEBAR_W - 1.0)).height(Length::Fill).style(theme::surface(SIDEBAR)),
@@ -295,7 +295,16 @@ pub fn tabs_bar(app: &App) -> Element<'_, Message> {
             let color = pane.map_or(theme::IDLE, |p| theme::status_color(p.status));
             let active = i == ws.active;
             let n = tab.root.ids().len();
-            let mut label = row![dot(color, 6.0), text(name).size(theme::BODY_SIZE)].spacing(7).align_y(Alignment::Center);
+            // Un shell normal es solo su nombre. Un agente real (lanzado por galgo o con hooks) suma su estado y, si
+            // espera algo de ti, un contador de pendientes.
+            let mut label = row![text(name).size(theme::BODY_SIZE)].spacing(7).align_y(Alignment::Center);
+            if let Some(p) = pane.filter(|p| p.agent) {
+                label = label.push(dot(theme::status_color(p.status), 6.0));
+                let pendientes = p.unacked + usize::from(p.status == Status::Blocked);
+                if pendientes > 0 {
+                    label = label.push(text(pendientes.to_string()).size(10).color(theme::BLOCKED));
+                }
+            }
             if n > 1 {
                 let zoomed = active && maximized(app).is_some();
                 label = label.push(text(if zoomed { format!("1/{n}") } else { format!("{n}") }).size(10).color(if zoomed { theme::ACCENT } else { theme::DIM }));
