@@ -601,6 +601,40 @@ impl State {
         self.entregar(pane);
     }
 
+    /// Por qué no se puede quitar el panel `id` sin perder algo: mensajes sin confirmar, o tareas delegadas por él que
+    /// siguen abiertas, y no hay un manager vivo al que pasarlas (revisión 20, A1). `None` si se puede quitar.
+    fn bloqueo_de_cierre(&self, id: u32) -> Option<String> {
+        let p = self.panes.get(&id)?;
+        if p.manager.is_some_and(|m| self.panes.contains_key(&m)) {
+            return None;
+        }
+        let pendientes = p.inbox.iter().filter(|m| !m.acked).count();
+        if pendientes > 0 {
+            return Some(format!(
+                "el panel {} tiene {pendientes} mensaje(s) sin confirmar y no tiene manager al que pasarlos; confírmalos con galgo ack o reasigna un manager",
+                p.name
+            ));
+        }
+        let abiertas = self.tasks.iter().filter(|t| t.from == id && t.status.abierta()).count();
+        if abiertas > 0 {
+            return Some(format!(
+                "el panel {} tiene {abiertas} tarea(s) delegada(s) abiertas y no tiene manager al que pasarlas; ciérralas antes o reasigna un manager",
+                p.name
+            ));
+        }
+        None
+    }
+
+    /// Al quitar a un delegador, sus tareas abiertas pasan a su manager vivo: el resultado sigue llegando a alguien.
+    fn reasignar_tareas_de(&mut self, id: u32, manager: Option<u32>) {
+        let Some(m) = manager else { return };
+        let Some(nombre) = self.panes.get(&m).map(|p| p.name.clone()) else { return };
+        for t in self.tasks.iter_mut().filter(|t| t.from == id && t.status.abierta()) {
+            t.from = m;
+            t.from_name = nombre.clone();
+        }
+    }
+
     /// El destinatario terminó su proceso: sus tareas abiertas fallan y el delegador lo sabe.
     fn fail_tasks_of(&mut self, pane: u32) {
         let abiertas: Vec<usize> = self.tasks.iter().enumerate().filter(|(_, t)| t.to == pane && t.status.abierta()).map(|(i, _)| i).collect();
@@ -2315,13 +2349,18 @@ impl Daemon {
         if let Some(out) = self.forget_ghost(&key)? {
             return Ok(out);
         }
+        // A3 (revisión 20): lo que impediría quitar el panel se comprueba antes de matar su proceso.
+        if let Some(motivo) = self.state.lock().unwrap().bloqueo_de_cierre(id) {
+            bail!(motivo);
+        }
         // «Ya terminó» no es un error al cerrar: es justo lo que queda por quitar.
         if let Err(e) = self.kill_pane(&key).await {
             if !self.state.lock().unwrap().panes.get(&id).is_some_and(|p| p.exited) {
                 return Err(e);
             }
         }
-        for _ in 0..40 {
+        // B1 (revisión 20): el hilo de salida puede tardar más que 200 ms bajo carga; se sondea con paso corto hasta ~2 s.
+        for _ in 0..400 {
             if self.state.lock().unwrap().panes.get(&id).is_none_or(|p| p.exited) {
                 break;
             }
@@ -2354,13 +2393,11 @@ impl Daemon {
         if !(st.panes[&id].ghost || terminado && st.panes[&id].exited) {
             return Ok(None);
         }
-        let manager = st.panes[&id].manager.filter(|m| st.panes.contains_key(m));
-        let pending = st.panes[&id].inbox.iter().filter(|m| !m.acked).count();
-        if pending > 0 && manager.is_none() {
-            bail!(
-                "el panel {pane} tiene {pending} mensaje(s) sin confirmar y no tiene manager al que pasarlos; confírmalos con galgo ack o reasigna un manager"
-            );
+        if let Some(motivo) = st.bloqueo_de_cierre(id) {
+            bail!(motivo);
         }
+        let manager = st.panes[&id].manager.filter(|m| st.panes.contains_key(m));
+        st.reasignar_tareas_de(id, manager);
         let ghost = st.panes.remove(&id).unwrap();
         let mut moved = 0usize;
         for m in ghost.inbox.into_iter().filter(|m| !m.acked) {
@@ -3626,6 +3663,30 @@ mod orquestador_tests {
         { let p = st.panes.get(&2).unwrap(); let sc = p.screen.lock().unwrap(); p.prompt_libre.store(prompt_libre_de(sc.screen()), Ordering::SeqCst); }
         st.deliver(2);
         assert_eq!(st.tasks[0].status, TaskStatus::Entregada);
+    }
+
+    /// A1 (revisión 20): un delegador quitado no deja tareas huérfanas: pasan a su manager vivo, o el cierre se rechaza.
+    #[test]
+    fn quitar_un_delegador_pasa_sus_tareas_al_manager_o_se_rechaza() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _jefe = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _delegador = vivo(&mut st, 2, "medio", true, Status::Idle);
+        let _obrero = vivo(&mut st, 3, "obrero", true, Status::Idle);
+        st.panes.get_mut(&2).unwrap().manager = Some(1);
+        st.tasks.push(tarea_abierta(7, 2, 3, None, 0));
+        // Sin manager vivo, con una tarea abierta como remitente: no se puede quitar.
+        st.panes.get_mut(&2).unwrap().manager = None;
+        assert!(st.bloqueo_de_cierre(2).unwrap().contains("tarea"));
+        // Con manager vivo: la tarea pasa a su nombre y el cierre es posible.
+        st.panes.get_mut(&2).unwrap().manager = Some(1);
+        assert!(st.bloqueo_de_cierre(2).is_none());
+        st.reasignar_tareas_de(2, Some(1));
+        assert_eq!((st.tasks[0].from, st.tasks[0].from_name.as_str()), (1, "jefe"));
+        // Una tarea ya cerrada no bloquea.
+        st.tasks[0].status = TaskStatus::Lista;
+        st.panes.get_mut(&1).unwrap().manager = None;
+        st.panes.get_mut(&2).unwrap().manager = None;
+        assert!(st.bloqueo_de_cierre(2).is_none());
     }
 
     fn tarea_abierta(id: u64, from: u32, to: u32, ws: Option<&str>, created_unix: u64) -> Task {
