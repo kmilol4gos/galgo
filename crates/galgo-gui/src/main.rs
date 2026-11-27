@@ -253,6 +253,8 @@ struct App {
     ws_saved: String,
     /// Cerrar un workspace pide dos clics: el primero deja aquí su clave.
     ws_close_armed: Option<String>,
+    /// Cuándo se armó el cierre: pasados unos segundos, el primer clic vuelve a contar como aviso.
+    ws_close_armed_at: Option<std::time::Instant>,
     /// Formulario «+ Agente…» abierto, y el rol de cada agente por nombre de panel (se guarda con el workspace).
     agent_form: Option<AgentForm>,
     roles: BTreeMap<String, String>,
@@ -2223,11 +2225,15 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::CloseWorkspace(key) => {
-            if app.ws_close_armed.as_deref() != Some(key.as_str()) {
+            // review-15 B5: el aviso caduca a los 3 s; el segundo clic solo cierra si llega dentro de ese plazo.
+            let vigente = app.ws_close_armed.as_deref() == Some(key.as_str()) && app.ws_close_armed_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+            if !vigente {
                 app.ws_close_armed = Some(key);
+                app.ws_close_armed_at = Some(std::time::Instant::now());
                 return Task::none();
             }
             app.ws_close_armed = None;
+            app.ws_close_armed_at = None;
             app.explicit.remove(&key);
             let ids: Vec<u32> = app.panes.iter().filter(|p| p.workspace.as_deref() == Some(key.as_str())).map(|p| p.id).collect();
             app.layouts.by_key.remove(&key);
@@ -3666,6 +3672,29 @@ mod tests {
         let _ = launch_team(&mut app, None, root.clone(), team);
         assert!(app.error.as_deref().is_some_and(|e| e.contains("no es un repo git")), "{:?}", app.error);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// review-15 B5: cerrar un grupo pide un segundo clic dentro de 3 s; pasado el plazo, el primero vuelve a avisar.
+    /// B7: arrastrar un archivo con ajustes abiertos no llega a la validación del panel.
+    #[test]
+    fn cerrar_grupo_caduca_y_arrastre_respeta_dialogos() {
+        let mut app = App::default();
+        app.explicit.insert("nexo".into(), "/tmp/nexo".into());
+        let _ = update(&mut app, Message::CloseWorkspace("nexo".into()));
+        assert!(app.explicit.contains_key("nexo"), "el primer clic solo avisa");
+        let _ = update(&mut app, Message::CloseWorkspace("nexo".into()));
+        assert!(!app.explicit.contains_key("nexo"), "el segundo, dentro de 3 s, cierra");
+        app.explicit.insert("nexo".into(), "/tmp/nexo".into());
+        let _ = update(&mut app, Message::CloseWorkspace("nexo".into()));
+        if let Some(viejo) = std::time::Instant::now().checked_sub(Duration::from_secs(10)) {
+            app.ws_close_armed_at = Some(viejo);
+            let _ = update(&mut app, Message::CloseWorkspace("nexo".into()));
+            assert!(app.explicit.contains_key("nexo"), "un aviso caducado no cierra: vuelve a avisar");
+        }
+        let mut con_ajustes = App::default();
+        con_ajustes.settings = Some(settings::Section::General);
+        let _ = update(&mut con_ajustes, Message::FileDropped(std::path::PathBuf::from("/tmp/a\u{3}b")));
+        assert!(con_ajustes.error.is_none(), "con ajustes abiertos, el arrastre no llega al panel");
     }
 
     /// Arranque (principio terminal-primero): la primera lista vacía abre un shell en ~ y marca el inicio; la

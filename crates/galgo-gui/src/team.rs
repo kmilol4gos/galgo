@@ -64,7 +64,10 @@ fn provider(text: &str) -> Option<Agent> {
 
 /// Modelo con caracteres seguros (letras, cifras, `.`, `_`, `-`, `:`, `/`): viaja como un argumento, sin shell.
 fn valid_model(text: &str) -> bool {
-    (1..=MAX_MODEL).contains(&text.chars().count()) && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
+    // review-15 B1: sin `-` inicial, o el modelo se leería como un flag (`--dangerously-skip-permissions`).
+    !text.starts_with('-')
+        && (1..=MAX_MODEL).contains(&text.chars().count())
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
 }
 
 /// Caracteres de formato (Cf: bidi, ancho cero, marcas invisibles, etiquetas E0000-E007F), de uso privado (Co) y no
@@ -119,6 +122,11 @@ pub fn parse(text: &str) -> Result<Team, String> {
             if !valid_model(m) {
                 return Err(format!("{}: modelo no válido {:?}", a.name, m));
             }
+        }
+        // review-15 B2: opencode no tiene flag de modelo en su comando (lo verificó r14 B6): un modelo ahí se ignoraría
+        // en silencio, así que se rechaza.
+        if provider == Agent::OpenCode && a.model.is_some() {
+            return Err(format!("{}: opencode no admite modelo en su comando; quita model", a.name));
         }
         let role = match a.role.as_deref() {
             None => Role::Libre,
@@ -256,6 +264,15 @@ role = "reviewer"
         assert!(parse("[[agent]]\nname=\"a\u{200B}\"\nprovider=\"claude\"").is_err(), "nombre con invisible");
         assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nprompt=\"Lee el README.\\n\\nDespués, resume.\"").is_ok(), "texto normal con párrafos");
         assert_eq!(prompt_stats("uno\ndos"), (7, 2));
+    }
+
+    /// review-15 B1/B2: un modelo que empieza por `-` no entra (sería un flag), y opencode no acepta modelo.
+    #[test]
+    fn modelo_con_guion_o_en_opencode_no_entra() {
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nmodel=\"--dangerously-skip-permissions\"").is_err(), "un flag no es un modelo");
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"codex\"\nmodel=\"-x\"").is_err());
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"opencode\"\nmodel=\"gpt\"").is_err(), "opencode no admite modelo");
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"opencode\"").is_ok(), "sin modelo, sí");
     }
 
     /// Modelos y prompts: caracteres seguros y tamaño acotado; un nombre con espacios no entra.

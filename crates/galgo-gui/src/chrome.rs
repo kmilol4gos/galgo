@@ -286,9 +286,16 @@ pub fn sidebar_view(app: &App) -> Element<'_, Message> {
 /// Barra superior del área de terminales: dónde estás (proyecto / rama), las pestañas del workspace y las acciones.
 /// Píldora de un workspace explícito: su nombre, sus pestañas y el cierre del grupo (dos clics: el primero avisa).
 fn group_pill<'a>(app: &'a App, key: String, pestanas: Vec<Element<'a, Message>>) -> Element<'a, Message> {
-    let armed = app.ws_close_armed.as_deref() == Some(key.as_str());
+    let armed = app.ws_close_armed.as_deref() == Some(key.as_str()) && app.ws_close_armed_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3));
+    // Con agentes trabajando o esperando, el aviso lo dice antes de cerrarlos.
+    let ocupados = app.panes.iter().filter(|p| p.workspace.as_deref() == Some(key.as_str()) && matches!(p.status, Status::Working | Status::Blocked)).count();
+    let aviso = match (armed, ocupados) {
+        (true, 0) => "¿cerrar grupo?".to_string(),
+        (true, n) => format!("¿cerrar? {n} trabajando"),
+        (false, _) => String::new(),
+    };
     let cerrar = theme::btn(
-        text(if armed { "¿cerrar grupo?" } else { "×" })
+        text(if armed { aviso } else { "×".to_string() })
             .size(if armed { theme::SMALL_SIZE } else { 13.0 })
             .color(if armed { theme::FAILED } else { theme::DIM }),
     )

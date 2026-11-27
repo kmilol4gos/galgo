@@ -75,14 +75,29 @@ pub struct Restored {
     pub by_key: BTreeMap<String, WsTabs>,
 }
 
+/// Quita las hojas repetidas de un árbol: un id aparece una sola vez (en la primera hoja que lo tenga). Un split que
+/// se queda sin hojas desaparece; el resto se mantiene.
+fn sin_repetidos(n: Node, vistos: &mut std::collections::HashSet<u32>) -> Option<Node> {
+    match n {
+        Node::Leaf(id) => vistos.insert(id).then_some(Node::Leaf(id)),
+        Node::Split { vertical, ratio, a, b } => match (sin_repetidos(*a, vistos), sin_repetidos(*b, vistos)) {
+            (Some(a), Some(b)) => Some(Node::Split { vertical, ratio, a: Box::new(a), b: Box::new(b) }),
+            (Some(solo), None) | (None, Some(solo)) => Some(solo),
+            (None, None) => None,
+        },
+    }
+}
+
 pub fn restore(v: &Value, id_de: &dyn Fn(&str) -> Option<u32>) -> Restored {
     let mut out = Restored { explicit: BTreeMap::new(), by_key: BTreeMap::new() };
     let Some(list) = v.get("workspaces").and_then(Value::as_array) else { return out };
+    // review-15 B4: un panel está en una sola hoja de todo lo restaurado (si no, se pintaría dos veces).
+    let mut vistos = std::collections::HashSet::new();
     for ws in list.iter().take(MAX_WORKSPACES) {
         let Some(key) = ws.get("key").and_then(Value::as_str).filter(|k| !k.is_empty() && k.len() <= 200) else { continue };
         let mut tabs = Vec::new();
         for t in ws.get("tabs").and_then(Value::as_array).into_iter().flatten().take(MAX_TABS) {
-            let Some(root) = t.get("tree").and_then(|tree| json_to_tree(tree, id_de)) else { continue };
+            let Some(root) = t.get("tree").and_then(|tree| json_to_tree(tree, id_de)).and_then(|r| sin_repetidos(r, &mut vistos)) else { continue };
             let focus = t.get("focus").and_then(Value::as_str).and_then(id_de).filter(|f| root.ids().contains(f)).unwrap_or(root.ids()[0]);
             tabs.push(Tab { root, focus });
         }
@@ -153,6 +168,22 @@ mod tests {
         assert_eq!(ws.active, 1);
         assert_eq!(ws.tabs[1].focus, 3);
         assert_eq!(ws.tabs.len(), 2);
+    }
+
+    /// review-15 B4: un panel que aparece dos veces (en dos hojas o en dos pestañas) queda en una sola hoja.
+    #[test]
+    fn panel_repetido_queda_en_una_hoja() {
+        let json = json!({ "workspaces": [
+            { "key": "a", "explicit": false, "active": 0, "tabs": [
+                { "focus": "shell", "tree": { "split": { "v": true, "r": 0.5, "a": { "leaf": "shell" }, "b": { "leaf": "shell" } } } },
+                { "focus": "claude", "tree": { "leaf": "claude" } }
+            ] },
+            { "key": "b", "explicit": false, "active": 0, "tabs": [ { "focus": "claude", "tree": { "leaf": "claude" } } ] }
+        ] });
+        let r = restore(&json, &ids);
+        let todas: Vec<u32> = r.by_key.values().flat_map(|ws| ws.tabs.iter().flat_map(|t| t.root.ids())).collect();
+        assert_eq!(todas.iter().filter(|id| **id == 1).count(), 1, "shell aparece una vez");
+        assert_eq!(todas.iter().filter(|id| **id == 2).count(), 1, "claude aparece una vez");
     }
 
     /// Entradas malformadas o fuera de límite no rompen la restauración.
