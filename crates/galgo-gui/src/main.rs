@@ -32,7 +32,7 @@ use galgo_usage::Limits;
 use iced::keyboard::{self, key::Named, Key};
 use iced::mouse;
 use iced::widget::text::Span;
-use iced::widget::{rich_text, span};
+use iced::widget::{rich_text, span, stack, text};
 use iced::{event, font, Event, Point, Subscription};
 use std::sync::{mpsc, OnceLock};
 
@@ -323,6 +323,10 @@ struct App {
     salir_al_vaciar: bool,
     /// Se cerró el último panel: la ventana sale solo si el Kill responde `removed` (revisión 20, A2).
     cierre_ultimo: bool,
+    /// Copia desde programas (OSC 52) activada: por defecto sí; se guarda en `gui-prefs.json` (`osc52_copy`).
+    copia_osc52: bool,
+    /// Aviso breve de la última copia: pestaña, caracteres y cuándo (se oculta a los pocos segundos).
+    aviso_copia: Option<(String, usize, std::time::Instant)>,
     /// Cuotas por agente del daemon, y el último error si no se pudieron leer.
     limits: Vec<Limits>,
     limits_error: Option<String>,
@@ -472,6 +476,8 @@ enum Message {
     DragWindow,
     /// Fuente del terminal elegida en Ajustes > Terminal; None = la automática (la primera Nerd Font instalada).
     SetTerminalFont(Option<String>),
+    /// Ajustes > Terminal: copiar desde programas (OSC 52) on/off.
+    SetOsc52(bool),
     /// Elige un workspace por su clave (B4): la barra de sesiones y la paleta no usan posiciones.
     SelectWorkspace(String),
     /// Eco de una tecla: pide solo la pantalla del panel enfocado (B7), sin sondear los demás.
@@ -2144,7 +2150,10 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             app.others_loading.remove(&id);
             if let Ok(ScreenReply::Full(mut snap)) = result {
                 // Un panel en segundo plano que pidió copiar: el texto no se pierde al no estar enfocado.
-                let copiar = snap.portapapeles.take().map_or_else(Task::none, iced::clipboard::write);
+                let copiar = match snap.portapapeles.take() {
+                    Some(texto) => copia_desde_programa(app, id, texto),
+                    None => Task::none(),
+                };
                 app.others_gen.insert(id, snap.gen);
                 app.others.insert(id, snap);
                 return copiar;
@@ -2305,6 +2314,11 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
             }
             _ => Task::none(),
         },
+        Message::SetOsc52(on) => {
+            app.copia_osc52 = on;
+            save_pref(app, "osc52_copy", serde_json::json!(on));
+            Task::none()
+        }
         Message::SetTerminalFont(choice) => {
             let family = match &choice {
                 Some(name) => fonts::CANDIDATES.iter().map(|c| c.0).find(|f| *f == name.as_str()).unwrap_or("Menlo"),
@@ -2741,7 +2755,7 @@ fn update_inner(app: &mut App, message: Message) -> Task<Message> {
                         traza_una_vez(2, "primer snapshot recibido");
                         // OSC 52 del programa: el texto va al portapapeles del sistema (solo escritura).
                         if let Some(texto) = snap.portapapeles.take() {
-                            copiar = iced::clipboard::write(texto);
+                            copiar = copia_desde_programa(app, id, texto);
                         }
                         app.error = None;
                         // El daemon puede haber recortado el desplazamiento al historial disponible.
@@ -3390,6 +3404,7 @@ fn view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill)
     .style(theme::surface(BG))
     .into();
+    let base = aviso_sobre(app, base);
     if app.settings.is_some() {
         return chrome::floating(base, chrome::settings_panel(app), 820.0, Message::CloseSettings);
     }
@@ -3402,6 +3417,34 @@ fn view(app: &App) -> Element<'_, Message> {
         Body::CloseConfirm => chrome::floating(base, chrome::close_confirm_panel(app), 420.0, Message::CancelClose),
         Body::Welcome | Body::Screen => base,
     }
+}
+
+/// Texto que un programa pidió copiar (OSC 52): va al portapapeles del sistema y deja un aviso breve con la pestaña
+/// y los caracteres. Si la copia está desactivada en Ajustes, no hace nada.
+fn copia_desde_programa(app: &mut App, id: u32, texto: String) -> Task<Message> {
+    if !app.copia_osc52 {
+        return Task::none();
+    }
+    let pestana = app.panes.iter().find(|p| p.id == id).map(titulo_pestana).unwrap_or_else(|| "panel".into());
+    app.aviso_copia = Some((pestana, texto.chars().count(), std::time::Instant::now()));
+    iced::clipboard::write(texto)
+}
+
+/// El aviso de copia, abajo a la derecha, mientras esté vigente (3 s): no bloquea nada y se cubre con el resto.
+fn aviso_sobre<'a>(app: &App, base: Element<'a, Message>) -> Element<'a, Message> {
+    let Some((pestana, n, cuando)) = app.aviso_copia.as_ref() else { return base };
+    if cuando.elapsed() > std::time::Duration::from_secs(3) {
+        return base;
+    }
+    let caracteres = if *n == 1 { "carácter" } else { "caracteres" };
+    let aviso = container(text(format!("{pestana} copió {n} {caracteres}")).size(theme::SMALL_SIZE).color(theme::TEXT))
+        .padding([6, 12])
+        .style(theme::surface(theme::SIDEBAR));
+    stack(vec![
+        base,
+        container(aviso).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Right).align_y(iced::alignment::Vertical::Bottom).padding(16).into(),
+    ])
+    .into()
 }
 
 /// Traza de arranque (`GALGO_TRACE_STARTUP=1`): tiempo desde el inicio de `main` en cada fase, a stderr. Sin la variable
@@ -3497,6 +3540,7 @@ fn main() -> iced::Result {
                 focused: true,
                 font_installed: installed,
                 sidebar: flag("sidebar"),
+                copia_osc52: prefs::get(&prefs, "osc52_copy").and_then(|v| v.as_bool()).unwrap_or(true),
                 team_trust: confianza,
                 status: flag("status"),
                 prefs_path: Some(prefs),
@@ -4578,6 +4622,26 @@ mod tests {
         let _ = update(&mut app, Message::CloseFocused);
         let _ = update(&mut app, Message::Event(key_press(Key::Named(Named::Enter), None)));
         assert!(!app.confirm_close, "Enter confirma");
+    }
+
+    /// OSC 52 (revisión de aviso): con la copia activada, el texto deja un aviso con la pestaña y los caracteres;
+    /// desactivada, no se copia nada ni se avisa. Un aviso más viejo que su vigencia no se muestra.
+    #[test]
+    fn la_copia_desde_un_programa_avisa_y_se_puede_desactivar() {
+        let mut app = App { panes: vec![pane_info(1, "build", Status::Idle)], selected: Some(1), copia_osc52: true, ..Default::default() };
+        let _ = copia_desde_programa(&mut app, 1, "hola mundo".into());
+        let (pestana, n, _) = app.aviso_copia.clone().expect("hay aviso");
+        assert_eq!(n, 10);
+        assert!(pestana.contains("build"), "{pestana}");
+        app.aviso_copia = None;
+        let _ = update(&mut app, Message::SetOsc52(false));
+        assert!(!app.copia_osc52);
+        let _ = copia_desde_programa(&mut app, 1, "otra".into());
+        assert!(app.aviso_copia.is_none(), "desactivada: ni copia ni aviso");
+        app.copia_osc52 = true;
+        app.aviso_copia = Some(("x".into(), 3, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        let vista = aviso_sobre(&app, text("base").into());
+        let _ = vista;
     }
 
     /// `exit` en un shell cierra su pestaña; un agente o un comando terminado se quedan para leerlos.

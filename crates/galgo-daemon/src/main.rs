@@ -109,7 +109,7 @@ struct Pane {
     /// Último título que el programa anunció por OSC 0/2 (lo escribe el hilo lector).
     osc_titulo: Arc<Mutex<Option<String>>>,
     /// Texto pendiente de copiar al portapapeles (OSC 52). Lo escribe el hilo lector y lo entrega el próximo snapshot.
-    osc_portapapeles: Arc<Mutex<Option<String>>>,
+    osc_portapapeles: Arc<Mutex<Option<(String, Instant)>>>,
     /// Uso del transcript (lo rellena el hilo de sondeo) y último informe del agente. Solo en memoria.
     usage: Option<PaneUsage>,
     usage_report: Option<usage::ReportData>,
@@ -1344,7 +1344,7 @@ impl Daemon {
         let osc_hilo = Arc::clone(&osc_cwd);
         let osc_titulo: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let titulo_hilo = Arc::clone(&osc_titulo);
-        let osc_portapapeles: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let osc_portapapeles: Arc<Mutex<Option<(String, Instant)>>> = Arc::new(Mutex::new(None));
         let portapapeles_hilo = Arc::clone(&osc_portapapeles);
         let prompt = Arc::new(AtomicBool::new(false));
         let prompt_hilo = Arc::clone(&prompt);
@@ -1428,7 +1428,7 @@ impl Daemon {
                             *titulo_hilo.lock().unwrap() = Some(titulo);
                         }
                         if let Some(texto) = anuncios.portapapeles {
-                            *portapapeles_hilo.lock().unwrap() = Some(texto);
+                            *portapapeles_hilo.lock().unwrap() = Some((texto, Instant::now()));
                         }
                         let mut parser = screen.lock().unwrap();
                         parser.process(&buf[..n]);
@@ -1878,7 +1878,7 @@ impl Daemon {
                 let mut snap = snapshot(parser.screen());
                 snap.gen = current;
                 // El texto de OSC 52 se entrega una sola vez: el snapshot que lo lleva es el que se copia.
-                snap.portapapeles = portapapeles.lock().unwrap().take();
+                snap.portapapeles = vigente_portapapeles(portapapeles.lock().unwrap().take());
                 snap.scrollback = parser.screen().scrollback() as u16;
                 snap.scrollback_max = parser.screen().scrollback_len() as u16;
                 snap.bracketed_paste = parser.screen().bracketed_paste();
@@ -2696,6 +2696,14 @@ fn conv_color(c: vt100::Color) -> galgo_proto::Color {
     }
 }
 
+/// Un texto de OSC 52 solo se entrega si se pidió hace poco: si el panel estuvo mucho tiempo sin que la GUI lo
+/// mirara (otra pestaña, ventana cerrada), copiarlo ahora sería una sorpresa.
+const VIGENCIA_PORTAPAPELES: Duration = Duration::from_secs(5);
+
+fn vigente_portapapeles(pendiente: Option<(String, Instant)>) -> Option<String> {
+    pendiente.filter(|(_, cuando)| cuando.elapsed() <= VIGENCIA_PORTAPAPELES).map(|(texto, _)| texto)
+}
+
 fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
     use galgo_proto::Run;
     let (rows, cols) = screen.size();
@@ -2753,6 +2761,21 @@ fn snapshot(screen: &vt100::Screen) -> galgo_proto::Snapshot {
         mouse_sgr: screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
         alt_screen: screen.alternate_screen(),
         portapapeles: None,
+    }
+}
+
+#[cfg(test)]
+mod portapapeles_tests {
+    use super::*;
+
+    /// Lo pedido hace poco se entrega; lo que lleva más de la vigencia se descarta.
+    #[test]
+    fn un_texto_viejo_no_se_copia() {
+        let ahora = Instant::now();
+        assert_eq!(vigente_portapapeles(Some(("hola".into(), ahora))).as_deref(), Some("hola"));
+        let viejo = ahora.checked_sub(VIGENCIA_PORTAPAPELES + Duration::from_secs(1)).unwrap();
+        assert_eq!(vigente_portapapeles(Some(("viejo".into(), viejo))), None);
+        assert_eq!(vigente_portapapeles(None), None);
     }
 }
 

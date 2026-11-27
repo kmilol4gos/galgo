@@ -785,6 +785,14 @@ fn settings_content(app: &App, section: settings::Section) -> Element<'_, Messag
                 );
             }
             col = col.push(text("Fuente que se usa en los paneles:").size(theme::SMALL_SIZE).color(MUTED)).push(opciones);
+            // Copia desde programas (OSC 52): un programa puede copiar al portapapeles con una secuencia especial.
+            col = col
+                .push(kv("Copiar desde programas".into(), "un programa puede copiar al portapapeles (OSC 52), con aviso".into()))
+                .push(row![
+                    enabled_btn("Activada", !app.copia_osc52, Message::SetOsc52(true)),
+                    enabled_btn("Desactivada", app.copia_osc52, Message::SetOsc52(false)),
+                ]
+                .spacing(8.0));
         }
         settings::Section::Shortcuts => {
             for (keys, what) in settings::SHORTCUTS {
