@@ -1033,10 +1033,21 @@ pub fn team_confirm_panel(app: &App) -> Element<'_, Message> {
                 .spacing(8)
                 .align_y(Alignment::Center),
                 text(format!("{} · {}", a.role.label(), a.isolation.label())).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT),
-                // El prompt inicial se muestra entero (recortado) antes de confirmar: es texto que se enviará al agente.
-                text(a.prompt.as_deref().map(|p| format!("prompt: «{}»", sidebar::recortar(p, 90))).unwrap_or_default())
-                    .size(theme::SMALL_SIZE)
-                    .color(theme::DIM),
+                // El prompt inicial entero, con su tamaño: es texto que se entregará al agente, y se revisa antes de confirmar.
+                match a.prompt.as_deref() {
+                    Some(p) => {
+                        let (chars, lineas) = team::prompt_stats(p);
+                        Element::from(column![
+                            text(format!("prompt · {chars} caracteres · {lineas} líneas")).size(theme::SMALL_SIZE).color(theme::DIM),
+                            container(scrollable(text(p.to_string()).size(theme::SMALL_SIZE).color(theme::TEXT_SOFT)).height(Length::Shrink))
+                                .max_height(160.0)
+                                .padding([6, 8])
+                                .style(theme::surface(theme::TERM_BG)),
+                        ]
+                        .spacing(4))
+                    }
+                    None => Element::from(Space::with_height(0)),
+                },
             ]
             .spacing(2),
         );

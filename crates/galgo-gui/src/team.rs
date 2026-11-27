@@ -67,9 +67,25 @@ fn valid_model(text: &str) -> bool {
     (1..=MAX_MODEL).contains(&text.chars().count()) && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
 }
 
-/// Prompt de texto: sin caracteres de control (salvo saltos de línea y tabuladores), y acotado.
+/// Caracteres de formato (Cf: bidi, ancho cero, marcas invisibles, etiquetas E0000-E007F), de uso privado (Co) y no
+/// asignados (Cn). Un prompt con ellos puede decir algo distinto de lo que se ve en pantalla: no se acepta.
+fn invisible_or_unassigned() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"[\p{Cf}\p{Co}\p{Cn}]").expect("expresión fija"))
+}
+
+/// Prompt de texto: sin caracteres de control (salvo saltos de línea y tabuladores), sin caracteres invisibles o sin
+/// asignar, acotado, y sin más de dos saltos de línea seguidos (que escondería texto bajo una pantalla en blanco).
 fn valid_prompt(text: &str) -> bool {
-    text.chars().count() <= MAX_PROMPT && text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+    text.chars().count() <= MAX_PROMPT
+        && text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        && !invisible_or_unassigned().is_match(text)
+        && !text.contains("\n\n\n")
+}
+
+/// Tamaño de un prompt para mostrarlo: caracteres y líneas.
+pub fn prompt_stats(text: &str) -> (usize, usize) {
+    (text.chars().count(), text.lines().count().max(1))
 }
 
 /// Lee y valida un equipo. Un error describe el primer problema, con el nombre del agente si lo hay.
@@ -114,7 +130,10 @@ pub fn parse(text: &str) -> Result<Team, String> {
         };
         if let Some(p) = &a.prompt {
             if !valid_prompt(p) {
-                return Err(format!("{}: el prompt tiene caracteres de control o pasa de {MAX_PROMPT} caracteres", a.name));
+                return Err(format!(
+                    "{}: el prompt tiene caracteres de control, invisibles o no asignados, saltos de línea seguidos, o pasa de {MAX_PROMPT} caracteres",
+                    a.name
+                ));
             }
         }
         agents.push(TeamAgent { name: a.name, provider, model: a.model, role, isolation, prompt: a.prompt });
@@ -228,6 +247,19 @@ role = "reviewer"
         assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nrole=\"jefe\"").is_err(), "rol inventado");
         assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nisolation=\"root\"").is_err(), "aislamiento inventado");
         assert!(parse("").is_err(), "sin agentes");
+    }
+
+    /// review-15 A2: un prompt con caracteres invisibles (bidi, ancho cero, etiquetas Unicode) o no asignados no entra, ni
+    /// tampoco una pantalla en blanco de saltos de línea que esconda texto. Un nombre con caracteres invisibles, tampoco.
+    #[test]
+    fn prompt_invisible_no_entra() {
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nprompt=\"ok\u{202E}cod\"").is_err(), "bidi");
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nprompt=\"ok\u{E0041}\"").is_err(), "etiqueta Unicode");
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nprompt=\"a\u{200B}b\"").is_err(), "ancho cero");
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nprompt=\"a\\n\\n\\n\\nb\"").is_err(), "saltos seguidos");
+        assert!(parse("[[agent]]\nname=\"a\u{200B}\"\nprovider=\"claude\"").is_err(), "nombre con invisible");
+        assert!(parse("[[agent]]\nname=\"a\"\nprovider=\"claude\"\nprompt=\"Lee el README.\\n\\nDespués, resume.\"").is_ok(), "texto normal con párrafos");
+        assert_eq!(prompt_stats("uno\ndos"), (7, 2));
     }
 
     /// Modelos y prompts: caracteres seguros y tamaño acotado; un nombre con espacios no entra.
