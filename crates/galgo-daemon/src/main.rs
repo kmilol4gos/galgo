@@ -61,7 +61,6 @@ struct InboxMsg {
     claimed: bool,
     /// Con `client_ack`: la reserva vence si el cliente no confirma a tiempo.
     hold_until: Option<Instant>,
-    last_inject: Option<Instant>,
     /// Llegó con un fantasma reutilizado del mismo manager. Se lee con `galgo inbox`, nunca se inyecta.
     inherited: bool,
 }
@@ -207,13 +206,26 @@ impl Pane {
         self.prompt_libre.load(Ordering::SeqCst)
     }
 
+    /// Compuerta única para entregar trabajo del daemon (una tarea o un resultado): hooks, sin estar caído, turno
+    /// terminado con su gracia, sin teclear hace poco, en el mismo proceso que terminó el turno y con el prompt libre.
+    fn libre_para_entrega(&self, ahora: Instant) -> bool {
+        self.hooked
+            && !self.ghost
+            && !self.exited
+            && matches!(self.status, Status::Idle | Status::Done | Status::Failed)
+            && self.listo_desde.is_some_and(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
+            && self.listo_fg == self.fg_pid()
+            && self.ultima_entrada.is_none_or(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
+            && self.linea_de_prompt_libre()
+    }
+
     /// Nombre del programa en primer plano (`vim`, `claude`, o el shell si está libre).
     fn programa(&self) -> Option<String> {
         if self.ghost || self.exited {
             return None;
         }
         let en_primer_plano = self._master.as_ref().and_then(|m| m.process_group_leader());
-        en_primer_plano.and_then(cwd::nombre_de_pid).or_else(|| self.pid.and_then(|p| cwd::nombre_de_pid(p as i32)))
+        en_primer_plano.and_then(cwd::nombre_visible_de_pid).or_else(|| self.pid.and_then(|p| cwd::nombre_visible_de_pid(p as i32)))
     }
 
     /// Directorio de trabajo vivo: el del proceso en primer plano del pty (su grupo de procesos), luego el del
@@ -365,6 +377,8 @@ const MAX_OPEN_PER_PAIR: usize = 3;
 const MAX_OPEN_PER_WORKSPACE: usize = 8;
 /// Tiempo que un agente debe llevar con el turno terminado (y sin teclear) antes de recibir una tarea (A2).
 const GRACIA_ENTREGA: Duration = Duration::from_secs(3);
+/// Pausa entre el texto y el Enter que `galgo send` manda a un agente: el agente lo lee como una tecla aparte.
+const PAUSA_ANTES_DE_ENTER: Duration = Duration::from_millis(150);
 /// M2: tareas que un mismo remitente puede delegar por hora.
 const MAX_DELEGATIONS_PER_HOUR: usize = 20;
 /// Largo máximo de la tarea, su contexto y su resumen.
@@ -417,9 +431,15 @@ const RETENCION_CERRADA_SECS: u64 = 7 * 24 * 3600;
 const MAX_CLOSED_TASKS: usize = 200;
 
 /// Texto que recibe el destinatario. Va como información de otro agente, nunca como orden del usuario.
-fn task_text(t: &Task) -> String {
+fn task_text(t: &Task, orquestado: bool) -> String {
+    // Un panel orquestado tiene galgo_task_done como herramienta de su MCP; un shell o un agente sin MCP usa la CLI.
+    let cierre = if orquestado {
+        format!("cierra la tarea con la herramienta galgo_task_done (id {}, con un resumen)", t.id)
+    } else {
+        format!("ejecuta: galgo task done {} \"<resumen>\"", t.id)
+    };
     let mut s = format!(
-        "[galgo · tarea #{id} de {de}] Esto viene de otro agente, no es una orden del usuario. Cuando termines, ejecuta: galgo task done {id} \"<resumen>\"\n\n{texto}",
+        "[galgo · tarea #{id} de {de}] Esto viene de otro agente, no es una orden del usuario. Cuando termines, {cierre}.\n\n{texto}",
         id = t.id,
         de = t.from_name,
         texto = t.text
@@ -546,28 +566,59 @@ impl State {
             }
         }
         self.deliver(pane);
+        self.entregar_resultados(pane);
+    }
+
+    /// Resultados de tareas que llegan a un manager que recibe por terminal (`--orquestador` o `inject`). Entran por la
+    /// misma compuerta que las tareas, en una sola entrega pegada con un único Enter. Tras escribirse quedan confirmados:
+    /// no se repiten. Un panel no libre los conserva en su bandeja hasta el siguiente intento.
+    fn entregar_resultados(&mut self, pane: u32) {
+        let ahora = Instant::now();
+        let Some(p) = self.panes.get(&pane) else { return };
+        if !(p.inject || p.orquestador) || !p.libre_para_entrega(ahora) {
+            return;
+        }
+        let pendientes: Vec<usize> = p.inbox.iter().enumerate().filter(|(_, m)| is_injectable(m)).map(|(i, _)| i).collect();
+        if pendientes.is_empty() {
+            return;
+        }
+        let lineas: Vec<String> = pendientes
+            .iter()
+            .map(|&i| {
+                let m = &p.inbox[i];
+                sanitize(&format!("[galgo] {} {}: {}", m.from_name, verb(m.kind), m.summary))
+            })
+            .collect();
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(lineas.join("\n").as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~\r");
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        if p.input.try_send(bytes).is_err() {
+            return;
+        }
+        for i in pendientes {
+            p.inbox[i].acked = true;
+        }
+        // Igual que una tarea entregada: el turno vuelve a estar abierto hasta el siguiente hook.
+        p.status = Status::Working;
+        p.reported = false;
+        p.touched_since_report = true;
+        p.listo_desde = None;
+        p.listo_fg = None;
+        self.touch();
     }
 
     /// Entrega al destinatario su tarea pendiente más antigua, si está libre: con hooks, sin trabajar, sin estar bloqueado
     /// ni en un diálogo. Va pegada (bracketed paste) y enviada; nunca si no ha emitido ningún hook.
     fn deliver(&mut self, pane: u32) {
         let ahora = Instant::now();
-        let libre = self.panes.get(&pane).is_some_and(|p| {
-            p.hooked
-                && !p.ghost
-                && !p.exited
-                && matches!(p.status, Status::Idle | Status::Done | Status::Failed)
-                // A2: solo tras el fin de un turno, con un rato de gracia, sin teclear hace poco y con el cursor en un prompt vacío.
-                && p.listo_desde.is_some_and(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
-                && p.listo_fg == p.fg_pid()
-                && p.ultima_entrada.is_none_or(|t| ahora.duration_since(t) >= GRACIA_ENTREGA)
-                && p.linea_de_prompt_libre()
-        });
+        let libre = self.panes.get(&pane).is_some_and(|p| p.libre_para_entrega(ahora));
         if !libre {
             return;
         }
         let Some(idx) = self.tasks.iter().position(|t| t.to == pane && t.status == TaskStatus::Pendiente) else { return };
-        let texto = task_text(&self.tasks[idx]);
+        let orquestado = self.panes.get(&pane).is_some_and(|p| p.orquestador);
+        let texto = task_text(&self.tasks[idx], orquestado);
         let mut bytes = b"\x1b[200~".to_vec();
         bytes.extend_from_slice(texto.as_bytes());
         bytes.extend_from_slice(b"\x1b[201~\r");
@@ -736,7 +787,6 @@ impl State {
                 acked: false,
                 claimed: false,
                 hold_until: None,
-                last_inject: None,
                 inherited: false,
             });
         }
@@ -785,7 +835,6 @@ struct Daemon {
     socket: PathBuf,
     orphan_secs: u64,
     ack_secs: u64,
-    retry: Duration,
     /// Tiempo máximo para escribir una respuesta; un cliente que no lee no bloquea la entrega.
     write_timeout: Duration,
 }
@@ -1088,19 +1137,33 @@ fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(Pa
 /// Deduce el workspace de un directorio dentro de un repo git: "<repo>/<rama>". Sin git, o con el
 /// HEAD desligado, devuelve `None` o solo el nombre del repo. Nunca falla: git ausente no es un error.
 /// Comando de un agente conocido (por nombre de ejecutable).
-/// Si la línea del cursor de `s` es un prompt libre: el agente espera una orden y no hay texto a medias. Lo que hay
-/// tras el prompt, sin contar los bordes de caja de la TUI, tiene que ser nada.
+/// Bordes de caja de una TUI: no cuentan como texto ni antes ni después del prompt.
+const BORDES_DE_CAJA: [char; 3] = ['│', '║', '|'];
+/// Caracteres con los que termina un prompt de shell o de agente.
+const CARACTERES_DE_PROMPT: [char; 6] = ['>', '❯', '›', '$', '%', '#'];
+
+/// Si la línea del cursor de `s` es un prompt libre: el agente espera una orden. Tres condiciones: el cursor está a la
+/// vista, lo que hay antes del cursor acaba en el carácter del prompt, y lo que sigue es vacío, borde de caja o texto
+/// atenuado (la sugerencia que Claude muestra en gris). Texto normal tras el cursor, como algo escrito que el usuario
+/// dejó a medias con el cursor al inicio, no es libre.
 fn prompt_libre_de(s: &vt100::Screen) -> bool {
-    // A2: un diálogo (confirmación, selección de inicio de sesión) oculta el cursor: no es un prompt. Y una línea
-    // vacía tampoco basta: el prompt tiene que estar a la vista y terminar en su carácter.
+    // A2: un diálogo (confirmación, selección de inicio de sesión) oculta el cursor: no es un prompt.
     if s.hide_cursor() {
         return false;
     }
-    let (fila, _) = s.cursor_position();
+    let (fila, col) = s.cursor_position();
     let (_, cols) = s.size();
-    let texto = s.contents_between(fila, 0, fila, cols.get());
-    let limpio = texto.trim_end().trim_end_matches(|c: char| matches!(c, '│' | '║' | '|')).trim_end();
-    !limpio.is_empty() && limpio.ends_with(['>', '❯', '›', '$', '%', '#'])
+    let antes = s.contents_between(fila, 0, fila, col);
+    let antes = antes.trim_end().trim_end_matches(&BORDES_DE_CAJA[..]).trim_end();
+    if !antes.ends_with(&CARACTERES_DE_PROMPT[..]) {
+        return false;
+    }
+    (col..cols.get()).all(|c| {
+        s.cell(fila, c).is_none_or(|celda| {
+            let texto = celda.contents();
+            texto.trim().is_empty() || texto.chars().all(|ch| BORDES_DE_CAJA.contains(&ch)) || celda.dim()
+        })
+    })
 }
 
 /// Una ruta de ejecutable es la de un agente conocido (`…/claude/versions/2.0.50`, `…/bin/codex`).
@@ -1499,43 +1562,11 @@ impl Daemon {
         self.mark_dirty();
     }
 
-    /// Encola en el panel los mensajes pendientes si pidió `inject` y está `idle`.
-    /// No escribe: la escritura la hace el hilo del panel. Nunca bloquea.
+    /// Entrega lo que espera el panel (tareas y resultados) solo por la compuerta segura: hooks, turno terminado, prompt
+    /// libre. Nunca escribe si el panel no está libre, y nunca bloquea.
     fn try_inject(&self, pane: u32) {
         let mut st = self.state.lock().unwrap();
-        let retry = self.retry;
-        let Some(p) = st.panes.get_mut(&pane) else { return };
-        if !p.inject || p.status != Status::Idle {
-            return;
-        }
-        let mut lines = Vec::new();
-        let mut ids = Vec::new();
-        for m in p.inbox.iter_mut().filter(|m| is_injectable(m)) {
-            if m.last_inject.is_none_or(|t| t.elapsed() >= retry) {
-                m.last_inject = Some(Instant::now());
-                lines.push(sanitize(&format!(
-                    "[galgo] {} {}: {}",
-                    m.from_name,
-                    verb(m.kind),
-                    m.summary
-                )));
-                ids.push(m.id);
-            }
-        }
-        if lines.is_empty() {
-            return;
-        }
-        let mut chunk = Vec::new();
-        for l in &lines {
-            chunk.extend_from_slice(l.as_bytes());
-            chunk.push(b'\r');
-        }
-        if p.input.try_send(chunk).is_err() {
-            // No cupo en la cola: se reintenta en el siguiente ciclo, no en `retry` segundos.
-            for m in p.inbox.iter_mut().filter(|m| ids.contains(&m.id)) {
-                m.last_inject = None;
-            }
-        }
+        st.entregar(pane);
     }
 
     /// Busca un mensaje del objetivo sin confirmar, o el estado final del objetivo.
@@ -1794,14 +1825,24 @@ impl Daemon {
                 if sender.is_none() && enter {
                     p.profundidad_recibida = 0;
                 }
+                // Un agente (Claude, Codex) trata un texto que llega con su Enter como un pegado y no envía: el Enter va en
+                // otra escritura, tras una pausa corta. Un shell sigue recibiendo texto y Enter en una sola escritura.
+                let separar_enter = enter && p.agente_en_primer_plano();
                 let mut chunk = text.into_bytes();
-                if enter {
+                if enter && !separar_enter {
                     chunk.push(b'\r');
                 }
                 if p.ghost {
                     return Err(no_proceso(&p.name));
                 }
                 p.input.try_send(chunk).map_err(input_error)?;
+                if separar_enter {
+                    let tx = p.input.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(PAUSA_ANTES_DE_ENTER);
+                        let _ = tx.send(b"\r".to_vec());
+                    });
+                }
                 p.ultima_entrada = Some(Instant::now());
                 p.touched_since_report = true;
                 if enter {
@@ -2642,7 +2683,6 @@ async fn main() -> Result<()> {
         socket: socket.clone(),
         orphan_secs: env_u64("GALGO_ORPHAN_SECS", 30),
         ack_secs: env_u64("GALGO_ACK_SECS", 5),
-        retry: Duration::from_secs(env_u64("GALGO_RETRY_SECS", 60)),
         write_timeout: Duration::from_secs(env_u64("GALGO_WRITE_TIMEOUT_SECS", 10)),
     });
     // El epoch nuevo queda guardado antes de aceptar la primera conexión; luego el hilo de guardado
@@ -2941,7 +2981,6 @@ mod tests_fantasmas {
             socket: PathBuf::from("/dev/null"),
             orphan_secs: 30,
             ack_secs: 5,
-            retry: Duration::from_secs(60),
             write_timeout: Duration::from_secs(10),
         })
     }
@@ -2961,7 +3000,6 @@ mod tests_fantasmas {
             acked: false,
             claimed: false,
             hold_until: None,
-            last_inject: None,
             inherited: false,
         }
     }
@@ -3445,6 +3483,62 @@ mod orquestador_tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
     }
 
+    /// Un resultado llega al manager por la misma compuerta que las tareas: pegado una sola vez con un Enter, confirmado
+    /// y sin repetirse. Ocupado no entra; sin orquestador ni inject se queda en la bandeja para `galgo inbox`.
+    #[test]
+    fn el_resultado_entra_por_la_compuerta_una_sola_vez() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let jefe_rx = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _w_rx = vivo(&mut st, 2, "w", true, Status::Idle);
+        let otro_rx = vivo(&mut st, 3, "otro", true, Status::Idle);
+        st.panes.get_mut(&1).unwrap().orquestador = true;
+        st.push(1, 2, "done", "tarea #7 lista: hecho".into());
+        st.push(3, 2, "done", "sin inject".into());
+
+        st.panes.get_mut(&1).unwrap().status = Status::Working;
+        st.entregar(1);
+        assert!(jefe_rx.try_recv().is_err(), "manager ocupado: el resultado espera");
+        assert!(st.panes[&1].inbox.iter().all(|m| !m.acked), "sin confirmar mientras espera");
+
+        {
+            let p = st.panes.get_mut(&1).unwrap();
+            p.status = Status::Idle;
+            p.listo_desde = Some(Instant::now() - Duration::from_secs(60));
+        }
+        st.entregar(1);
+        let texto = String::from_utf8(jefe_rx.try_recv().expect("entra al manager libre")).unwrap();
+        assert!(texto.starts_with("\x1b[200~[galgo] w terminó: tarea #7 lista: hecho"), "{texto}");
+        assert!(texto.ends_with("\x1b[201~\r"), "pegado y un solo Enter al final: {texto}");
+        assert_eq!(texto.matches('\r').count(), 1);
+        assert!(st.panes[&1].inbox.iter().all(|m| m.acked), "queda confirmado al escribirse");
+
+        {
+            let p = st.panes.get_mut(&1).unwrap();
+            p.status = Status::Idle;
+            p.listo_desde = Some(Instant::now() - Duration::from_secs(60));
+        }
+        st.entregar(1);
+        assert!(jefe_rx.try_recv().is_err(), "una sola vez: confirmado, no se repite");
+
+        st.entregar(3);
+        assert!(otro_rx.try_recv().is_err(), "sin orquestador ni inject, el resultado se queda para `galgo inbox`");
+        assert!(st.panes[&3].inbox.iter().all(|m| !m.acked));
+    }
+
+    /// En un panel orquestado, la tarea se cierra con la herramienta galgo_task_done; en el resto, con la CLI.
+    #[test]
+    fn el_texto_de_la_tarea_nombra_la_herramienta_del_panel() {
+        let t = Task {
+            id: 5, from: 1, to: 2, from_name: "jefe".into(), to_name: "w".into(), workspace: None,
+            text: "crea x.txt".into(), context: None, status: TaskStatus::Pendiente, summary: None,
+            files: vec![], depth: 1, created_unix: 0,
+        };
+        let orquestado = task_text(&t, true);
+        assert!(orquestado.contains("galgo_task_done (id 5"), "{orquestado}");
+        assert!(!orquestado.contains("galgo task done"), "un panel orquestado no usa la CLI: {orquestado}");
+        assert!(task_text(&t, false).contains("galgo task done 5 \"<resumen>\""));
+    }
+
     /// La tarea se entrega solo a un agente con hooks que está libre: pegada entre marcas de bracketed paste y con un
     /// único Enter al final. Sin hooks, trabajando o bloqueado, queda pendiente.
     #[test]
@@ -3519,6 +3613,20 @@ mod orquestador_tests {
         assert!(prompt_libre_de(p.screen()), "prompt dentro de borde de caja");
         p.process(b"\x1b[2K\x1b[1;1Hescribiendo algo");
         assert!(!prompt_libre_de(p.screen()), "texto a medias");
+    }
+
+    /// Claude muestra una sugerencia atenuada tras el prompt: sigue siendo un prompt libre. Texto normal tras el cursor
+    /// (algo escrito a medias, con el cursor movido al inicio) no lo es.
+    #[test]
+    fn prompt_libre_admite_sugerencia_atenuada() {
+        use std::num::NonZeroU16;
+        let mut p = vt100::Parser::new(NonZeroU16::new(4).unwrap(), NonZeroU16::new(60).unwrap(), 0);
+        p.process("\x1b[1;1H❯ \x1b[2mrevisa el resultado del worker\x1b[0m\x1b[1;3H".as_bytes());
+        assert!(prompt_libre_de(p.screen()), "sugerencia atenuada tras el cursor: prompt libre");
+        p.process("\x1b[1;1H\x1b[2K❯ hola\x1b[1;3H".as_bytes());
+        assert!(!prompt_libre_de(p.screen()), "texto normal tras el cursor: no es libre");
+        p.process("\x1b[1;1H\x1b[2K❯ \x1b[2msugerencia\x1b[0m mas\x1b[1;3H".as_bytes());
+        assert!(!prompt_libre_de(p.screen()), "sugerencia seguida de texto normal: no es libre");
     }
 
     /// A3 (revisión 17): lo que un panel puede pedir. Sin panel no hay restricción (la CLI del usuario); un panel actúa

@@ -52,9 +52,22 @@ pub fn ruta_de_pid(pid: i32) -> Option<String> {
 }
 
 /// Nombre del ejecutable de un proceso (`vim`, `claude`, `zsh`…).
-pub fn nombre_de_pid(pid: i32) -> Option<String> {
-    let ruta = ruta_de_pid(pid)?;
-    std::path::Path::new(&ruta).file_name().map(|f| f.to_string_lossy().into_owned())
+/// Nombre con el que se muestra un programa. Claude instala su binario como `…/claude/versions/2.1.332`: el nombre
+/// de archivo es el número de versión, así que se muestra el agente de la ruta. Otras rutas: su nombre de archivo.
+pub fn nombre_visible(ruta: &str) -> Option<String> {
+    let base = std::path::Path::new(ruta).file_name()?.to_string_lossy().into_owned();
+    let es_version = !base.is_empty() && base.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if es_version {
+        if let Some(agente) = ruta.split('/').find(|c| matches!(*c, "claude" | "codex")) {
+            return Some(agente.to_string());
+        }
+    }
+    Some(base)
+}
+
+/// `nombre_visible` del proceso `pid`, o None si no existe.
+pub fn nombre_visible_de_pid(pid: i32) -> Option<String> {
+    nombre_visible(&ruta_de_pid(pid)?)
 }
 
 /// Ruta de una URI `file://host/ruta` (OSC 7), con los `%XX` decodificados. El host se ignora.
@@ -341,7 +354,7 @@ mod tests {
 
     #[test]
     fn el_nombre_del_proceso_propio_es_el_del_binario() {
-        let nombre = nombre_de_pid(std::process::id() as i32).expect("nombre del propio proceso");
+        let nombre = nombre_visible_de_pid(std::process::id() as i32).expect("nombre del propio proceso");
         let esperado = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(nombre, esperado);
     }
@@ -384,5 +397,16 @@ mod tests {
         let mut o = Osc::default();
         assert_eq!(o.feed(b"\x1b]52;c;aG9s"), Anuncios::default());
         assert_eq!(portapapeles(&o.feed(b"YQ==\x07")), Some("hola"));
+    }
+
+    #[test]
+    fn claude_se_muestra_como_claude_y_no_como_su_version() {
+        assert_eq!(nombre_visible("/Users/a/.local/share/claude/versions/2.1.332").as_deref(), Some("claude"));
+        assert_eq!(nombre_visible("/usr/bin/vim").as_deref(), Some("vim"));
+        assert_eq!(nombre_visible("/opt/homebrew/bin/zsh").as_deref(), Some("zsh"));
+        // Un programa con un número en el nombre y sin agente en la ruta conserva su nombre.
+        assert_eq!(nombre_visible("/opt/tools/2.0").as_deref(), Some("2.0"));
+        // Una carpeta llamada claude no cambia el nombre de un programa cualquiera.
+        assert_eq!(nombre_visible("/Users/a/claude/bin/htop").as_deref(), Some("htop"));
     }
 }

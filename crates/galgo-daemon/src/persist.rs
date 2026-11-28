@@ -384,7 +384,6 @@ pub fn restore(st: &mut State, saved: Saved) {
                 acked: false,
                 claimed: false,
                 hold_until: None,
-                last_inject: None,
                 inherited: false,
             });
         }

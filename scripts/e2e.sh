@@ -6,7 +6,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export PATH="$ROOT/target/debug:$PATH"
 TMP=$(mktemp -d)
 export GALGO_SOCKET="$TMP/galgo.sock"
-export GALGO_ORPHAN_SECS=1 GALGO_RETRY_SECS=2
+export GALGO_ORPHAN_SECS=1
 pass=0
 fail=0
 skipped=0
@@ -55,22 +55,30 @@ galgo inbox --pane mgr4 | grep -q "resultado4"; check "inbox muestra el resultad
 galgo ack "$ID" --pane mgr4 >/dev/null
 galgo ls | grep mgr4 | grep -q "ENTREGA"; [ $? -ne 0 ]; check "tras ack ya no es huérfana" $?
 
-echo "5. inject escribe el resultado en el manager cuando está idle"
-galgo spawn mgr5 --inject -- cat >/dev/null
+echo "5. inject escribe el resultado en el manager cuando está idle (el manager es un agente con hooks)"
+# Agente falso: avisa que está libre con Stop y guarda cada línea que recibe (lo pegado) en un archivo.
+mkdir -p "$TMP/fake5" && cat > "$TMP/fake5/claude" <<FAKE_EOF
+#!/bin/sh
+echo '{"hook_event_name":"Stop"}' | galgo hook claude >/dev/null 2>&1
+while printf '> '; IFS= read -r linea; do printf '%s\n' "\$linea" >> "$TMP/fake5/recibido"; echo '{"hook_event_name":"Stop"}' | galgo hook claude >/dev/null 2>&1; done
+FAKE_EOF
+chmod +x "$TMP/fake5/claude"
+galgo spawn mgr5 --inject -- "$TMP/fake5/claude" >/dev/null
 galgo spawn w5 --manager mgr5 -- bash --norc >/dev/null
+sleep 4
 galgo send w5 'galgo done --summary "hecho5"'
-sleep 1
-galgo read mgr5 | grep -q "\[galgo\] w5 terminó: hecho5"; check "mensaje inyectado" $?
+ok=0; for i in $(seq 1 60); do galgo read mgr5 | grep -q "\[galgo\] w5 terminó: hecho5" && { ok=1; break; }; sleep 0.25; done
+[ $ok = 1 ]; check "mensaje inyectado" $?
 
 echo "6. inject espera si el manager está trabajando y entrega al quedar idle"
 galgo spawn w6 --manager mgr5 -- bash --norc >/dev/null
 galgo status working --pane mgr5
 galgo send w6 'galgo done --summary "hecho6"'
-sleep 1
+sleep 4
 galgo read mgr5 | grep -q "hecho6"; [ $? -ne 0 ]; check "no interrumpe mientras trabaja" $?
 galgo status idle --pane mgr5
-sleep 1
-galgo read mgr5 | grep -q "\[galgo\] w6 terminó: hecho6"; check "se entrega al quedar idle" $?
+ok=0; for i in $(seq 1 60); do galgo read mgr5 | grep -q "\[galgo\] w6 terminó: hecho6" && { ok=1; break; }; sleep 0.25; done
+[ $ok = 1 ]; check "se entrega al quedar idle" $?
 
 echo "7. un worker que muere sin reportar avisa al manager"
 galgo spawn mgr7 -- bash --norc >/dev/null
@@ -273,12 +281,20 @@ galgo ls | grep m19 | grep -q "ENTREGA SIN CONFIRMAR"; check "ls lo marca como e
 galgo ls | grep m19 | grep -q "espera a"; [ $? -ne 0 ]; check "ya no figura como esperando" $?
 
 echo "20. la inyección no pasa caracteres de control al manager"
-galgo spawn m20 --inject -- cat -v >/dev/null
+mkdir -p "$TMP/fake20" && cat > "$TMP/fake20/claude" <<FAKE_EOF
+#!/bin/sh
+echo '{"hook_event_name":"Stop"}' | galgo hook claude >/dev/null 2>&1
+while printf '> '; IFS= read -r linea; do printf '%s\n' "\$linea" >> "$TMP/fake20/recibido"; echo '{"hook_event_name":"Stop"}' | galgo hook claude >/dev/null 2>&1; done
+FAKE_EOF
+chmod +x "$TMP/fake20/claude"
+galgo spawn m20 --inject -- "$TMP/fake20/claude" >/dev/null
 galgo spawn w20 --manager m20 -- bash --norc >/dev/null
+sleep 4
 echo '{"hook_event_name":"Stop","last_assistant_message":"uno\rdos\u0003\u001b[2J"}' | hook w20
-sleep 1
+ok=0; for i in $(seq 1 60); do galgo read m20 | grep -q "w20 terminó" && { ok=1; break; }; sleep 0.25; done
 galgo ls | grep m20 | grep -q exited; [ $? -ne 0 ]; check "el manager sigue vivo" $?
-galgo read m20 | grep -q "w20 terminó"; check "el resumen llegó al manager" $?
+[ $ok = 1 ]; check "el resumen llegó al manager" $?
+! grep -q "$(printf '\003')" "$TMP/fake20/recibido" 2>/dev/null; check "lo pegado no lleva Ctrl-C" $?
 
 echo "21. un panel que no lee su entrada no congela al daemon"
 galgo spawn b21 -- bash -c 'stty raw -echo; sleep 300' >/dev/null
@@ -1530,10 +1546,14 @@ for i in $(seq 1 50); do python3 -c 'import json,subprocess,sys
 ps=json.loads(subprocess.run(["galgo","--json","ls"],capture_output=True,text=True).stdout)
 sys.exit(0 if all(p.get("hooked") for p in ps if p["name"] in ("jefe147","w147")) else 1)' && break; sleep 0.2; done
 galgo send jefe147 DELEGAR >/dev/null
-ok=0; for i in $(seq 1 60); do galgo inbox --pane jefe147 2>/dev/null | grep -q "hecho por w147" && { ok=1; break; }; sleep 0.25; done
+ok=0; for i in $(seq 1 60); do galgo read jefe147 2>/dev/null | grep -q "w147 terminó" && { ok=1; break; }; sleep 0.25; done
 [ $ok = 1 ]; check "el manager delega, el worker recibe la tarea, responde y el resultado vuelve al manager" $?
 galgo tasks --pane jefe147 | grep -q "lista"; check "la tarea queda lista en el registro" $?
 galgo read w147 | grep -q "tarea #"; check "el texto llegó al worker pegado en su terminal" $?
+grep -q "SessionStart" "$TMP/c147/jefe147.args" && grep -q "hook claude" "$TMP/c147/jefe147.args"; check "claude arranca con el hook SessionStart por --settings" $?
+ok=0; for i in $(seq 1 40); do [ "$(galgo read jefe147 2>/dev/null | grep -c 'w147 terminó')" -ge 1 ] && { ok=1; break; }; sleep 0.25; done
+[ $ok = 1 ]; check "el resultado entra en la terminal del manager (por la compuerta, no solo en la bandeja)" $?
+sleep 1; [ "$(galgo read jefe147 | grep -c 'w147 terminó')" = 1 ]; check "el resultado entra en la terminal del manager una sola vez" $?
 export PATH="$ANTES_PATH"; unset TMP_ARGS_DIR TMP_FAKE_DIR DESTINO
 echo "149. ratón hacia el programa: el modo que activa un programa real llega al snapshot y los bytes le llegan"
 export GALGO_SOCKET="$TMP/c149/g.sock"; mkdir -p "$TMP/c149" && chmod 700 "$TMP/c149"
@@ -1614,6 +1634,63 @@ read -r filas_ancho maxima_ancho <<< "$(x152)"
 [ "$filas_ancho" = 1 ] && [ "$maxima_ancho" = 120 ]; check "al ensancharla vuelve a una sola fila de 120 x" $?
 galgo kill rs152 --remove >/dev/null 2>&1; galgo stop >/dev/null 2>&1
 export GALGO_SOCKET="$TMP/galgo.sock"
+
+echo "153. modo orquestador sin hooks en el arranque: prompt con sugerencia atenuada recibe la tarea, texto a medias no; galgo send separa el Enter en un agente; claude se muestra como claude"
+export GALGO_SOCKET="$TMP/c153/g.sock"; mkdir -p "$TMP/c153" "$TMP/fake153" && chmod 700 "$TMP/c153"
+# Claude falso: avisa de su arranque (como el hook de --settings), pinta el prompt con una sugerencia atenuada (modo
+# tenue) o con texto normal tras el cursor (modo normal), y cierra las tareas que le llegan.
+cat > "$TMP/fake153/agente-tenue.sh" <<'FAKE_EOF'
+#!/bin/sh
+emite() { echo "{\"hook_event_name\":\"$1\",\"source\":\"startup\"}" | galgo hook claude >/dev/null 2>&1; }
+emite SessionStart
+if [ "$1" = tenue ]; then tras='\033[2msugerencia del modelo\033[0m'; else tras='escribiendo a medias'; fi
+while printf '\r\033[2K❯ %b\r\033[2C' "$tras"; IFS= read -r linea; do
+  case "$linea" in
+    *"tarea #"*) id=$(echo "$linea" | sed -n 's/.*tarea #\([0-9][0-9]*\).*/\1/p'); galgo task done "$id" "hecho" >/dev/null 2>&1; emite Stop ;;
+  esac
+done
+FAKE_EOF
+printf '#!/bin/sh\nexec sh "%s" "$@"\n' "$TMP/fake153/agente-tenue.sh" > "$TMP/fake153/claude"
+# Grabador de bytes que se hace pasar por claude: cada lectura del pty queda en una línea (un trozo por línea).
+mkdir -p "$TMP/fake153/rec"
+cat > "$TMP/fake153/rec/claude" <<PY_EOF
+#!/usr/bin/env python3
+import os, tty
+tty.setraw(0)
+log = open("$TMP/c153/trozos", "a", buffering=1)
+while True:
+    data = os.read(0, 1024)
+    if not data:
+        break
+    log.write(repr(data) + "\n")
+PY_EOF
+chmod +x "$TMP/fake153/claude" "$TMP/fake153/agente-tenue.sh" "$TMP/fake153/rec/claude"
+ANTES_PATH="$PATH"; export PATH="$TMP/fake153:$PATH"
+galgo spawn tenue153 -- claude tenue >/dev/null; galgo spawn normal153 -- claude normal >/dev/null
+galgo spawn sh153 -- bash --norc >/dev/null; galgo spawn rec153 -- "$TMP/fake153/rec/claude" >/dev/null
+check "paneles de prueba (agentes falsos y shell)" $?
+for i in $(seq 1 50); do python3 -c 'import json,subprocess,sys
+ps=json.loads(subprocess.run(["galgo","--json","ls"],capture_output=True,text=True).stdout)
+sys.exit(0 if all(p.get("hooked") for p in ps if p["name"] in ("tenue153","normal153")) else 1)' && break; sleep 0.2; done
+galgo send sh153 "galgo delegate tenue153 'crea tenue.txt' >/dev/null 2>&1; galgo delegate normal153 'crea normal.txt' >/dev/null 2>&1" >/dev/null
+for i in $(seq 1 80); do galgo tasks --all 2>/dev/null | grep "sh153 → tenue153" | grep -qiv pendiente && break; sleep 0.25; done
+galgo tasks --all | grep "sh153 → tenue153" | grep -qiv pendiente; check "el prompt con sugerencia atenuada recibe la tarea del arranque (sin esperar a un turno)" $?
+galgo read tenue153 | grep -q "tarea #"; check "la tarea llega pegada a la terminal del agente libre" $?
+sleep 8; galgo tasks --all | grep "sh153 → normal153" | grep -q pendiente; check "texto normal tras el cursor no es prompt libre: la tarea espera" $?
+galgo read normal153 | grep -q "tarea #"; [ $? -ne 0 ]; check "el panel con texto a medias no recibe nada" $?
+galgo send sh153 "echo UNA153" >/dev/null; sleep 1
+galgo read sh153 | grep -q "^UNA153"; check "un shell sigue recibiendo texto y Enter de una vez" $?
+galgo send rec153 "hola" >/dev/null; sleep 1
+grep -qxF "b'hola'" "$TMP/c153/trozos" && grep -qxF "b'\\r'" "$TMP/c153/trozos"; check "galgo send a un agente manda el Enter en una escritura aparte" $?
+mkdir -p "$TMP/v153/claude/versions"; printf '#include <unistd.h>\nint main(void){for(;;)sleep(30);}\n' > "$TMP/v153/s.c"
+if cc -o "$TMP/v153/claude/versions/2.1.332" "$TMP/v153/s.c" 2>/dev/null; then
+  galgo spawn ver153 -- "$TMP/v153/claude/versions/2.1.332" >/dev/null; sleep 0.5
+  galgo --json ls | python3 -c 'import json,sys; ps=json.load(sys.stdin); sys.exit(0 if next(p for p in ps if p["name"]=="ver153").get("programa")=="claude" else 1)'; check "un agente con binario en .../claude/versions/<n> se muestra como claude" $?
+else
+  check "un agente con binario en .../claude/versions/<n> se muestra como claude" 77
+fi
+for p in tenue153 normal153 sh153 rec153 ver153; do galgo kill "$p" --remove >/dev/null 2>&1; done
+export PATH="$ANTES_PATH"; unset ANTES_PATH
 
 # Ningún daemon de esta corrida puede quedar vivo: se comprueba (y se para) lo que quede bajo $TMP.
 echo "148. cerrar una pestaña quita el panel; kill a secas lo deja como exited"
