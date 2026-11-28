@@ -104,6 +104,9 @@ pub fn map_event(p: &Value) -> Option<(HookEvent, Option<String>)> {
             .map(truncate)
     };
     match p.get("hook_event_name")?.as_str()? {
+        // Arranque de la sesión (hook de `--settings` en modo orquestador): el agente ya está libre, aunque no haya
+        // hecho ningún turno. Así su primera tarea puede entrar sin esperar al primer prompt.
+        "SessionStart" => Some((HookEvent::Idle, None)),
         "UserPromptSubmit" => Some((HookEvent::PromptSubmitted, None)),
         "PostToolUse" => Some((HookEvent::Working, None)),
         "Stop" => Some((HookEvent::TurnEnded, text("last_assistant_message"))),
@@ -496,7 +499,7 @@ mod tests {
             map_event(&json!({"hook_event_name": "UserPromptSubmit", "prompt": "x"})),
             Some((HookEvent::PromptSubmitted, None))
         );
-        assert_eq!(map_event(&json!({"hook_event_name": "SessionStart"})), None);
+        assert_eq!(map_event(&json!({"hook_event_name": "SessionStart"})), Some((HookEvent::Idle, None)), "arranque: libre sin turno previo");
         assert_eq!(map_event(&Value::Null), None);
     }
 

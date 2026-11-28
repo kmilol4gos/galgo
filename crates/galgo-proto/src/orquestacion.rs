@@ -32,17 +32,23 @@ fn toml_str(texto: &str) -> String {
     json!(texto).to_string()
 }
 
-/// Los argumentos completos del agente: `cmd` con los de galgo delante del resto. `mcp` es el ejecutable de galgo-mcp y
-/// `sock` el socket del daemon. Un agente que no sea claude o codex no se arranca en este modo.
-pub fn argv(cmd: &[String], nombre: &str, rol: &str, mcp: &str, sock: &str) -> Result<Vec<String>, String> {
+/// Comando del hook de arranque: el mismo formato que instala `galgo hooks install` (ruta absoluta entre comillas simples).
+fn comando_hook(galgo: &str) -> String {
+    format!("'{}' hook claude 2>/dev/null || true", galgo.replace('\'', "'\\''"))
+}
+
+/// Los argumentos completos del agente: `cmd` con los de galgo delante del resto. `mcp` es el ejecutable de galgo-mcp,
+/// `sock` el socket del daemon y `galgo` la CLI que recibe los hooks. Un agente que no sea claude o codex no se arranca
+/// en este modo.
+pub fn argv(cmd: &[String], nombre: &str, rol: &str, mcp: &str, sock: &str, galgo: &str) -> Result<Vec<String>, String> {
     if !nombre_valido(nombre) {
         return Err(format!("nombre de agente no válido para el modo orquestador: {nombre:?}"));
     }
     if !ROLES.contains(&rol) {
         return Err(format!("rol desconocido {rol:?} (manager, worker, reviewer o libre)"));
     }
-    if [mcp, sock].iter().any(|t| t.is_empty() || t.chars().any(char::is_control)) {
-        return Err("ruta del MCP o del socket no válida".into());
+    if [mcp, sock, galgo].iter().any(|t| t.is_empty() || t.chars().any(char::is_control)) {
+        return Err("ruta del MCP, del socket o de galgo no válida".into());
     }
     let Some(primero) = cmd.first() else { return Err("falta el comando del agente".into()) };
     let base = std::path::Path::new(primero).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -55,8 +61,14 @@ pub fn argv(cmd: &[String], nombre: &str, rol: &str, mcp: &str, sock: &str) -> R
                 "mcpServers": { "galgo": { "command": mcp, "args": ["--orquestador"], "env": { "GALGO_PANE": nombre, "GALGO_SOCKET": sock } } }
             })
             .to_string();
+            // El hook de SessionStart va por argumentos: el primer aviso del agente llega al arrancar, no en su primer
+            // turno, y la primera tarea puede entrar. Se suma a los hooks del usuario (`--settings` no los reemplaza).
+            let ajustes = json!({
+                "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": comando_hook(galgo) } ] } ] }
+            })
+            .to_string();
             // Sin `--strict-mcp-config`: el usuario conserva sus otros servidores MCP; el de galgo se añade al lado.
-            out.extend(["--mcp-config".into(), cfg, "--append-system-prompt".into(), instr]);
+            out.extend(["--settings".into(), ajustes, "--mcp-config".into(), cfg, "--append-system-prompt".into(), instr]);
         }
         "codex" => {
             out.extend([
@@ -88,7 +100,7 @@ mod tests {
     /// quedan detrás, y no se desactivan los MCP del usuario.
     #[test]
     fn claude_lleva_mcp_en_linea_y_conserva_sus_argumentos() {
-        let out = argv(&cmd(&["claude", "--model", "haiku"]), "jefe", "manager", "/x/galgo-mcp", "/s/g.sock").unwrap();
+        let out = argv(&cmd(&["claude", "--model", "haiku"]), "jefe", "manager", "/x/galgo-mcp", "/s/g.sock", "/x/galgo").unwrap();
         assert_eq!(out[0], "claude");
         let i = out.iter().position(|a| a == "--mcp-config").unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&out[i + 1]).unwrap();
@@ -96,13 +108,17 @@ mod tests {
         assert_eq!(cfg["mcpServers"]["galgo"]["env"]["GALGO_PANE"], "jefe");
         assert!(!out.contains(&"--strict-mcp-config".to_string()), "no se desactivan los MCP del usuario");
         assert!(out.iter().any(|a| a.contains("«jefe»") && a.contains("Coordinas")), "las instrucciones nombran el agente y su rol");
+        let i = out.iter().position(|a| a == "--settings").unwrap();
+        let ajustes: serde_json::Value = serde_json::from_str(&out[i + 1]).unwrap();
+        assert_eq!(ajustes["hooks"]["SessionStart"][0]["hooks"][0]["command"], "'/x/galgo' hook claude 2>/dev/null || true", "el arranque avisa a galgo por hook");
+        assert!(ajustes["hooks"].as_object().unwrap().len() == 1, "solo añade su hook; los del usuario siguen en su configuración");
         assert_eq!(&out[out.len() - 2..], &["--model".to_string(), "haiku".to_string()], "los argumentos del usuario van al final");
     }
 
     /// Codex: los overrides `-c` llevan el servidor MCP y las instrucciones; el valor de cada uno es TOML válido.
     #[test]
     fn codex_usa_overrides_c() {
-        let out = argv(&cmd(&["codex"]), "codex-1", "worker", "/x/galgo-mcp", "/s/g.sock").unwrap();
+        let out = argv(&cmd(&["codex"]), "codex-1", "worker", "/x/galgo-mcp", "/s/g.sock", "/x/galgo").unwrap();
         let overrides: Vec<&String> = out.iter().enumerate().filter(|(i, _)| *i > 0 && out[i - 1] == "-c").map(|(_, a)| a).collect();
         assert!(overrides.iter().any(|o| o.as_str() == "mcp_servers.galgo.command=\"/x/galgo-mcp\""));
         assert!(overrides.iter().any(|o| o.starts_with("mcp_servers.galgo.env={GALGO_PANE=\"codex-1\"")));
@@ -112,12 +128,12 @@ mod tests {
     /// Solo claude y codex; nombre y rol acotados; ni rutas ni nombres con caracteres de control o de TOML.
     #[test]
     fn solo_agentes_verificados_y_entradas_acotadas() {
-        assert!(argv(&cmd(&["pi"]), "a", "libre", "/m", "/s").is_err(), "pi no está verificado");
-        assert!(argv(&cmd(&["bash", "-c", "rm"]), "a", "libre", "/m", "/s").is_err());
-        assert!(argv(&cmd(&["claude"]), "con espacio", "libre", "/m", "/s").is_err());
-        assert!(argv(&cmd(&["claude"]), "a\"b", "libre", "/m", "/s").is_err(), "sin comillas en el nombre");
-        assert!(argv(&cmd(&["claude"]), "a", "jefe", "/m", "/s").is_err(), "rol inventado");
-        assert!(argv(&cmd(&["claude"]), "a", "libre", "/m\n", "/s").is_err(), "sin saltos en la ruta");
-        assert!(argv(&[], "a", "libre", "/m", "/s").is_err());
+        assert!(argv(&cmd(&["pi"]), "a", "libre", "/m", "/s", "/g").is_err(), "pi no está verificado");
+        assert!(argv(&cmd(&["bash", "-c", "rm"]), "a", "libre", "/m", "/s", "/g").is_err());
+        assert!(argv(&cmd(&["claude"]), "con espacio", "libre", "/m", "/s", "/g").is_err());
+        assert!(argv(&cmd(&["claude"]), "a\"b", "libre", "/m", "/s", "/g").is_err(), "sin comillas en el nombre");
+        assert!(argv(&cmd(&["claude"]), "a", "jefe", "/m", "/s", "/g").is_err(), "rol inventado");
+        assert!(argv(&cmd(&["claude"]), "a", "libre", "/m\n", "/s", "/g").is_err(), "sin saltos en la ruta");
+        assert!(argv(&[], "a", "libre", "/m", "/s", "/g").is_err());
     }
 }

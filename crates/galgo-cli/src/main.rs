@@ -215,7 +215,8 @@ fn orquestacion_argv(cmd: &[String], name: &str, rol: &str) -> Result<Vec<String
     let exe = std::env::current_exe()?;
     let mcp = exe.parent().map(|d| d.join("galgo-mcp")).unwrap_or_else(|| "galgo-mcp".into());
     let sock = galgo_proto::socket_path();
-    galgo_proto::orquestacion::argv(cmd, name, rol, &mcp.to_string_lossy(), &sock.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))
+    let galgo = exe.to_string_lossy().into_owned();
+    galgo_proto::orquestacion::argv(cmd, name, rol, &mcp.to_string_lossy(), &sock.to_string_lossy(), &galgo).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn run() -> Result<()> {
