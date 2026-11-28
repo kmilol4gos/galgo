@@ -7,6 +7,11 @@ export PATH="$ROOT/target/debug:$PATH"
 TMP=$(mktemp -d)
 export GALGO_SOCKET="$TMP/galgo.sock"
 export GALGO_ORPHAN_SECS=1
+# Nunca el daemon del usuario: sin GALGO_SOCKET, galgo usa ~/.galgo/galgo.sock. Con HOME dentro de $TMP, un descuido
+# futuro cae en un socket de prueba y no en los paneles reales.
+HOME_REAL="$HOME"
+export HOME="$TMP/home"
+mkdir -p "$HOME"
 pass=0
 fail=0
 skipped=0
@@ -1056,7 +1061,6 @@ galgo send w121b 'galgo done --summary "nuevo121"' >/dev/null
 sleep 0.8
 galgo ack "$OLD121" --pane m121b >/dev/null 2>&1; [ $? -ne 0 ]; check "el ack de antes del corrupto se rechaza" $?
 galgo inbox --pane m121b | grep -q "nuevo121"; check "el mensaje nuevo sigue pendiente" $?
-unset GALGO_SOCKET
 galgo stop >/dev/null 2>&1 || true
 export GALGO_SOCKET="$TMP/galgo.sock"
 
@@ -1077,7 +1081,6 @@ galgo ls >/dev/null
 galgo kill g122 >/dev/null 2>&1; check "kill quita un fantasma" $?
 galgo inbox --pane m122 | grep -q "resultado122"; check "su resultado pasa al manager" $?
 galgo ls | grep -q " g122 "; [ $? -ne 0 ]; check "el fantasma desaparece de ls" $?
-unset GALGO_SOCKET
 galgo stop >/dev/null 2>&1 || true
 export GALGO_SOCKET="$TMP/galgo.sock"
 
@@ -1757,7 +1760,9 @@ sleep 0.3; ! galgo ls | grep -qE "queda148|fuera148"; check "ninguno de los dos 
 galgo stop >/dev/null 2>&1
 export GALGO_SOCKET="$TMP/galgo.sock"
 
-"$(cd "$(dirname "$0")" && pwd)/comprobar-huerfanos.sh" "$TMP" >"$TMP/huerfanos" 2>&1
-check "no queda ningún galgod de esta corrida ($(tail -1 "$TMP/huerfanos"))" $?
+# El comprobador se niega si el directorio contiene HOME, así que se le da el real.
+HOME="$HOME_REAL" "$ROOT/scripts/comprobar-huerfanos.sh" "$TMP" >"$TMP/huerfanos" 2>&1
+rc=$?
+check "no queda ningún galgod de esta corrida ($(tail -1 "$TMP/huerfanos"))" "$rc"
 echo "resultado: $pass ok, $fail con falla, $skipped omitidos"
 [ "$fail" = "0" ]
