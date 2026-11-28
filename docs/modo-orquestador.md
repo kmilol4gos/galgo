@@ -11,6 +11,13 @@ galgo es el cartero: los agentes no se hablan directo. Aprobado por el usuario c
 - **Hooks**: la entrega depende de saber que el destinatario está idle. Claude ya tiene hooks instalados. Para Codex, investigar si se pueden pasar por argumentos; si solo se puede editando su config, NO hacerlo: informar para pedir permiso al usuario.
 - **Frenos**: profundidad máxima de delegación 3, máximo de tareas abiertas por par y por workspace; error claro al superarlos. Sin flags que salten permisos de los agentes.
 
+## Entrega y frenos (revisión 22)
+- **Resultados**: un manager orquestado (o con `--inject`) recibe sus resultados por la misma compuerta que las tareas, en una sola entrega pegada con Enter. Tras escribirse quedan confirmados y no se repiten. El pegado dice de qué agente viene y que no es una orden del usuario.
+- **Sin hooks no se escribe nada**: `--inject` exige que el panel tenga hooks de agente, esté libre y con el prompt visible. Un shell o un agente sin hooks no recibe sus resultados por terminal; quedan en `galgo inbox`.
+- **Freno de turnos automáticos**: tras 5 resultados automáticos seguidos, los siguientes esperan en la bandeja (se ven con `galgo inbox` y `galgo tasks` avisa). Solo una escritura humana (la GUI o la terminal, sin panel detrás) reanuda. Lo que manda otro panel no cuenta.
+- **Confirmación**: un panel orquestado que lee su propio inbox (`galgo_inbox`) confirma lo que lee; no se vuelve a pegar. Una persona o el otro panel que consulta no confirma.
+- **Enter diferido**: `galgo send` a un agente escribe el texto y, 150 ms después, el Enter, solo si el agente sigue libre (no bloqueado, cursor visible, mismo proceso en primer plano). Si no, el Enter no se manda y `galgo send` lo dice.
+
 ## Corte 2
 `galgo_ask`/respuesta entre iguales, línea de tiempo lateral (Cmd+Shift+O) con pausar/intervenir, preset «Claude dirige, GPT programa».
 

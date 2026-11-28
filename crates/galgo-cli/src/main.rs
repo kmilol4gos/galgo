@@ -32,7 +32,9 @@ enum Cmd {
         /// Panel que recibe el resultado de este.
         #[arg(long)]
         manager: Option<String>,
-        /// Escribe los mensajes pendientes en este panel cuando esté idle.
+        /// Escribe en este panel los resultados de sus subtareas, pegados y con Enter, solo cuando el panel tiene hooks de
+        /// agente, está libre y su prompt está visible. Sin hooks (un shell o un agente sin instalar) no recibe nada: los
+        /// resultados quedan en `galgo inbox`. Tras 5 resultados automáticos seguidos, los siguientes esperan a una persona.
         #[arg(long)]
         inject: bool,
         #[arg(long)]
@@ -293,6 +295,27 @@ fn run() -> Result<()> {
     let resp = request(&req)?;
     if !resp.ok {
         bail!("{}", resp.error.unwrap_or_else(|| "error desconocido".into()));
+    }
+    // El Enter diferido de `send` puede omitirse si el agente dejó de estar libre: se dice, en lugar de callarlo.
+    if let (Cmd::Send { .. }, Some(motivo)) = (&cli.cmd, resp.data["motivo"].as_str()) {
+        eprintln!("galgo: no se envió el Enter: {motivo}. El texto quedó escrito en el panel.");
+    }
+    // Con el freno de turnos activo, sus resultados esperan a una persona: `tasks` e `inbox` lo avisan.
+    let panel_consultado = match &cli.cmd {
+        Cmd::Tasks { pane, .. } => pane.clone(),
+        Cmd::Inbox { pane } => Some(pane.clone()),
+        _ => None,
+    };
+    if let Some(pane) = panel_consultado {
+        if let Ok(lista) = request(&Request::List) {
+            let frenado = lista.data.as_array().into_iter().flatten().any(|p| {
+                let coincide = p["name"].as_str() == Some(pane.as_str()) || p["id"].as_u64().map(|i| i.to_string()).as_deref() == Some(pane.as_str());
+                coincide && p["frenado"].as_bool() == Some(true)
+            });
+            if frenado {
+                eprintln!("galgo: {pane} tiene el freno de turnos activo: sus resultados esperan a una persona. Escribe en el panel para reanudar.");
+            }
+        }
     }
     let ack = match (&cli.cmd, resp.data["msg_id"].as_u64(), resp.data["pane_id"].as_u64()) {
         (Cmd::Wait { .. }, Some(msg), Some(pane)) => Some((pane, msg)),

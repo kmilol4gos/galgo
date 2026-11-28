@@ -1692,6 +1692,59 @@ fi
 for p in tenue153 normal153 sh153 rec153 ver153; do galgo kill "$p" --remove >/dev/null 2>&1; done
 export PATH="$ANTES_PATH"; unset ANTES_PATH
 
+echo "154. freno de turnos (5 automáticos), el manager que lee su inbox confirma, y un Enter omitido con el agente bloqueado (revisión 22)"
+export GALGO_SOCKET="$TMP/c154/g.sock"; mkdir -p "$TMP/c154" "$TMP/fake154" && chmod 700 "$TMP/c154"
+# Manager falso: termina cada turno con Stop y, si recibe la línea LEER, consulta su propio inbox (lo que confirma).
+cat > "$TMP/fake154/claude" <<FAKE_EOF
+#!/bin/sh
+echo '{"hook_event_name":"Stop"}' | galgo hook claude >/dev/null 2>&1
+while printf '> '; IFS= read -r linea; do
+  case "\$linea" in
+    LEER) galgo inbox > "$TMP/fake154/leido" 2>&1 ;;
+  esac
+  echo '{"hook_event_name":"Stop"}' | galgo hook claude >/dev/null 2>&1
+done
+FAKE_EOF
+chmod +x "$TMP/fake154/claude"
+# Grabador de bytes que se hace pasar por claude (para el Enter omitido).
+mkdir -p "$TMP/fake154/rec" && cat > "$TMP/fake154/rec/claude" <<PY_EOF
+#!/usr/bin/env python3
+import os, tty
+tty.setraw(0)
+log = open("$TMP/fake154/trozos", "a", buffering=1)
+while True:
+    data = os.read(0, 1024)
+    if not data:
+        break
+    log.write(repr(data) + "\\n")
+PY_EOF
+chmod +x "$TMP/fake154/rec/claude"
+galgo spawn m154 --orquestador --rol manager -- "$TMP/fake154/claude" >/dev/null
+galgo spawn w154 --manager m154 -- bash --norc >/dev/null
+sleep 4
+for i in 1 2 3 4 5; do
+  galgo send w154 "galgo done --summary \"r$i\"" >/dev/null
+  ok=0; for k in $(seq 1 100); do galgo read m154 | grep -q "terminó: r$i (viene" && { ok=1; break; }; sleep 0.25; done
+  [ $ok = 1 ] || break
+done
+[ $ok = 1 ]; check "cinco resultados automáticos seguidos llegan al manager" $?
+galgo send w154 'galgo done --summary "r6"' >/dev/null; sleep 8
+galgo read m154 | grep -q "r6 (viene"; [ $? -ne 0 ]; check "el sexto espera en la bandeja (freno de turnos)" $?
+galgo inbox --pane m154 | grep -q "r6"; check "el sexto sigue visible en galgo inbox" $?
+galgo tasks --pane m154 2>&1 | grep -q "freno de turnos"; check "galgo tasks avisa del freno" $?
+galgo send m154 "LEER" --no-enter >/dev/null; sleep 0.5
+galgo send m154 "" >/dev/null; sleep 8
+grep -q "r6" "$TMP/fake154/leido" 2>/dev/null; check "el manager lee su inbox por sí mismo (galgo inbox dentro del panel)" $?
+galgo read m154 | grep -q "r6 (viene"; [ $? -ne 0 ]; check "lo que el manager leyó no se vuelve a pegar (confirmado al leerlo él)" $?
+galgo inbox --pane m154 | grep -q "r6"; [ $? -ne 0 ]; check "después de leerlo ya no aparece en el inbox" $?
+galgo spawn rec154 -- "$TMP/fake154/rec/claude" >/dev/null; sleep 1
+galgo status blocked --pane rec154 >/dev/null
+out=$(galgo send rec154 "hola" 2>&1); sleep 1
+echo "$out" | grep -q "no se envió el Enter"; check "un agente bloqueado no recibe el Enter diferido, y galgo send lo dice" $?
+grep -qxF "b'hola'" "$TMP/fake154/trozos" && ! grep -qxF "b'\\r'" "$TMP/fake154/trozos"; check "el texto sí se escribió y el \\r no" $?
+for p in m154 w154 rec154; do galgo kill "$p" --remove >/dev/null 2>&1; done
+export GALGO_SOCKET="$TMP/galgo.sock"
+
 # Ningún daemon de esta corrida puede quedar vivo: se comprueba (y se para) lo que quede bajo $TMP.
 echo "148. cerrar una pestaña quita el panel; kill a secas lo deja como exited"
 export GALGO_SOCKET="$TMP/c148/g.sock"; mkdir -p "$TMP/c148" && chmod 700 "$TMP/c148"

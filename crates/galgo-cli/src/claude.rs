@@ -106,7 +106,12 @@ pub fn map_event(p: &Value) -> Option<(HookEvent, Option<String>)> {
     match p.get("hook_event_name")?.as_str()? {
         // Arranque de la sesión (hook de `--settings` en modo orquestador): el agente ya está libre, aunque no haya
         // hecho ningún turno. Así su primera tarea puede entrar sin esperar al primer prompt.
-        "SessionStart" => Some((HookEvent::Idle, None)),
+        // Solo el arranque y la reanudación dejan el agente libre. La compactación y `clear` ocurren a mitad de un turno
+        // o sobre una conversación vacía: no cuentan como libres (M1 de la revisión 22).
+        "SessionStart" => match p.get("source").and_then(Value::as_str) {
+            Some("startup" | "resume") => Some((HookEvent::Idle, None)),
+            _ => None,
+        },
         "UserPromptSubmit" => Some((HookEvent::PromptSubmitted, None)),
         "PostToolUse" => Some((HookEvent::Working, None)),
         "Stop" => Some((HookEvent::TurnEnded, text("last_assistant_message"))),
@@ -499,7 +504,10 @@ mod tests {
             map_event(&json!({"hook_event_name": "UserPromptSubmit", "prompt": "x"})),
             Some((HookEvent::PromptSubmitted, None))
         );
-        assert_eq!(map_event(&json!({"hook_event_name": "SessionStart"})), Some((HookEvent::Idle, None)), "arranque: libre sin turno previo");
+        assert_eq!(map_event(&json!({"hook_event_name": "SessionStart", "source": "startup"})), Some((HookEvent::Idle, None)), "arranque: libre sin turno previo");
+        assert_eq!(map_event(&json!({"hook_event_name": "SessionStart", "source": "resume"})), Some((HookEvent::Idle, None)));
+        assert_eq!(map_event(&json!({"hook_event_name": "SessionStart", "source": "compact"})), None, "compactar a mitad de turno no es estar libre");
+        assert_eq!(map_event(&json!({"hook_event_name": "SessionStart", "source": "clear"})), None);
         assert_eq!(map_event(&Value::Null), None);
     }
 

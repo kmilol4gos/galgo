@@ -146,7 +146,7 @@ mod tests {
             programa: None, titulo_osc: None,
             usage: None,
             title: None,
-            agent: false, hooked: false,
+            agent: false, hooked: false, frenado: false,
         }
     }
 
@@ -205,7 +205,7 @@ mod carpeta_tests {
         assert_eq!(folder_label(Some("/Users/x/proyecto"), "/Users/x"), "proyecto");
         assert_eq!(folder_label(Some("/Users/x"), "/Users/x"), "~");
         assert_eq!(folder_label(None, "/Users/x"), "sin workspace");
-        let mut p = PaneInfo { id: 1, name: "shell".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: Some("/Users/x".into()), programa: None, titulo_osc: None, usage: None, title: None, agent: false, hooked: false };
+        let mut p = PaneInfo { id: 1, name: "shell".into(), status: Status::Idle, manager: None, cmd: vec![], unacked: 0, oldest_unacked_secs: None, orphan: false, waiting_on: None, waiting_secs: None, workspace: None, cwd: Some("/Users/x".into()), programa: None, titulo_osc: None, usage: None, title: None, agent: false, hooked: false, frenado: false };
         let arbol = tree_with_home(std::slice::from_ref(&p), "/Users/x");
         assert_eq!(arbol[0].name, "~");
         p.cwd = Some("/Users/x/nexo".into());

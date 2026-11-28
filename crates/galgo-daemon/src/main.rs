@@ -140,7 +140,15 @@ struct Pane {
     /// Ya entregó su resultado en este turno (`galgo done` o el evento de fin de turno).
     /// Solo se limpia con un prompt nuevo o con un envío con Enter.
     reported: bool,
+    /// Resultados entregados de forma automática desde el último Enter humano. Con `FRENO_TURNOS`, los siguientes
+    /// esperan a una persona (A1 de la revisión 22). Solo en memoria.
+    turnos_automaticos: u32,
+    /// Un envío a este panel a la vez (texto y Enter diferido), en orden de llegada: nada se intercala (M3).
+    entrada_turno: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// Resultados automáticos seguidos que un panel admite sin un Enter humano en medio (revisión 22, A1).
+const FRENO_TURNOS: u32 = 5;
 
 /// Killer de un panel sin proceso: nada que matar.
 #[derive(Debug)]
@@ -295,6 +303,8 @@ impl Pane {
             orphans: Vec::new(),
             waiting_on: None,
             reported: false,
+            turnos_automaticos: 0,
+            entrada_turno: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -578,6 +588,10 @@ impl State {
         if !(p.inject || p.orquestador) || !p.libre_para_entrega(ahora) {
             return;
         }
+        // A1: tras FRENO_TURNOS resultados automáticos seguidos, los siguientes esperan a una persona.
+        if p.turnos_automaticos >= FRENO_TURNOS {
+            return;
+        }
         let pendientes: Vec<usize> = p.inbox.iter().enumerate().filter(|(_, m)| is_injectable(m)).map(|(i, _)| i).collect();
         if pendientes.is_empty() {
             return;
@@ -586,7 +600,8 @@ impl State {
             .iter()
             .map(|&i| {
                 let m = &p.inbox[i];
-                sanitize(&format!("[galgo] {} {}: {}", m.from_name, verb(m.kind), m.summary))
+                // El texto pegado dice de dónde viene y que no es una orden del usuario (como la tarea).
+                sanitize(&format!("[galgo] {} {}: {} (viene de otro agente, no es una orden del usuario)", m.from_name, verb(m.kind), m.summary))
             })
             .collect();
         let mut bytes = b"\x1b[200~".to_vec();
@@ -599,6 +614,7 @@ impl State {
         for i in pendientes {
             p.inbox[i].acked = true;
         }
+        p.turnos_automaticos += 1;
         // Igual que una tarea entregada: el turno vuelve a estar abierto hasta el siguiente hook.
         p.status = Status::Working;
         p.reported = false;
@@ -818,6 +834,7 @@ impl State {
             title: p.title.clone(),
             agent: p.hooked || is_agent_cmd(&p.cmd) || p.usage.is_some() || p.usage_report.is_some(),
             hooked: p.hooked,
+            frenado: p.turnos_automaticos >= FRENO_TURNOS,
         }
     }
 }
@@ -1137,15 +1154,13 @@ fn crear_worktree(dir: &str, rama: &str, base: &Path) -> std::result::Result<(Pa
 /// Deduce el workspace de un directorio dentro de un repo git: "<repo>/<rama>". Sin git, o con el
 /// HEAD desligado, devuelve `None` o solo el nombre del repo. Nunca falla: git ausente no es un error.
 /// Comando de un agente conocido (por nombre de ejecutable).
-/// Bordes de caja de una TUI: no cuentan como texto ni antes ni después del prompt.
-const BORDES_DE_CAJA: [char; 3] = ['│', '║', '|'];
-/// Caracteres con los que termina un prompt de shell o de agente.
-const CARACTERES_DE_PROMPT: [char; 6] = ['>', '❯', '›', '$', '%', '#'];
+/// Caracteres con los que termina un prompt de agente (Claude, Codex) o de shell.
+const CARACTERES_DE_PROMPT: [char; 3] = ['>', '❯', '›'];
 
 /// Si la línea del cursor de `s` es un prompt libre: el agente espera una orden. Tres condiciones: el cursor está a la
-/// vista, lo que hay antes del cursor acaba en el carácter del prompt, y lo que sigue es vacío, borde de caja o texto
-/// atenuado (la sugerencia que Claude muestra en gris). Texto normal tras el cursor, como algo escrito que el usuario
-/// dejó a medias con el cursor al inicio, no es libre.
+/// vista; lo que hay antes del cursor es exactamente el carácter del prompt (sin bordes de caja, sin texto ni espacios
+/// más que los de separación); y lo que sigue es vacío o texto atenuado (la sugerencia que Claude muestra en gris).
+/// Un borrador como `❯ cuesta 5 $` no es libre: antes del cursor hay texto, aunque acabe en `$`.
 fn prompt_libre_de(s: &vt100::Screen) -> bool {
     // A2: un diálogo (confirmación, selección de inicio de sesión) oculta el cursor: no es un prompt.
     if s.hide_cursor() {
@@ -1154,14 +1169,15 @@ fn prompt_libre_de(s: &vt100::Screen) -> bool {
     let (fila, col) = s.cursor_position();
     let (_, cols) = s.size();
     let antes = s.contents_between(fila, 0, fila, col);
-    let antes = antes.trim_end().trim_end_matches(&BORDES_DE_CAJA[..]).trim_end();
-    if !antes.ends_with(&CARACTERES_DE_PROMPT[..]) {
+    let mut antes = antes.trim_end().chars();
+    let es_prompt = matches!((antes.next(), antes.next()), (Some(c), None) if CARACTERES_DE_PROMPT.contains(&c));
+    if !es_prompt {
         return false;
     }
     (col..cols.get()).all(|c| {
         s.cell(fila, c).is_none_or(|celda| {
             let texto = celda.contents();
-            texto.trim().is_empty() || texto.chars().all(|ch| BORDES_DE_CAJA.contains(&ch)) || celda.dim()
+            texto.trim().is_empty() || celda.dim()
         })
     })
 }
@@ -1460,6 +1476,8 @@ impl Daemon {
             orphans: Vec::new(),
             waiting_on: None,
             reported: false,
+            turnos_automaticos: 0,
+            entrada_turno: Arc::new(tokio::sync::Mutex::new(())),
         };
         let mut inherited = 0usize;
         {
@@ -1560,6 +1578,31 @@ impl Daemon {
             self.try_inject(m);
         }
         self.mark_dirty();
+    }
+
+    /// Razón para no mandar el Enter diferido de `galgo send`, o None si el agente sigue libre: vivo, no bloqueado, el
+    /// mismo proceso en primer plano que al escribir el texto y con el cursor visible (M3). Toma el candado del estado y
+    /// luego el de la pantalla, nunca los dos a la vez.
+    fn motivo_sin_enter(&self, id: u32, fg_antes: Option<i32>) -> Option<String> {
+        let (pantalla, fg) = {
+            let st = self.state.lock().unwrap();
+            let Some(p) = st.panes.get(&id) else { return Some("el panel ya no existe".into()) };
+            if p.ghost || p.exited {
+                return Some("el proceso ya terminó".into());
+            }
+            if p.status == Status::Blocked {
+                return Some("el agente está bloqueado: espera una decisión".into());
+            }
+            (Arc::clone(&p.screen), p.fg_pid())
+        };
+        if fg != fg_antes {
+            return Some("cambió el proceso en primer plano".into());
+        }
+        let oculto = pantalla.lock().unwrap().screen().hide_cursor();
+        if oculto {
+            return Some("el cursor está oculto: hay un diálogo abierto".into());
+        }
+        None
     }
 
     /// Entrega lo que espera el panel (tareas y resultados) solo por la compuerta segura: hooks, turno terminado, prompt
@@ -1818,41 +1861,65 @@ impl Daemon {
                 Ok(serde_json::to_value(v)?)
             }
             Request::Send { pane, text, enter } => {
-                let mut st = self.state.lock().unwrap();
-                let id = st.resolve(&pane)?;
-                let p = st.panes.get_mut(&id).unwrap();
-                // M4: una orden humana (sin panel detrás) empieza un trabajo nuevo: la cadena de profundidad vuelve a cero.
-                if sender.is_none() && enter {
-                    p.profundidad_recibida = 0;
-                }
-                // Un agente (Claude, Codex) trata un texto que llega con su Enter como un pegado y no envía: el Enter va en
-                // otra escritura, tras una pausa corta. Un shell sigue recibiendo texto y Enter en una sola escritura.
-                let separar_enter = enter && p.agente_en_primer_plano();
-                let mut chunk = text.into_bytes();
-                if enter && !separar_enter {
-                    chunk.push(b'\r');
-                }
-                if p.ghost {
-                    return Err(no_proceso(&p.name));
-                }
-                p.input.try_send(chunk).map_err(input_error)?;
-                if separar_enter {
-                    let tx = p.input.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(PAUSA_ANTES_DE_ENTER);
-                        let _ = tx.send(b"\r".to_vec());
-                    });
-                }
-                p.ultima_entrada = Some(Instant::now());
-                p.touched_since_report = true;
-                if enter {
-                    // Una tarea nueva: el turno vuelve a estar abierto y el estado final se reinicia.
-                    p.reported = false;
-                    if matches!(p.status, Status::Done | Status::Failed) {
-                        p.status = Status::Working;
+                // Un envío a la vez por panel, en orden de llegada: el texto y su Enter diferido no se intercalan con
+                // otro envío (ni con lo que teclea la GUI, que también llega por aquí).
+                let turno = {
+                    let st = self.state.lock().unwrap();
+                    let id = st.resolve(&pane)?;
+                    Arc::clone(&st.panes[&id].entrada_turno)
+                };
+                let _turno = turno.lock().await;
+                let (id, fg_antes, separar) = {
+                    let mut st = self.state.lock().unwrap();
+                    let id = st.resolve(&pane)?;
+                    let p = st.panes.get_mut(&id).unwrap();
+                    if p.ghost {
+                        return Err(no_proceso(&p.name));
                     }
+                    // Una orden humana (sin panel detrás, como la GUI o la terminal) empieza un trabajo nuevo: la cadena de
+                    // profundidad vuelve a cero y el freno de turnos automáticos se reinicia (A1). Lo que manda otro panel no.
+                    if sender.is_none() {
+                        p.turnos_automaticos = 0;
+                        if enter {
+                            p.profundidad_recibida = 0;
+                        }
+                    }
+                    // Un agente (Claude, Codex) trata un texto que llega con su Enter como un pegado y no envía: el Enter va
+                    // en otra escritura, tras una pausa. Un shell sigue recibiendo texto y Enter en una sola escritura.
+                    let separar = enter && p.agente_en_primer_plano();
+                    let mut chunk = text.into_bytes();
+                    if enter && !separar {
+                        chunk.push(b'\r');
+                    }
+                    p.input.try_send(chunk).map_err(input_error)?;
+                    p.ultima_entrada = Some(Instant::now());
+                    p.touched_since_report = true;
+                    if enter {
+                        // Una tarea nueva: el turno vuelve a estar abierto y el estado final se reinicia.
+                        p.reported = false;
+                        if matches!(p.status, Status::Done | Status::Failed) {
+                            p.status = Status::Working;
+                        }
+                    }
+                    (id, p.fg_pid(), separar)
+                };
+                if !separar {
+                    return Ok(json!({}));
                 }
-                Ok(json!({}))
+                // La pausa se espera sin ningún candado tomado. Luego se comprueba que el agente sigue libre antes del Enter (M3).
+                tokio::time::sleep(PAUSA_ANTES_DE_ENTER).await;
+                if let Some(motivo) = self.motivo_sin_enter(id, fg_antes) {
+                    return Ok(json!({ "enter": "no enviado", "motivo": motivo }));
+                }
+                let input = {
+                    let st = self.state.lock().unwrap();
+                    st.panes.get(&id).map(|p| p.input.clone())
+                };
+                match input.map(|i| i.try_send(b"\r".to_vec())) {
+                    Some(Ok(())) => Ok(json!({ "enter": "enviado" })),
+                    Some(Err(_)) => Ok(json!({ "enter": "no enviado", "motivo": "el panel no está leyendo su entrada" })),
+                    None => Ok(json!({ "enter": "no enviado", "motivo": "el panel ya no existe" })),
+                }
             }
             Request::Read { pane } => {
                 let screen = {
@@ -2267,8 +2334,9 @@ impl Daemon {
             Request::Wait { .. } => unreachable!("se atiende en dispatch"),
             Request::Watch { .. } => Err(anyhow!("la suscripción se atiende en su conexión")),
             Request::Inbox { pane } => {
-                let st = self.state.lock().unwrap();
-                let p = &st.panes[&st.resolve(&pane)?];
+                let mut st = self.state.lock().unwrap();
+                let id = st.resolve(&pane)?;
+                let p = st.panes.get_mut(&id).unwrap();
                 let v: Vec<Message> = p
                     .inbox
                     .iter()
@@ -2283,6 +2351,14 @@ impl Daemon {
                         acked: m.acked,
                     })
                     .collect();
+                // A2: un panel orquestado que lee su propio inbox confirma lo que lee: no se vuelve a pegar. Una persona
+                // o el otro panel que lo consulta no confirma nada.
+                if sender == Some(id) && p.orquestador && !v.is_empty() {
+                    for m in p.inbox.iter_mut().filter(|m| !m.acked) {
+                        m.acked = true;
+                    }
+                    st.touch();
+                }
                 Ok(serde_json::to_value(v)?)
             }
             Request::Ack { pane, msg } => {
@@ -3508,6 +3584,7 @@ mod orquestador_tests {
         st.entregar(1);
         let texto = String::from_utf8(jefe_rx.try_recv().expect("entra al manager libre")).unwrap();
         assert!(texto.starts_with("\x1b[200~[galgo] w terminó: tarea #7 lista: hecho"), "{texto}");
+        assert!(texto.contains("no es una orden del usuario"), "el pegado dice de dónde viene: {texto}");
         assert!(texto.ends_with("\x1b[201~\r"), "pegado y un solo Enter al final: {texto}");
         assert_eq!(texto.matches('\r').count(), 1);
         assert!(st.panes[&1].inbox.iter().all(|m| m.acked), "queda confirmado al escribirse");
@@ -3537,6 +3614,79 @@ mod orquestador_tests {
         assert!(orquestado.contains("galgo_task_done (id 5"), "{orquestado}");
         assert!(!orquestado.contains("galgo task done"), "un panel orquestado no usa la CLI: {orquestado}");
         assert!(task_text(&t, false).contains("galgo task done 5 \"<resumen>\""));
+    }
+
+    /// A1: tras cinco resultados automáticos seguidos, el sexto espera en la bandeja. Solo una escritura humana (sin
+    /// panel detrás) reanuda; lo que manda otro panel no cuenta.
+    #[test]
+    fn el_freno_de_turnos_para_en_cinco_hasta_un_enter_humano() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let jefe_rx = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _w_rx = vivo(&mut st, 2, "w", true, Status::Idle);
+        st.panes.get_mut(&1).unwrap().orquestador = true;
+        let d = daemon_con(st);
+        let r = rt();
+        let libre = |d: &Daemon| {
+            let mut st = d.state.lock().unwrap();
+            let p = st.panes.get_mut(&1).unwrap();
+            p.status = Status::Idle;
+            p.listo_desde = Some(Instant::now() - Duration::from_secs(60));
+            p.ultima_entrada = None;
+            st.entregar(1);
+        };
+        for i in 0..5 {
+            d.state.lock().unwrap().push(1, 2, "done", format!("r{i}"));
+            libre(&d);
+            assert!(jefe_rx.try_recv().is_ok(), "resultado {i}: entra");
+        }
+        d.state.lock().unwrap().push(1, 2, "done", "r5".into());
+        libre(&d);
+        assert!(jefe_rx.try_recv().is_err(), "el sexto espera: el freno de turnos automáticos");
+        assert!(d.state.lock().unwrap().panes[&1].inbox.iter().any(|m| !m.acked && m.summary == "r5"), "sigue en la bandeja");
+        assert!(d.state.lock().unwrap().panes[&1].turnos_automaticos >= FRENO_TURNOS);
+
+        // Lo que manda otro panel no cuenta como humano.
+        r.block_on(d.handle(Some(2), Request::Send { pane: "1".into(), text: String::new(), enter: true })).unwrap();
+        while jefe_rx.try_recv().is_ok() {}
+        libre(&d);
+        assert!(jefe_rx.try_recv().is_err(), "otro panel no reanuda");
+
+        // Una escritura humana (sin panel detrás, como la GUI o la terminal) reanuda.
+        r.block_on(d.handle(None, Request::Send { pane: "1".into(), text: String::new(), enter: true })).unwrap();
+        while jefe_rx.try_recv().is_ok() {}
+        libre(&d);
+        assert!(jefe_rx.try_recv().is_ok(), "un Enter humano reanuda la entrega");
+    }
+
+    /// A2: un panel orquestado que lee su inbox confirma lo que lee; una persona o el otro panel no confirman.
+    #[test]
+    fn el_inbox_lo_confirma_solo_el_propio_panel_orquestado() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let _jefe_rx = vivo(&mut st, 1, "jefe", true, Status::Idle);
+        let _w_rx = vivo(&mut st, 2, "w", true, Status::Idle);
+        st.panes.get_mut(&1).unwrap().orquestador = true;
+        st.push(1, 2, "done", "lista".into());
+        let d = daemon_con(st);
+        let r = rt();
+        let leidos = |v: serde_json::Value| v.as_array().unwrap().len();
+        assert_eq!(leidos(r.block_on(d.handle(None, Request::Inbox { pane: "1".into() })).unwrap()), 1);
+        assert_eq!(leidos(r.block_on(d.handle(None, Request::Inbox { pane: "1".into() })).unwrap()), 1, "una persona no confirma al leer");
+        assert_eq!(leidos(r.block_on(d.handle(Some(1), Request::Inbox { pane: "1".into() })).unwrap()), 1);
+        assert_eq!(leidos(r.block_on(d.handle(Some(1), Request::Inbox { pane: "1".into() })).unwrap()), 0, "lo leído por sí mismo queda confirmado");
+    }
+
+    /// M3: con el agente bloqueado, el texto se escribe pero el Enter diferido no se manda, y se dice por qué.
+    #[test]
+    fn el_enter_diferido_no_se_manda_a_un_agente_bloqueado() {
+        let mut st = State { epoch: 3, ..State::default() };
+        let rx = vivo(&mut st, 1, "jefe", true, Status::Blocked);
+        let d = daemon_con(st);
+        let r = rt();
+        let resp = r.block_on(d.handle(None, Request::Send { pane: "1".into(), text: "hola".into(), enter: true })).unwrap();
+        assert_eq!(resp["enter"], "no enviado");
+        assert!(resp["motivo"].as_str().unwrap().contains("bloqueado"), "{resp}");
+        let escrito: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert_eq!(escrito, vec![b"hola".to_vec()], "el texto sí, el Enter no");
     }
 
     /// La tarea se entrega solo a un agente con hooks que está libre: pegada entre marcas de bracketed paste y con un
@@ -3607,10 +3757,16 @@ mod orquestador_tests {
         assert!(!prompt_libre_de(p.screen()), "cursor oculto: es un diálogo");
         p.process(b"\x1b[?25h");
         assert!(prompt_libre_de(p.screen()), "cursor visible tras '> '");
+        p.process("\x1b[2K\x1b[1;1H❯ cuesta 5 $\x1b[1;12H".as_bytes());
+        assert!(!prompt_libre_de(p.screen()), "un borrador que acaba en $ no es un prompt libre (M2)");
+        p.process("\x1b[2K\x1b[1;1H❯ compara a >\x1b[1;13H".as_bytes());
+        assert!(!prompt_libre_de(p.screen()), "un borrador que acaba en > no es un prompt libre (M2)");
+        p.process("\x1b[2K\x1b[1;1H❯\x1b[1;2H".as_bytes());
+        assert!(prompt_libre_de(p.screen()), "el carácter de prompt solo, con el cursor tras él");
         p.process(b"\x1b[2K\x1b[1;1H");
         assert!(!prompt_libre_de(p.screen()), "línea vacía: no es prompt");
         p.process(b"\x1b[1;1H\xe2\x94\x82 > \xe2\x94\x82");
-        assert!(prompt_libre_de(p.screen()), "prompt dentro de borde de caja");
+        assert!(!prompt_libre_de(p.screen()), "un borde de caja no es un prompt libre (M2)");
         p.process(b"\x1b[2K\x1b[1;1Hescribiendo algo");
         assert!(!prompt_libre_de(p.screen()), "texto a medias");
     }

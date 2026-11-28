@@ -121,7 +121,7 @@ mod tests {
             programa: None, titulo_osc: None,
             usage: None,
             title: None,
-            agent: false, hooked: false,
+            agent: false, hooked: false, frenado: false,
         }
     }
 

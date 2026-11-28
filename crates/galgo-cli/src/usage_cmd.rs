@@ -284,7 +284,7 @@ mod tests {
             titulo_osc: None,
             usage,
             title: None,
-            agent: false, hooked: false,
+            agent: false, hooked: false, frenado: false,
         }
     }
 

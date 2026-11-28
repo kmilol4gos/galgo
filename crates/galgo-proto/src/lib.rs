@@ -482,6 +482,9 @@ pub struct PaneInfo {
     /// El agente del panel ha enviado algún evento de hook: ya arrancó y avisa de su estado (no es solo un comando).
     #[serde(default)]
     pub hooked: bool,
+    /// El freno de turnos automáticos está activo: sus resultados esperan a que una persona escriba en el panel (A1).
+    #[serde(default)]
+    pub frenado: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,7 +575,7 @@ mod tests_grupos {
             programa: None, titulo_osc: None,
             usage: None,
             title: None,
-            agent: false, hooked: false,
+            agent: false, hooked: false, frenado: false,
         }
     }
 
